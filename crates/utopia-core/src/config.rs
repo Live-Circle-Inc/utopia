@@ -60,6 +60,49 @@ impl AppConfig {
 impl AppConfig {
     /// 迁移连接串：未单独配置时用运行时那一个。
     pub fn migration_url(&self) -> &str {
-        self.migration_url.as_deref().unwrap_or(&self.database_url)
+        self.migration_url_override().unwrap_or(&self.database_url)
+    }
+
+    /// 显式配置的独立迁移身份，没有则 `None`。
+    ///
+    /// 空串按未设置处理：compose 里写 `${UTOPIA_MIGRATION_URL:-}` 时环境变量是存在但
+    /// 为空的，照字面读会得到 `Some("")`——迁移池拿它连库，启动第一步就死在
+    /// 「error with configuration: relative URL without a base」上，而那句话里
+    /// 没有任何字提到是哪个连接串，照着它翻代码翻不出来。
+    /// 同 `jwt_secret` 在 server 入口处的处理。
+    pub fn migration_url_override(&self) -> Option<&str> {
+        self.migration_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 空的 `UTOPIA_MIGRATION_URL` 回落到运行时连接串
+    #[test]
+    fn an_empty_migration_url_falls_back() {
+        for blank in ["", "   "] {
+            let cfg = AppConfig {
+                migration_url: Some(blank.into()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.migration_url(), cfg.database_url);
+            assert!(cfg.migration_url_override().is_none());
+        }
+    }
+
+    /// 给了就用给的那个
+    #[test]
+    fn a_configured_migration_url_wins() {
+        let cfg = AppConfig {
+            migration_url: Some("postgres://owner:pw@db:5432/utopia".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.migration_url(), "postgres://owner:pw@db:5432/utopia");
+        assert!(cfg.migration_url_override().is_some());
     }
 }

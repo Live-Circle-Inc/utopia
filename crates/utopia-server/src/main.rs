@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // 只读写业务表、对台账只增不改的受限角色连库。迁移池用完立即释放，
     // 那个高权限连接不在运行期常驻。
     let migration_url = cfg.migration_url().to_string();
-    let separate_migration_role = cfg.migration_url.is_some();
+    let separate_migration_role = cfg.migration_url_override().is_some();
     {
         let mig_pool = utopia_store::db::connect(&migration_url, Some(2)).await?;
         utopia_store::db::migrate(&mig_pool).await?;
