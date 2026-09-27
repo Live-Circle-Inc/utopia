@@ -70,7 +70,7 @@ One Rust binary and one Postgres. Full-text search is embedded in the binary, ve
 
 Requirements: Docker (local development also needs Rust 1.85+, Node 20+, pnpm).
 
-Start from the prebuilt image:
+Build and start:
 
 ```bash
 git clone https://github.com/deeplethe/utopia.git
@@ -78,13 +78,12 @@ cd utopia
 docker compose --profile app up -d
 ```
 
+This builds `brycircle-utopia:latest` from the tree and runs it. Nothing is pulled from a
+registry -- `pull_policy: build` in `docker-compose.yml` makes that a guarantee rather than a
+side effect of whether an image happens to be cached locally. To rebuild after changing code,
+add `--build`.
+
 Open http://localhost:1516 and register. The first account automatically becomes the administrator, and a public knowledge base readable by everyone is created at the same time. Before extracting business documents, configure the model endpoints (chat and embedding) under system settings.
-
-Or build from source:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
-```
 
 ### Local development
 

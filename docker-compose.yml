@@ -37,17 +37,27 @@ services:
   # Full deployment: docker compose --profile app up -d
   # For local development only db is started, and the application is run with cargo run
   #
-  # Only image is written here, not build: with both present, an up on a machine that has no
-  # local image goes off and "builds" instead of "pulling", and the prebuilt image was published
-  # for nothing. To start from source, layer on docker-compose.build.yml.
+  # **This fork builds its own image and runs that image. It never pulls one.**
+  #
+  # Upstream wrote image without build here on purpose: with both present, an up on a machine
+  # with no local image builds instead of pulling, and the image they published goes unused.
+  # That reasoning is theirs -- they publish releases to ghcr. We do not consume those, so the
+  # trade runs the other way: build is what we want, and a registry fetch is the thing to
+  # prevent. pull_policy makes that explicit rather than leaving it to whether an image
+  # happens to be lying around locally.
   app:
-    # Pinned to a specific published version. **This default value is exactly the command the
-    # README promises**, and writing a tag that does not exist means the first step after a clone
-    # is manifest unknown.
-    # So when a version is withdrawn this has to be changed along with it -- 0.1.0 was withdrawn,
-    # so it now points at the rc.
-    # Change it back to 0.1.0 once that is promoted (or to latest to have it follow along).
-    image: ${UTOPIA_IMAGE:-ghcr.io/deeplethe/utopia:0.1.0-rc3}
+    # Local build tag, never an upstream release. The old default was
+    # ghcr.io/deeplethe/utopia:0.1.0-rc3, which tied us to whichever tag upstream had or had
+    # not withdrawn that week -- and a withdrawn tag makes the first command after a clone
+    # fail with manifest unknown. UTOPIA_IMAGE still overrides, for pinning a build by tag.
+    image: ${UTOPIA_IMAGE:-brycircle-utopia:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    # build, not missing: always build from this tree rather than reaching for a registry.
+    # With only `build:` above, compose would still pull if a matching tag existed locally or
+    # remotely, which is exactly the fallback we are removing.
+    pull_policy: build
     profiles: ["app"]
     environment:
       # Runs as the owner by default. To enable the restricted role (business tables read and

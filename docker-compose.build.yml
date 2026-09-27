@@ -1,10 +1,13 @@
-# Build from source, layered on top of docker-compose.yml -- for when you have changed code, or
-# want to run a version that has not been released:
+# **Redundant in this fork, kept only so the command below still works.**
+#
+# docker-compose.yml now carries build: and pull_policy: build itself, so a plain
+# `docker compose --profile app up -d` already builds from this tree -- this overlay adds
+# nothing on top of it. It survives because the READMEs document the longer form:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
 #
-# An ordinary deployment does not need this file: just docker compose --profile app up -d to pull
-# the prebuilt image.
+# Upstream needed the split because it publishes release images to ghcr and did not want an up
+# to build one by accident. We do not consume those images, so there is nothing to protect.
 services:
   app:
     build:
