@@ -107,6 +107,9 @@ pub async fn models_in_use(pool: &PgPool) -> AppResult<Vec<(String, String, Stri
         "SELECT DISTINCT chat_base_url, chat_model, 'chat' FROM llm_settings
           WHERE chat_base_url IS NOT NULL AND chat_model IS NOT NULL
          UNION
+         SELECT DISTINCT extract_base_url, extract_model, 'extract' FROM llm_settings
+          WHERE extract_base_url IS NOT NULL AND extract_model IS NOT NULL
+         UNION
          SELECT DISTINCT embed_base_url, embed_model, 'embed' FROM llm_settings
           WHERE embed_base_url IS NOT NULL AND embed_model IS NOT NULL",
     )

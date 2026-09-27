@@ -943,6 +943,12 @@ export const en = {
     modelsIntro:
       "OpenAI-compatible protocol — DeepSeek, Qwen, GLM, Ollama, vLLM all work. Fully on-prem friendly.",
     chatModel: "Chat model",
+    extractModel: "Extraction model (optional)",
+    extractHint:
+      "Leave blank to reuse the chat model. Extraction runs the same prompt over every chunk of every document, so it dominates cost while asking far less of the model than chat does — a cheaper, faster model usually belongs here.",
+    extractKeyPlaceholder: "same as chat when the base URL matches",
+    extractInheriting:
+      "Currently following the chat model — set both Base URL and Model to use a separate one.",
     embedModel: "Embedding model (optional, enables semantic search)",
     baseUrl: "Base URL",
     model: "Model",
@@ -954,6 +960,7 @@ export const en = {
     test: "Test connection",
     testing: "Testing…",
     chatLabel: "Chat",
+    extractLabel: "Extraction",
     embedLabel: "Embedding",
     ok: (reply: string) => `Connected (${reply})`,
     okDim: (dim: number) => `Connected (dim ${dim})`,

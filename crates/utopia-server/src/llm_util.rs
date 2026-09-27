@@ -20,6 +20,17 @@ pub fn chat_client(s: &LlmSettings) -> Option<LlmClient> {
     ))
 }
 
+/// The client extraction uses. **Blank means the chat one** -- the fallback lives
+/// entirely in [`LlmSettings::effective_extract`], and both this and
+/// `acquire_extract` read only that, so the (base_url, model) the gate counts
+/// permits for is necessarily the one requests actually go to. If each resolved
+/// the fallback separately, a half-configured deployment would have the gate
+/// counting permits for a different model than the one being called.
+pub fn extract_client(s: &LlmSettings) -> Option<LlmClient> {
+    let (base, key, model) = s.effective_extract();
+    Some(LlmClient::new(base?, key, model?))
+}
+
 pub fn embed_client(s: &LlmSettings) -> Option<LlmClient> {
     if !s.embed_ready() {
         return None;
@@ -82,6 +93,15 @@ pub async fn acquire(
 pub async fn acquire_chat(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.chat_base_url.as_deref()?, s.chat_model.as_deref()?);
     acquire(state, base, model).await
+}
+
+/// Convenience form of `acquire`: the extraction model. Identity comes from
+/// `effective_extract`, the same source as `extract_client` -- once extraction
+/// moves to a cheaper model it counts permits against its own (base_url, model)
+/// instead of competing for chat's gate
+pub async fn acquire_extract(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
+    let (base, _, model) = s.effective_extract();
+    acquire(state, base?, model?).await
 }
 
 /// `acquire` 的便捷形式：embedding 模型。

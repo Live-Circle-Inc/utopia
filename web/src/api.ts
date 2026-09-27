@@ -218,6 +218,10 @@ export interface LlmSettingsView {
   chat_base_url?: string | null;
   chat_model?: string | null;
   has_chat_key?: boolean;
+  /** Extraction-only endpoint. All blank = follow chat */
+  extract_base_url?: string | null;
+  extract_model?: string | null;
+  has_extract_key?: boolean;
   embed_base_url?: string | null;
   embed_model?: string | null;
   embed_dim?: number | null;
@@ -1854,6 +1858,9 @@ export const api = {
   testSettings: (workspaceId: string) =>
     request<{
       chat: { ok: boolean; reply?: string; error?: string };
+      /** `null` = extraction has no endpoint of its own, so the row does not
+       *  apply -- which is not the same as "tested and failed" */
+      extract: { ok: boolean; reply?: string; error?: string } | null;
       embed: { ok: boolean; dim?: number; error?: string };
     }>(`/api/v1/workspaces/${workspaceId}/settings/test`, { method: "POST" }),
 };

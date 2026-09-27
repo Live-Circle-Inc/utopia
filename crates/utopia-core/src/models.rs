@@ -339,6 +339,12 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub chat_api_key: Option<String>,
     pub chat_model: Option<String>,
+    /// Extraction-only endpoint. **Blank means follow chat** -- see
+    /// [`LlmSettings::effective_extract`]
+    pub extract_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub extract_api_key: Option<String>,
+    pub extract_model: Option<String>,
     pub embed_base_url: Option<String>,
     #[serde(skip_serializing)]
     pub embed_api_key: Option<String>,
@@ -353,6 +359,175 @@ impl LlmSettings {
     }
     pub fn embed_ready(&self) -> bool {
         self.embed_base_url.is_some() && self.embed_model.is_some()
+    }
+
+    /// Which endpoint, key and model extraction actually uses.
+    ///
+    /// **Falls back as a whole block, not field by field.** When `extract_model`
+    /// is set but `extract_base_url` is not, per-field fallback would send one
+    /// provider's model name to another provider's address -- that request either
+    /// 404s or, worse, succeeds against a same-named but different model, and both
+    /// columns read as "configured". The test matches `chat_ready`/`embed_ready`:
+    /// address and model must both be present to count.
+    ///
+    /// **The key is inherited only on an identical address.** When extraction
+    /// points at the same base_url as chat (the common case: same provider, cheaper
+    /// tier), chat's key is reused -- otherwise the admin has to retype something
+    /// the UI never shows them (keys are write-only). A different address does not
+    /// inherit: sending one vendor's credential to another vendor's host is a leak,
+    /// not a convenience.
+    pub fn effective_extract(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
+        let ready = self.extract_base_url.is_some() && self.extract_model.is_some();
+        if !ready {
+            return (
+                self.chat_base_url.as_deref(),
+                self.chat_api_key.as_deref(),
+                self.chat_model.as_deref(),
+            );
+        }
+        let base = self.extract_base_url.as_deref();
+        let key = match self.extract_api_key.as_deref() {
+            Some(k) if !k.is_empty() => Some(k),
+            // same address only
+            _ if base == self.chat_base_url.as_deref() => self.chat_api_key.as_deref(),
+            _ => None,
+        };
+        (base, key, self.extract_model.as_deref())
+    }
+
+    /// Whether extraction has its own endpoint configured. Not the same question
+    /// as "can extraction run" -- it runs fine after falling back to chat. Used by
+    /// the UI and the connectivity probe only: with nothing configured there is no
+    /// third row to test
+    pub fn extract_overridden(&self) -> bool {
+        self.extract_base_url.is_some() && self.extract_model.is_some()
+    }
+
+    /// Whether extraction can run at all. **This is the test for enqueueing
+    /// extraction jobs** -- a deployment that configured only an extraction
+    /// endpoint and no chat (skipping the strong model entirely, wanting just the
+    /// graph) should still extract, whereas gating on `chat_ready` would enqueue
+    /// nothing at all and not report an error
+    pub fn extract_ready(&self) -> bool {
+        self.extract_overridden() || self.chat_ready()
+    }
+}
+
+#[cfg(test)]
+mod llm_settings_tests {
+    use super::*;
+
+    fn settings(
+        chat: (Option<&str>, Option<&str>, Option<&str>),
+        extract: (Option<&str>, Option<&str>, Option<&str>),
+    ) -> LlmSettings {
+        LlmSettings {
+            workspace_id: Uuid::nil(),
+            chat_base_url: chat.0.map(String::from),
+            chat_api_key: chat.1.map(String::from),
+            chat_model: chat.2.map(String::from),
+            extract_base_url: extract.0.map(String::from),
+            extract_api_key: extract.1.map(String::from),
+            extract_model: extract.2.map(String::from),
+            embed_base_url: None,
+            embed_api_key: None,
+            embed_model: None,
+            embed_dim: None,
+            updated_at: DateTime::<Utc>::MIN_UTC,
+        }
+    }
+
+    const CHAT: (Option<&str>, Option<&str>, Option<&str>) =
+        (Some("https://chat.test/v1"), Some("chat-key"), Some("big"));
+
+    /// With extraction unconfigured it is exactly the chat triple, field for field
+    /// -- deployments already running behave identically after upgrading
+    #[test]
+    fn an_unconfigured_extract_model_is_the_chat_model() {
+        let s = settings(CHAT, (None, None, None));
+        assert_eq!(
+            s.effective_extract(),
+            (Some("https://chat.test/v1"), Some("chat-key"), Some("big"))
+        );
+        assert!(!s.extract_overridden());
+        assert!(s.extract_ready());
+    }
+
+    /// **Half-configured does not count as configured.** A model name with no
+    /// address falls back as a whole block, rather than sending one provider's
+    /// model name to another's address -- where both columns read as "configured"
+    #[test]
+    fn a_half_configured_extract_model_falls_back_whole() {
+        let s = settings(CHAT, (None, None, Some("cheap")));
+        assert_eq!(s.effective_extract().2, Some("big"));
+        assert!(!s.extract_overridden());
+
+        let s = settings(CHAT, (Some("https://cheap.test/v1"), None, None));
+        assert_eq!(s.effective_extract().0, Some("https://chat.test/v1"));
+        assert!(!s.extract_overridden());
+    }
+
+    /// A different provider uses its own key, and no key means no key -- sending
+    /// the chat provider's credential to another host is a leak, not a convenience
+    #[test]
+    fn a_different_host_never_inherits_the_chat_key() {
+        let s = settings(CHAT, (Some("https://cheap.test/v1"), None, Some("cheap")));
+        assert_eq!(
+            s.effective_extract(),
+            (Some("https://cheap.test/v1"), None, Some("cheap"))
+        );
+
+        let s = settings(
+            CHAT,
+            (
+                Some("https://cheap.test/v1"),
+                Some("own-key"),
+                Some("cheap"),
+            ),
+        );
+        assert_eq!(s.effective_extract().1, Some("own-key"));
+    }
+
+    /// Same provider, cheaper model is the common case, and keys are write-only in
+    /// the UI -- not inheriting would force the admin to dig up something they
+    /// cannot see
+    #[test]
+    fn the_same_host_inherits_the_chat_key() {
+        for blank in [None, Some("")] {
+            let s = settings(CHAT, (Some("https://chat.test/v1"), blank, Some("cheap")));
+            assert_eq!(
+                s.effective_extract(),
+                (
+                    Some("https://chat.test/v1"),
+                    Some("chat-key"),
+                    Some("cheap")
+                ),
+                "blank key = {blank:?}"
+            );
+            assert!(s.extract_overridden());
+        }
+    }
+
+    /// Extraction configured without chat should still extract (a graph-only
+    /// deployment). Gating on `chat_ready` would enqueue nothing and not error
+    #[test]
+    fn an_extract_only_deployment_still_extracts() {
+        let s = settings(
+            (None, None, None),
+            (Some("https://cheap.test/v1"), Some("k"), Some("cheap")),
+        );
+        assert!(!s.chat_ready());
+        assert!(s.extract_ready());
+        assert_eq!(s.effective_extract().2, Some("cheap"));
+    }
+
+    /// With nothing configured extraction cannot run -- the fallback must not turn
+    /// "unconfigured" into "chat is configured"
+    #[test]
+    fn nothing_configured_is_not_ready() {
+        let s = settings((None, None, None), (None, None, None));
+        assert!(!s.extract_ready());
+        assert_eq!(s.effective_extract(), (None, None, None));
     }
 }
 
