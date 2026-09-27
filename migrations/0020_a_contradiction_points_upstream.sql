@@ -1,15 +1,22 @@
--- 派生撞上断言时，让路这件事从静默变成可见（docs/decisions/0017）。
+-- When a derivation collides with an assertion, make the yielding visible instead of silent
+-- (docs/decisions/0017).
 --
--- 0002 定了 asserted > derived：推出来的事实撞上账本里的断言就不落地。此前那一步
--- 什么都不留——`ceo_of ⊑ works_at` 推出的 works_at 没了，人不知道有过这回事，也就
--- 不知道该去看看是抽取错了、旧断言该闭合、还是两个「Mira」其实是一个人。
+-- 0002 settled asserted > derived: an inferred fact that collides with an assertion in the
+-- ledger simply does not land. Until now that step left nothing behind -- the works_at inferred
+-- from `ceo_of ⊑ works_at` was gone, nobody knew it had ever happened, and so nobody knew to go
+-- and look at whether the extraction was wrong, whether the old assertion should be closed, or
+-- whether the two "Mira"s are in fact one person.
 --
--- 一致性检查多一种 `derived_contradiction`：left 是被撞的断言，right 是派生的最后一条
--- 前提，path 是全部前提；推出来的三元组本身没有落库、没有 id 可指，放进 `detail`。
--- 出路多一条 `fact_closed`——最常见的修法是给旧断言一个结束日期。
+-- The consistency check gains one more kind, `derived_contradiction`: left is the assertion that
+-- was hit, right is the last premise of the derivation, path is all of the premises; the
+-- inferred triple itself never landed and has no id to point at, so it goes into `detail`.
+-- The resolutions gain one more, `fact_closed` -- the most common fix is to give the old
+-- assertion an end date.
 --
--- 派生之间互撞（两条规则加在一起产出互斥的结论）按规则对聚合进 `ontology_defects`，
--- 一种 `rules_disagree`，`detail` 记规则对与几个例子。逐对进 Review 只会淹掉队列。
+-- Derivations colliding with each other (two rules that together produce mutually exclusive
+-- conclusions) are aggregated by rule pair into `ontology_defects` as a single `rules_disagree`,
+-- with `detail` recording the rule pair and a few examples. One row per pair would only drown
+-- the Review queue.
 
 ALTER TABLE axiom_violations
     DROP CONSTRAINT axiom_violations_kind_check,

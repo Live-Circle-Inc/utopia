@@ -1,18 +1,25 @@
--- 签名违规成为一致性检查的一种（见 #190 / #196，docs/decisions/0012 待做第一条）。
+-- Signature violations become a kind of consistency check (see #190 / #196, the first to-do item
+-- in docs/decisions/0012).
 --
--- #138 在抽取写入时按关系的 domain 掰正方向：主语不合、宾语合就对调，都不合就
--- 留空谓词。但写谓词的路不止抽取一条：**采纳**把谓词挂回旧事实（#190，实测把
--- 违反率从 0 抬到 12.3%），**合并**换掉主语的类型（#196）。守卫只在一条路上，
--- 另外两条各自绕过去了。
+-- #138 straightened the direction out at extraction-write time using the relation's domain: if
+-- the subject doesn't fit and the object does, swap them; if neither fits, leave the predicate
+-- empty. But extraction is not the only path that writes predicates: **adoption** hangs a
+-- predicate back onto old facts (#190, measured to push the violation rate from 0 up to 12.3%),
+-- and **merging** swaps out the subject's type (#196). The guard sat on one path only, and the
+-- other two each went around it.
 --
--- 修法两层：写入时的判断抽成一处（`ontology::judge_direction`），抽取与采纳共用；
--- 账本层再加一道兜底——一致性检查（0002 R0）多查一种 `signature`：活事实的主语
--- 不在谓词声明的 domain 里、或宾语不在 range 里。合并之后对搬动过的事实立刻查一遍，
--- 手动跑检查时全量查。**任何一条路写反了，人都能在 Review 里看见**，出路与其它
--- 违规一样：撤事实、放宽公理（去掉那条 domain 声明）、或认可并存。
+-- The fix has two layers: the write-time judgement is factored into one place
+-- (`ontology::judge_direction`), shared by extraction and adoption; and the ledger layer gets a
+-- backstop -- the consistency check (0002 R0) checks one more kind, `signature`: a live fact whose
+-- subject is not in the domain the predicate declares, or whose object is not in its range. After
+-- a merge we check the facts that were moved right away; a manual check run scans everything.
+-- **Whichever path wrote it backwards, a human can see it in Review**, and the ways out are the
+-- same as for the other violations: retract the fact, loosen the axiom (drop that domain
+-- declaration), or accept that both stand.
 --
--- 只动 CHECK 约束：表的形状够用——签名违规只涉及一条事实，left 与 right 同一条，
--- 与自反那类同款。
+-- Only the CHECK constraint changes: the shape of the table is good enough -- a signature
+-- violation involves a single fact, with left and right being the same one, same as the
+-- reflexive kind.
 ALTER TABLE axiom_violations DROP CONSTRAINT axiom_violations_kind_check;
 ALTER TABLE axiom_violations ADD CONSTRAINT axiom_violations_kind_check
     CHECK (kind IN ('self_loop', 'asymmetry', 'cycle', 'functional', 'signature'));

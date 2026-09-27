@@ -1,4 +1,4 @@
-//! 来源管理 API + 文本推送摄入（ingest）。
+//! Source management API plus text-push ingestion (ingest).
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -14,16 +14,17 @@ use crate::auth::AuthUser;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// 生成 api 来源的推送密钥。
+/// Generates the push token for an api source.
 fn new_ingest_token() -> String {
     format!("utp_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-/// 取一条来源，并确认它属于路径上的这个库。
+/// Fetches one source and confirms it belongs to the kb named in the path.
 ///
-/// `require_kb` 只查人对库的权限；来源 id 是另一个维度——不比对的话，A 库的
-/// Editor 拿着 B 库来源的 id 就能同步、清理、删除它。不属于就当不存在（404），
-/// 与 `get_token` 一直以来的做法一致
+/// `require_kb` only checks a person's permission on the kb; the source id is a separate
+/// dimension -- without comparing it, an Editor on kb A holding the id of a source in kb B could
+/// sync it, clean it up, and delete it. Not belonging is treated as not existing (404), matching
+/// what `get_token` has always done
 async fn source_in_kb(
     state: &AppState,
     kb_id: Uuid,
@@ -56,7 +57,7 @@ pub struct CreateBody {
     pub icon: Option<String>,
     #[serde(default)]
     pub sync_interval_minutes: Option<i32>,
-    /// 标准 5 段 cron（与 interval 互斥，二者传其一）
+    /// Standard 5-field cron (mutually exclusive with interval; pass one or the other)
     #[serde(default)]
     pub sync_cron: Option<String>,
 }
@@ -79,7 +80,8 @@ pub async fn create(
         body.sync_cron.as_deref(),
     )
     .await?;
-    // 拉取型来源建好立即同步一次（有配置即产出，无需等下一个调度周期）
+    // Pull-style sources sync once immediately after creation (configured means output; no need
+    // to wait for the next scheduling cycle)
     if matches!(source.kind.as_str(), "url" | "rss" | "custom") {
         let _ = utopia_store::sources::mark_queued(&state.pool, source.id).await;
         utopia_store::jobs::enqueue(
@@ -89,7 +91,7 @@ pub async fn create(
         )
         .await?;
     }
-    // api 来源：生成专属推送密钥（此后可随时经 get_token 查看）
+    // api sources: generate a dedicated push token (viewable any time afterwards via get_token)
     let mut ingest_token: Option<String> = None;
     if source.kind == "api" {
         let token = new_ingest_token();
@@ -112,7 +114,8 @@ pub async fn create(
     ))
 }
 
-/// 查看 api 来源的推送密钥（Editor；列表响应从不携带，查看走这里）。
+/// Views the push token of an api source (Editor; list responses never carry it, viewing goes
+/// through here).
 pub async fn get_token(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -126,7 +129,7 @@ pub async fn get_token(
     Ok(Json(json!({ "ingest_token": source.ingest_token })))
 }
 
-/// 轮换 api 来源的推送密钥：旧密钥立即失效。
+/// Rotates the push token of an api source: the old token stops working immediately.
 pub async fn rotate_token(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -142,14 +145,17 @@ pub async fn rotate_token(
     Ok(Json(json!({ "ingest_token": token })))
 }
 
-/// 响应前剔除凭据（只进不出；键见 `SOURCE_SECRET_KEYS`）。
+/// Strips credentials before responding (they go in only, never out; for the keys see
+/// `SOURCE_SECRET_KEYS`).
 fn mask_secrets(source: utopia_core::models::Source) -> utopia_core::models::Source {
     source.without_secrets()
 }
 
-/// 更新时凭据的合并规则，每个 `SOURCE_SECRET_KEYS` 里的键一样：新配置里**没有**这个键
-/// 或值是空串 → 保留库里的原值（表单留空就是「别动」）；显式 `null` → 删掉；
-/// 其余照新值。响应从不回显，所以客户端没有办法把旧值原样送回来，规则只能长在这里
+/// The merge rule for credentials on update, identical for every key in `SOURCE_SECRET_KEYS`:
+/// the key is **absent** from the new config or its value is an empty string → keep the value
+/// stored in the database (leaving the form blank means "don't touch it"); an explicit `null` →
+/// delete it; anything else takes the new value. Responses never echo them back, so the client
+/// has no way to send the old value back verbatim; the rule can only live here
 fn keep_secrets(next: &mut serde_json::Value, existing: &serde_json::Value) {
     let Some(obj) = next.as_object_mut() else {
         return;
@@ -177,7 +183,8 @@ pub struct UpdateBody {
     pub name: Option<String>,
     pub config: Option<serde_json::Value>,
     pub icon: Option<String>,
-    /// 出现 schedule 字段即整体覆盖调度（interval 与 cron 互斥；两者皆 null = 关闭定时）
+    /// The presence of the schedule field overwrites the schedule wholesale (interval and cron
+    /// are mutually exclusive; both null = timed syncing off)
     #[serde(default)]
     pub schedule: Option<ScheduleBody>,
 }
@@ -198,7 +205,8 @@ pub async fn update(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
     let existing = source_in_kb(&state, kb_id, source_id).await?;
-    // 凭据只进不出：响应从不回显，表单留空 / 没传 = 保留库里原值
+    // Credentials go in only, never out: responses never echo them, and a blank form field / an
+    // absent field = keep the value stored in the database
     let mut config = body.config;
     if let Some(cfg) = config.as_mut() {
         keep_secrets(cfg, &existing.config);
@@ -214,7 +222,7 @@ pub async fn update(
     )
     .await?;
     state.emit_source(kb_id);
-    // 审计不落凭据：config 只记「改没改」
+    // The audit log never stores credentials: for config it only records "changed or not"
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -228,7 +236,8 @@ pub async fn update(
     Ok(Json(json!({ "source": mask_secrets(source) })))
 }
 
-/// 批量删除该来源下所有"不在来源中"的文档（url 对账 / custom 墓碑标出的）。
+/// Bulk-deletes every document under this source that is "no longer in the source" (the ones
+/// flagged by url reconciliation / custom tombstones).
 pub async fn cleanup_missing(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -256,7 +265,8 @@ pub async fn delete(
     Path((kb_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // Memory 来源常驻：记忆空间不因来源整理而蒸发（记忆文档本身可在 Library 删除）
+    // The Memory source is permanent: the memory space does not evaporate because someone tidied
+    // up their sources (the memory documents themselves can be deleted in the Library)
     let source = source_in_kb(&state, kb_id, source_id).await?;
     if source.kind == utopia_store::memory::MEMORY_SOURCE_KIND {
         return Err(utopia_core::AppError::invalid(
@@ -280,7 +290,7 @@ pub async fn delete(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 同步运行历史（渠道审计）。
+/// Sync run history (channel audit).
 pub async fn runs(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -315,19 +325,21 @@ pub async fn sync_now(
 #[derive(Deserialize)]
 pub struct IngestBody {
     pub filename: String,
-    /// 墓碑推送（`deleted: true`）可以不带 content——指南一直这么写，而字段
-    /// 从前是必填，缺了就在反序列化那一步被拒。其余情况仍然必填：空串在
-    /// 下面的校验里挡
+    /// A tombstone push (`deleted: true`) may come without content -- that is what the guide has
+    /// always said, while the field used to be required, so a missing one was rejected right at
+    /// deserialization. Everything else still requires it: an empty string is caught by the
+    /// validation below
     #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub doc_time: Option<DateTime<Utc>>,
-    /// 调用方的逻辑文档 ID：同 ID 再推 = 更新同一文档（原地替换 + 版本记录）。
-    /// 不传则以 filename 为身份。
+    /// The caller's logical document ID: pushing the same ID again = updating that same document
+    /// (replaced in place plus a version record). Omit it and the filename becomes the identity.
     #[serde(default)]
     pub external_id: Option<String>,
-    /// 墓碑：true = 按身份标记"不在来源中"（不删除；仅 api 来源推送支持）。
-    /// 此时 content 可省略；再次正常推送同身份会摘掉标记。
+    /// Tombstone: true = flag the identity as "no longer in the source" (not a delete; only
+    /// supported when pushing to an api source). content may be omitted in that case; pushing the
+    /// same identity normally again takes the flag back off.
     #[serde(default)]
     pub deleted: bool,
 }
@@ -342,8 +354,9 @@ fn action_str(action: crate::ingest_sources::IngestAction) -> &'static str {
     }
 }
 
-/// KB 级文本推送（会话认证）：普通上传语义——落入 Uploads，无身份追踪。
-/// 需要"同 ID 再推 = 更新"语义时，建一个 api 来源用它的密钥推送。
+/// Kb-level text push (session-authenticated): plain upload semantics -- it lands in Uploads,
+/// with no identity tracking. When you want "same ID again = update" semantics, create an api
+/// source and push with its token.
 pub async fn ingest(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -375,14 +388,16 @@ pub async fn ingest(
     Ok(Json(json!({ "action": action_str(action) })))
 }
 
-/// 推送失败的两种性质。**调用方发错了**和**我们这边没接住**得分开：前者记进
-/// run 供集成调试，但不算来源同步失败——来源没坏，是那一次请求不合格；
-/// 后者才该把来源标成 failed 并进告警中心。从前两者都走 `finish_sync(error)`，
-/// 一次格式错误就让铃铛说"来源同步失败，没有新内容进来"
+/// The two natures of a failed push. **The caller sent it wrong** and **we failed to catch it on
+/// our end** have to be kept apart: the former is recorded into the run for integration
+/// debugging, but does not count as a source sync failure -- the source is not broken, that one
+/// request was unacceptable; only the latter should mark the source failed and land in the alert
+/// centre. Both used to go through `finish_sync(error)`, so a single malformed payload made the
+/// bell say "source sync failed, no new content came in"
 enum PushError {
-    /// 4xx：负载不合格（JSON 解析、缺字段）
+    /// 4xx: unacceptable payload (JSON parsing, missing fields)
     Rejected(String),
-    /// 摄入本身失败
+    /// Ingestion itself failed
     Failed(String),
 }
 
@@ -394,7 +409,8 @@ impl PushError {
     }
 }
 
-/// 认证之后的推送处理：解析 + 校验 + 摄入/墓碑。错误一律返回文字（记进 run）。
+/// Push handling after authentication: parse + validate + ingest/tombstone. Errors always come
+/// back as text (recorded into the run).
 async fn handle_push(
     state: &AppState,
     source: &utopia_core::models::Source,
@@ -416,7 +432,8 @@ async fn handle_push(
     }
     let key = format!("api:{identity}");
 
-    // 墓碑：标记"不在来源中"（与 custom 的 deleted[] 同一条路径），content 可省略
+    // Tombstone: flag it as "no longer in the source" (the same path as custom's deleted[]);
+    // content may be omitted
     if body.deleted {
         utopia_store::documents::mark_missing_keys(&state.pool, source.id, &[key])
             .await
@@ -441,17 +458,20 @@ async fn handle_push(
     )
     .await
     .map_err(|e| PushError::Failed(e.to_string()))?;
-    // 失而复得：曾被墓碑标记的身份再次正常推送，摘掉 missing 标记
+    // Lost and found: an identity that was once tombstoned is pushed normally again, so take the
+    // missing flag back off
     utopia_store::documents::clear_missing_keys(&state.pool, source.id, &[key])
         .await
         .map_err(|e| PushError::Failed(e.to_string()))?;
     Ok(action)
 }
 
-/// api 来源推送（来源专属密钥认证，无会话）：三路身份语义——
-/// 新 external_id → 新增；同 ID 同内容 → 无操作；同 ID 新内容 → 原地更新 + 版本记录。
-/// 认证通过后每次推送都记一条 run（含格式错误——集成调试全靠它）；
-/// 未认证请求不写任何记录（不给匿名流量制造落库路径）。
+/// Push to an api source (authenticated by the source's own token, no session): three-way
+/// identity semantics -- a new external_id → insert; same ID same content → no-op; same ID new
+/// content → updated in place plus a version record.
+/// Every push that gets past authentication records one run (malformed payloads included -- that
+/// is what integration debugging lives on); unauthenticated requests write no record at all (no
+/// creating a path into the database for anonymous traffic).
 pub async fn push(
     State(state): State<AppState>,
     Path(source_id): Path<Uuid>,
@@ -462,7 +482,7 @@ pub async fn push(
     if source.kind != "api" {
         return Err(utopia_core::AppError::NotFound.into());
     }
-    // Bearer 密钥校验
+    // Bearer token check
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -486,7 +506,8 @@ pub async fn push(
             };
             utopia_store::sources::finish_run(&state.pool, run, source.id, None, created, updated)
                 .await?;
-            // 来源行同步反映"上一次推送"：操作条/左栏状态点直接可用
+            // The source row reflects "the last push" in step: the action bar / left-column
+            // status dot work straight away
             utopia_store::sources::finish_sync(&state.pool, source.id, None, created).await?;
             state.emit_source(source.kb_id);
             Ok(Json(json!({ "action": action_str(action) })))
@@ -495,7 +516,8 @@ pub async fn push(
             let msg = err.message().to_string();
             utopia_store::sources::finish_run(&state.pool, run, source.id, Some(&msg), 0, 0)
                 .await?;
-            // 只有我们这边没接住才算来源失败；调用方发错了留在 run 历史里就够
+            // Only our failing to catch it counts as a source failure; the caller sending it
+            // wrong is fine left in the run history
             if let PushError::Failed(_) = err {
                 utopia_store::sources::finish_sync(&state.pool, source.id, Some(&msg), 0).await?;
             }
@@ -505,8 +527,10 @@ pub async fn push(
     }
 }
 
-/// 来源级全量重抽（增量语义）：该来源下所有 ready 文档重新过一遍抽取。
-/// 走正常管道——实体消解、事实去重、时态冲突照常，既有人工决策全部保留。
+/// Source-wide full re-extraction (incremental semantics): every ready document under this
+/// source runs through extraction again. It takes the normal pipeline -- entity resolution, fact
+/// deduplication and temporal conflicts all behave as usual, and every existing human decision
+/// is preserved.
 pub async fn re_extract(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -517,7 +541,8 @@ pub async fn re_extract(
     if source.kb_id != kb_id {
         return Err(utopia_core::AppError::NotFound.into());
     }
-    // 任务由 queue_extraction 与状态同事务建好，这里只负责推送
+    // queue_extraction creates the jobs in the same transaction as the status change; all this
+    // does is emit
     let ids =
         utopia_store::documents::queue_extraction(&state.pool, kb_id, Some(source_id)).await?;
     for id in &ids {
@@ -544,7 +569,7 @@ mod tests {
     #[test]
     fn a_blank_or_missing_secret_keeps_the_stored_one() {
         let existing = json!({ "bucket": "old", "secret_access_key": "s", "password": "p" });
-        // 没传 → 留；空串 → 留；有值 → 换；null → 删
+        // absent → keep; empty string → keep; a value → replace; null → delete
         let mut next = json!({ "bucket": "new", "password": "  ", "token": null });
         keep_secrets(&mut next, &existing);
         assert_eq!(next["bucket"], "new");

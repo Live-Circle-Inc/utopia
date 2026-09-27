@@ -1,15 +1,20 @@
-//! 等人点头的事实（见 `docs/decisions/0015`，表在 `migrations/0018`）。
+//! Facts awaiting a nod (see `docs/decisions/0015`; the table is in `migrations/0018`).
 //!
-//! 一句记忆抽出来的三元组先落这里，**不进 `facts`**：不上图、不参与检索、
-//! 不进推理。人在对话里或 Review 页看见「原句在上、三元组在下」之后点头，
-//! 它才经与抽取相同的那条路（`insert_fact` + 证据 + 时态对账）进账本。
+//! The triples pulled out of one sentence of memory land here first, **they do not go into
+//! `facts`**: not on the graph, not part of retrieval, not part of reasoning. Only once a human
+//! has seen "the original sentence above, the triple below" -- in the conversation or on the
+//! Review page -- and nodded does it go onto the ledger by the same route as extraction
+//! (`insert_fact` + evidence + temporal reconciliation).
 //!
-//! **为什么另一张表而不是 `facts` 加一列**：五十多处查询按 `invalidated_at IS NULL`
-//! 捞活事实，逐个补过滤漏一处就有一条没人点头的事实混进图里——而这张表存在的
-//! 全部理由就是防这件事。分开之后忘了读它的后果是「看不见待确认队列」，
-//! 方向对了。0013 的 `derived_facts` 是同一个判断。
+//! **Why a second table rather than a column on `facts`**: fifty-odd queries scoop up live facts
+//! by `invalidated_at IS NULL`, and patching the filter into each of them and missing a single
+//! one means a fact nobody nodded at gets mixed into the graph -- and preventing exactly that is
+//! the entire reason this table exists. Once they are separate, the consequence of forgetting to
+//! read it is "the pending queue is invisible", and that direction is the right way round. 0013's
+//! `derived_facts` is the same judgement.
 //!
-//! **只拦交互式的单条写入。** 批量摄入仍旧乐观写入 + 事后审阅——那条路不经这里。
+//! **It only stops interactive single-row writes.** Bulk ingestion is still optimistic-write plus
+//! after-the-fact review -- that path does not come through here.
 
 use sqlx::PgPool;
 use utopia_core::models::PendingFactView;
@@ -18,12 +23,14 @@ use uuid::Uuid;
 
 use crate::graph::Validity;
 
-/// 抽取器交过来的一条提议。字段与 `insert_fact` / `insert_value_fact` 对齐，
-/// 多出 `proposed_predicate`（模型原话）、`chunk_id`（那句记忆）、`proposed_by`（谁说的）。
+/// One proposal handed over by the extractor. The fields line up with `insert_fact` /
+/// `insert_value_fact`, with `proposed_predicate` (the model's own words), `chunk_id` (that
+/// sentence of memory) and `proposed_by` (who said it) on top.
 pub struct Proposal<'a> {
     pub kb_id: Uuid,
     pub subject_id: Uuid,
-    /// None = 本体里没有对应的关系（0010）。**人要看见的正是这个空**
+    /// None = the ontology has no matching relation (0010). **And that emptiness is precisely
+    /// what the human needs to see**
     pub predicate_id: Option<Uuid>,
     pub object_id: Option<Uuid>,
     pub object_value: Option<&'a serde_json::Value>,
@@ -34,16 +41,17 @@ pub struct Proposal<'a> {
     pub proposed_by: Option<Uuid>,
 }
 
-/// 提议的去向。三种「没提」都不是错误——重抽一句记忆会再次算出同样的三元组，
-/// 不挡住就等于每抽一次都把人的决定抹掉一次。
+/// Where a proposal goes. None of the three "did not ask" outcomes is an error -- re-extracting a
+/// sentence of memory will compute the same triple again, and not blocking it amounts to wiping
+/// out the human's decision once per extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Proposed(Uuid),
-    /// 图上已经有一条一样的活事实——不必再问
+    /// The graph already has an identical live fact -- no need to ask again
     AlreadyAsserted,
-    /// 已经在队列里等着
+    /// Already sitting in the queue, waiting
     AlreadyPending,
-    /// 人拒绝过这个三元组（`rejected_facts`）
+    /// A human has rejected this triple (`rejected_facts`)
     Rejected,
 }
 
@@ -85,9 +93,11 @@ pub async fn propose(pool: &PgPool, p: Proposal<'_>) -> AppResult<Outcome> {
     if pending.is_some() {
         return Ok(Outcome::AlreadyPending);
     }
-    // 拒绝记录只按 (主语, 谓词, 宾语实体) 查。**字面值事实不查**：`rejected_facts`
-    // 没有 object_value 列，按 (主语, 谓词) 挡会把「薪水 28000 被拒」扩大成
-    // 「薪水这个属性永远不再提」。宁可多问一次，不替人拒掉一个新值
+    // Rejection records are only looked up by (subject, predicate, object entity). **Literal-value
+    // facts are not looked up**: `rejected_facts` has no object_value column, and blocking by
+    // (subject, predicate) would inflate "salary 28000 was rejected" into "never mention the
+    // salary attribute again". Better to ask one more time than to reject a new value on the
+    // human's behalf
     if let Some(object_id) = p.object_id {
         let rejected: Option<(i32,)> = sqlx::query_as(
             "SELECT 1 FROM rejected_facts
@@ -133,7 +143,7 @@ pub async fn propose(pool: &PgPool, p: Proposal<'_>) -> AppResult<Outcome> {
     Ok(Outcome::Proposed(id))
 }
 
-/// 给人看的一条待确认项：`utopia_core::models::PendingFactView`。
+/// One pending item as a human sees it: `utopia_core::models::PendingFactView`.
 const VIEW_SELECT: &str = "\
     SELECT p.id, p.subject_id, s.canonical_name AS subject_name,
            p.predicate_id, r.label AS predicate_label, p.proposed_predicate,
@@ -164,7 +174,8 @@ pub async fn list(
     .await?)
 }
 
-/// 一句记忆抽出的全部待确认项——对话里那张卡片按这个取。
+/// Every pending item pulled out of one sentence of memory -- the card in the conversation is
+/// fetched by this.
 pub async fn for_chunk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -188,7 +199,8 @@ async fn get(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<PendingFactView>
         .ok_or(AppError::NotFound)
 }
 
-/// 决策台账要的自包含快照：行删了之后台账上还读得出当时确认或拒绝的是什么。
+/// The self-contained snapshot the decision ledger needs: once the row is deleted, the ledger can
+/// still be read to see what was confirmed or rejected at the time.
 fn snapshot(v: &PendingFactView) -> serde_json::Value {
     serde_json::json!({
         "subject": v.subject_name,
@@ -206,19 +218,23 @@ fn snapshot(v: &PendingFactView) -> serde_json::Value {
 
 pub struct Confirmed {
     pub fact_id: Uuid,
-    /// false = 图上已有同一条活事实，这次只补了证据
+    /// false = the graph already had the same live fact, and this only added evidence
     pub created: bool,
-    /// 时态对账拿不准、进了 `fact_conflicts` 的条数
+    /// The number that temporal reconciliation could not be sure about and that went into
+    /// `fact_conflicts`
     pub conflicts: u32,
     pub snapshot: serde_json::Value,
 }
 
-/// 人点头：按抽取那条路进账本——落事实、挂证据、时态对账——然后从队列里拿掉。
+/// A human nods: onto the ledger by the extraction route -- persist the fact, hang the evidence
+/// off it, reconcile the temporal side -- then take it off the queue.
 ///
-/// **置信度不动。** 人的态度不用浮点数表达（0011 的教训），它在审计台账里。
+/// **The confidence is left alone.** A human's position is not expressed as a float (the lesson
+/// of 0011); it lives in the audit ledger.
 ///
-/// 不包事务：`insert_fact` 按 (主语, 谓词, 宾语) 对活事实去重，中途断掉再点一次
-/// 只会补证据、不会落第二条，删行在最后——幂等靡有余悸。
+/// Not wrapped in a transaction: `insert_fact` deduplicates live facts by (subject, predicate,
+/// object), so breaking off halfway and clicking again only adds evidence and never persists a
+/// second row, and the row deletion is last -- idempotent, with nothing left to worry about.
 pub async fn confirm(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Confirmed> {
     let v = get(pool, kb_id, id).await?;
     let validity = Validity {
@@ -259,7 +275,8 @@ pub async fn confirm(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Confirme
             ))
         }
     };
-    // 证据指回那句记忆。引句就是整句——一条 episode 本来就只有一句
+    // The evidence points back at that sentence of memory. The quote is the whole sentence -- an
+    // episode only ever had one sentence in it anyway
     crate::graph::add_evidence(
         pool,
         fact_id,
@@ -269,8 +286,9 @@ pub async fn confirm(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Confirme
     )
     .await?;
 
-    // 与抽取相同的时态对账：带唯一性约束的状态关系，新事实闭合旧事实。
-    // 这正是记忆该有的行为——「Mira 交给 Devin 了」说完，Mira 那条就该闭合
+    // The same temporal reconciliation as extraction: for a state relation with a uniqueness
+    // constraint, a new fact closes the old one. This is exactly how memory ought to behave --
+    // once "Mira handed it over to Devin" has been said, the Mira row should close
     let mut conflicts = 0u32;
     if created {
         if let Some(pid) = v.predicate_id {
@@ -286,7 +304,8 @@ pub async fn confirm(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Confirme
                     if functional {
                         directions.push(crate::temporal::Uniqueness::SubjectSide);
                     }
-                    // 宾语侧唯一只对实体宾语有意义；字面值没有「谁被指着」
+                    // Object-side uniqueness only means anything for entity objects; a literal
+                    // value has no "who is being pointed at"
                     if inverse_functional && v.object_id.is_some() {
                         directions.push(crate::temporal::Uniqueness::ObjectSide);
                     }
@@ -322,8 +341,10 @@ pub async fn confirm(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Confirme
     })
 }
 
-/// 人拒绝：记进 `rejected_facts`（下一轮重抽先查它），从队列里拿掉。
-/// 那句记忆本身留着——人确实说过那句话，只是没抽出可用的事实。
+/// A human rejects: recorded into `rejected_facts` (which the next round of re-extraction checks
+/// first), and taken off the queue.
+/// The sentence of memory itself stays -- the person really did say it, it just did not yield a
+/// usable fact.
 pub async fn reject(
     pool: &PgPool,
     kb_id: Uuid,

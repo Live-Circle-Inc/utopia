@@ -1,59 +1,69 @@
-//! 本体自己的自洽性:**不碰事实,只看定义**。
+//! The ontology's own self-consistency: **does not touch facts, only looks at definitions**.
 //!
-//! 与 [`crate::check`] 是两件事。那一层问「事实与定义抵触吗」,这一层问
-//! 「定义自己站得住吗」。分开不是分类癖:一个自相矛盾的本体会让事实层的
-//! 结论全部可疑——若某个谓词同时声明了 symmetric 与 asymmetric,那么据它
-//! 报出来的每一条反对称违规都建立在一个本来就不成立的前提上。所以这一层
-//! 的结论要**排在前面**给人看。
+//! A different thing from [`crate::check`]. That layer asks "do the facts clash with the
+//! definitions"; this one asks "do the definitions stand up by themselves". Separating them is
+//! not a habit of taxonomy: a self-contradictory ontology makes every conclusion at the fact
+//! layer suspect -- if some predicate declares both symmetric and asymmetric, then every
+//! asymmetry violation reported on its authority rests on a premise that never held in the first
+//! place. So this layer's conclusions belong **first** in front of a human.
 //!
-//! 便宜也是理由:输入只有几千行本体,不用扫账本。
+//! Cheapness is a reason too: the input is only a few thousand lines of ontology, with no ledger
+//! to scan.
 //!
-//! **同样是「没声明就不查」。** 这里查的每一条都对应本体里写下来的东西,
-//! 没有一条是我们替用户假设的。
+//! **Same "not declared means not checked".** Every check here corresponds to something written
+//! down in the ontology; not one of them is an assumption we make on the user's behalf.
 
 use crate::Axioms;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// 类层级上溯的深度上限。与 [`crate::MAX_DEPTH`] 同一个理由:本体里可以有环
-/// （建表时只挡得住自环,`A → B → A` 拦不住），没有上限就不终止。
+/// Depth cap for climbing the class hierarchy. Same reason as [`crate::MAX_DEPTH`]: the
+/// ontology can contain rings (the table definition only holds off self-loops, `A → B → A`
+/// gets through), and without a cap this does not terminate.
 pub const MAX_ANCESTRY: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Defect {
-    /// 同一个谓词既声明 symmetric 又声明 asymmetric。
+    /// The same predicate declares both symmetric and asymmetric.
     ///
-    /// OWL 里这两者只能同时对**空**属性成立——一旦有一条边 `A p B`，对称说
-    /// `B p A` 必须成立，反对称说它必须不成立。所以但凡这个谓词上有事实，
-    /// 声明就一定错了一个。
+    /// In OWL the two can only hold together for the **empty** property -- the moment there is
+    /// an edge `A p B`, symmetry says `B p A` must hold and asymmetry says it must not. So as
+    /// soon as this predicate has any facts, one of the two declarations is certainly wrong.
     SymmetricAndAsymmetric,
-    /// 传递 + 函数性。OWL 2 DL 明文禁止（函数性属性不得声明为传递），
-    /// 因为两者一起会让推理跳出可判定的片段。
+    /// Transitive + functional. OWL 2 DL forbids it outright (a functional property may not be
+    /// declared transitive), because the two together push inference out of the decidable
+    /// fragment.
     ///
-    /// 直觉上也讲得通：函数性说「主语侧只有一个值」，传递说「顺着链一直推」，
-    /// 而链上第二跳就给同一个主语推出了第二个值。
+    /// It makes intuitive sense too: functionality says "only one value on the subject side",
+    /// transitivity says "keep entailing along the chain", and the second hop on the chain
+    /// entails a second value for that same subject.
     TransitiveAndFunctional,
-    /// subClassOf 绕成了环。建表时的 CHECK 只挡得住 `A → A`。
+    /// subClassOf closed into a ring. The CHECK on the table only holds off `A → A`.
     ///
-    /// 环意味着环上所有类互为子类，即它们其实是同一个类——而它们有各自的
-    /// 标签、描述、属性，界面上也各画一行。
+    /// A ring means every class on it is a subclass of every other, i.e. they are really one
+    /// class -- yet each has its own label, description and properties, and each draws its own
+    /// row in the UI.
     SubclassCycle,
-    /// 一个类跟自己的祖先声明了互斥 → 这个类**永远不可能有实例**。
-    /// 它继承了祖先的身份，又声明与之互斥。
+    /// A class declares itself disjoint with its own ancestor → the class **can never have an
+    /// instance**. It inherits the ancestor's identity and declares itself disjoint from it.
     DisjointWithAncestor,
-    /// 一个类的两个祖先互相互斥 → 同上，不可满足。
-    /// 多父继承下这个形状不罕见：两支各自合理，合起来就矛盾了。
+    /// Two of a class's ancestors are disjoint with each other → same as above, unsatisfiable.
+    /// Under multiple inheritance this shape is not rare: each branch is reasonable on its own,
+    /// and put together they contradict.
     InheritsDisjoint,
-    /// 一个谓词声明自己是自己的逆。**等价于 symmetric**——推理照跑，
-    /// 只是读的人要多想一步。提示改写成 `symmetric` 更直白
+    /// A predicate declares itself its own inverse. **Equivalent to symmetric** -- inference
+    /// runs either way, it only costs the reader an extra step of thought. We suggest rewriting
+    /// it as `symmetric`, which says it more plainly
     InverseOfItself,
-    /// `p⁻¹ = q` 而 `q⁻¹ = r`，两边指得不一样。
+    /// `p⁻¹ = q` while `q⁻¹ = r` -- the two sides point at different things.
     ///
-    /// 载入公理时只补空缺、不覆盖人写的（**人写的优先于推出来的**），
-    /// 所以这个矛盾不会被悄悄抹平，留到这里报。
+    /// Loading the axioms only fills gaps and never overwrites what a human wrote (**what a
+    /// human wrote wins over what was inferred**), so this contradiction is not quietly smoothed
+    /// over; it is left for here to report.
     InverseNotMutual,
-    /// subPropertyOf 绕成了环。与 [`Defect::SubclassCycle`] 同形：
-    /// 环上所有谓词互为子属性 = 它们其实是同一个谓词，而各自有标签、有事实。
+    /// subPropertyOf closed into a ring. Same shape as [`Defect::SubclassCycle`]: every
+    /// predicate on the ring is a sub-property of every other = they are really one predicate,
+    /// and each has its own label and its own facts.
     SubPropertyCycle,
 }
 
@@ -72,22 +82,25 @@ impl Defect {
     }
 }
 
-/// 本体里的一处自相矛盾。
+/// One self-contradiction in the ontology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OntologyDefect {
     pub kind: Defect,
-    /// 出问题的那个对象：谓词（前两类）或类（后三类）
+    /// The object at fault: a predicate (the first two kinds) or a class (the last three)
     pub subject: Uuid,
-    /// 另一方：互斥的那个类。前两类与环没有第二方
+    /// The other side: the class it is disjoint with. The first two kinds and the rings have no
+    /// second side
     pub other: Option<Uuid>,
-    /// 环的路径（按类排列），或从类到那个祖先的路径。其余为空
+    /// The ring's path (as classes), or the path from the class up to that ancestor. Empty
+    /// otherwise
     pub path: Vec<Uuid>,
 }
 
-/// 量一遍本体自己。
+/// Measure the ontology against itself.
 ///
-/// `parents` 是 `(子, 父)` 对，`disjoint` 是互斥对——**导入侧已经把对称性
-/// 展开成两行**，所以这里两个方向都会看到，去重靠有序键。
+/// `parents` are `(child, parent)` pairs, `disjoint` are disjointness pairs -- **the import side
+/// has already expanded the symmetry into two rows**, so both directions show up here and
+/// deduplication relies on an ordered key.
 pub fn check_ontology(
     axioms: &HashMap<Uuid, Axioms>,
     parents: &[(Uuid, Uuid)],
@@ -95,8 +108,9 @@ pub fn check_ontology(
 ) -> Vec<OntologyDefect> {
     let mut out = Vec::new();
 
-    // ---- 谓词上的两处自相矛盾。**排序后再报**：HashMap 的遍历顺序每次不同，
-    // 而同一个本体两次检查出来的结果该是同一份
+    // ---- The two self-contradictions on predicates. **Sort before reporting**: a HashMap
+    // iterates in a different order every time, and two checks of the same ontology ought to
+    // come out identical
     let mut preds: Vec<(&Uuid, &Axioms)> = axioms.iter().collect();
     preds.sort_by_key(|(id, _)| **id);
     for (&pred, ax) in preds {
@@ -116,8 +130,9 @@ pub fn check_ontology(
                 path: Vec::new(),
             });
         }
-        // 自己是自己的逆 = 对称。**不是错，是绕远路**——推理照跑，
-        // 但读本体的人得自己想一步才明白。提示改用 `symmetric` 更直白
+        // Its own inverse = symmetric. **Not wrong, just the long way round** -- inference runs
+        // either way, but whoever reads the ontology has to work that step out for themselves.
+        // We suggest `symmetric`, which says it more plainly
         if ax.inverse_of == Some(pred) {
             out.push(OntologyDefect {
                 kind: Defect::InverseOfItself,
@@ -126,8 +141,9 @@ pub fn check_ontology(
                 path: Vec::new(),
             });
         }
-        // 逆 + 反对称：`A p B` 推出 `B p A`（自己的逆），而反对称说这不成立。
-        // 与 symmetric+asymmetric 同一个矛盾，换了个写法进来
+        // Inverse + asymmetric: `A p B` entails `B p A` (its own inverse), and asymmetry says
+        // that does not hold. The same contradiction as symmetric+asymmetric, arriving in a
+        // different spelling
         if ax.inverse_of == Some(pred) && ax.asymmetric {
             out.push(OntologyDefect {
                 kind: Defect::SymmetricAndAsymmetric,
@@ -136,8 +152,9 @@ pub fn check_ontology(
                 path: Vec::new(),
             });
         }
-        // 两边各自声明了逆，却指向不同的谓词。**不在载入时悄悄改一致**
-        // （`reasoning::axioms` 那边只补空缺，不覆盖人写的），所以在这里报
+        // Both sides declare an inverse, but they point at different predicates. **We do not
+        // quietly make them agree at load time** (`reasoning::axioms` over there only fills gaps
+        // and never overwrites what a human wrote), so it is reported here
         if let Some(inv) = ax.inverse_of {
             if let Some(back) = axioms.get(&inv).and_then(|a| a.inverse_of) {
                 if back != pred {
@@ -152,8 +169,9 @@ pub fn check_ontology(
         }
     }
 
-    // ---- subPropertyOf 成环。与 subClassOf 的环是同一个形状：
-    // 环上所有谓词互为子属性 = 它们其实是同一个谓词，而各自有标签、有事实
+    // ---- subPropertyOf closing into a ring. The same shape as a subClassOf ring: every
+    // predicate on the ring is a sub-property of every other = they are really one predicate,
+    // and each has its own label and its own facts
     {
         let parent_of: HashMap<Uuid, Uuid> = axioms
             .iter()
@@ -170,7 +188,7 @@ pub fn check_ontology(
             let mut cur = start;
             for _ in 0..MAX_ANCESTRY {
                 if seen.contains(&cur) {
-                    // 环上每个成员都标记过，整条环只报一次
+                    // Every member of the ring gets marked, so the whole ring is reported once
                     for m in &seen {
                         reported.insert(*m);
                     }
@@ -197,7 +215,7 @@ pub fn check_ontology(
     out
 }
 
-/// 子 → 父的邻接表。同一对重复声明只留一次。
+/// Child → parent adjacency. The same pair declared twice is kept once.
 fn adjacency(parents: &[(Uuid, Uuid)]) -> HashMap<Uuid, Vec<Uuid>> {
     let mut up: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
     for &(child, parent) in parents {
@@ -206,14 +224,14 @@ fn adjacency(parents: &[(Uuid, Uuid)]) -> HashMap<Uuid, Vec<Uuid>> {
             slot.push(parent);
         }
     }
-    // 排序保证同一份本体每次算出同一条路径
+    // Sorting guarantees the same ontology works out the same path every time
     for v in up.values_mut() {
         v.sort();
     }
     up
 }
 
-/// subClassOf 的环。每个环只报一次，键取环上类的有序集合。
+/// subClassOf rings. Each ring is reported once, keyed on the ordered set of classes on it.
 fn subclass_cycles(up: &HashMap<Uuid, Vec<Uuid>>) -> Vec<OntologyDefect> {
     let mut reported: HashSet<Vec<Uuid>> = HashSet::new();
     let mut out = Vec::new();
@@ -252,7 +270,7 @@ fn climb(
     };
     for &parent in ups {
         if parent == start && !path.is_empty() {
-            // 回到起点：这是一个环。`path` 此刻是 start 之后的那几个类
+            // Back at the start: this is a ring. `path` right now is the classes after start
             let mut ring = vec![start];
             ring.extend(path.iter().copied());
             let mut key = ring.clone();
@@ -269,7 +287,7 @@ fn climb(
             continue;
         }
         if on_path.contains(&parent) || parent == start {
-            // 别处的环，等它自己那一轮报；这里只是别走进去
+            // A ring elsewhere; it gets reported on its own round -- here just don't walk in
             continue;
         }
         path.push(parent);
@@ -280,10 +298,11 @@ fn climb(
     }
 }
 
-/// 不可满足的类：它的祖先集合里出现了一对互斥。
+/// Unsatisfiable classes: a disjoint pair turns up inside the ancestor set.
 ///
-/// 两种形状分开报，因为**给人的话不一样**：跟自己的祖先互斥是「这条 disjoint
-/// 声明写反了」，而两个祖先互斥是「这个类不该同时挂在这两支下」。
+/// The two shapes are reported separately because **what you tell a human differs**: disjoint
+/// with your own ancestor means "this disjoint declaration was written backwards", whereas two
+/// disjoint ancestors means "this class should not hang under both branches at once".
 fn unsatisfiable(up: &HashMap<Uuid, Vec<Uuid>>, disjoint: &[(Uuid, Uuid)]) -> Vec<OntologyDefect> {
     let pairs: HashSet<(Uuid, Uuid)> = disjoint.iter().copied().collect();
     if pairs.is_empty() {
@@ -294,7 +313,7 @@ fn unsatisfiable(up: &HashMap<Uuid, Vec<Uuid>>, disjoint: &[(Uuid, Uuid)]) -> Ve
     classes.sort();
     for class in classes {
         let anc = ancestors(class, up);
-        // 一、跟自己的祖先互斥
+        // One: disjoint with its own ancestor
         for &a in &anc {
             if pairs.contains(&(class, a)) {
                 out.push(OntologyDefect {
@@ -305,7 +324,8 @@ fn unsatisfiable(up: &HashMap<Uuid, Vec<Uuid>>, disjoint: &[(Uuid, Uuid)]) -> Ve
                 });
             }
         }
-        // 二、两个祖先互相互斥。有序对去重，否则展开成两行的 disjoint 会报两遍
+        // Two: two ancestors disjoint with each other. The ordered pair deduplicates, otherwise
+        // a disjoint expanded into two rows gets reported twice
         let mut sorted: Vec<Uuid> = anc.iter().copied().collect();
         sorted.sort();
         for (i, &a) in sorted.iter().enumerate() {
@@ -324,7 +344,7 @@ fn unsatisfiable(up: &HashMap<Uuid, Vec<Uuid>>, disjoint: &[(Uuid, Uuid)]) -> Ve
     out
 }
 
-/// 一个类的全部祖先（不含自己）。有环也不会转不出来——`seen` 挡住。
+/// All of a class's ancestors (not itself). A ring cannot trap it -- `seen` holds it off.
 fn ancestors(class: Uuid, up: &HashMap<Uuid, Vec<Uuid>>) -> HashSet<Uuid> {
     let mut seen = HashSet::new();
     let mut queue = vec![(class, 0usize)];
@@ -377,7 +397,8 @@ mod tests {
     fn either_one_alone_is_fine() {
         assert!(check_ontology(&ax(|a| a.symmetric = true), &[], &[]).is_empty());
         assert!(check_ontology(&ax(|a| a.asymmetric = true), &[], &[]).is_empty());
-        // 传递 + 反对称是**正常的**——它正是环检测有意义的前提
+        // Transitive + asymmetric is **normal** -- it is precisely the premise that makes cycle
+        // detection meaningful
         let both = ax(|a| {
             a.transitive = true;
             a.asymmetric = true;
@@ -395,7 +416,7 @@ mod tests {
             kinds(&check_ontology(&a, &[], &[])),
             vec![Defect::TransitiveAndFunctional]
         );
-        // 反函数性同理
+        // Same for inverse functionality
         let b = ax(|a| {
             a.transitive = true;
             a.inverse_functional = true;
@@ -412,15 +433,23 @@ mod tests {
         // 1 → 2 → 3 → 1
         let ring = [(c(1), c(2)), (c(2), c(3)), (c(3), c(1))];
         let d = check_ontology(&none, &ring, &[]);
-        assert_eq!(kinds(&d), vec![Defect::SubclassCycle], "三个类绕成一圈");
-        assert_eq!(d.len(), 1, "同一个环只报一次，不是每个类各报一次");
-        assert_eq!(d[0].path.len(), 3, "路径要带上环上全部三个类");
+        assert_eq!(
+            kinds(&d),
+            vec![Defect::SubclassCycle],
+            "three classes forming one ring"
+        );
+        assert_eq!(d.len(), 1, "one ring is reported once, not once per class");
+        assert_eq!(
+            d[0].path.len(),
+            3,
+            "the path carries all three classes on the ring"
+        );
     }
 
     #[test]
     fn a_tree_is_not_a_ring() {
         let none = HashMap::new();
-        // 多父也不是环：4 同时挂在 2 与 3 下
+        // Multiple parents is not a ring either: 4 hangs under both 2 and 3
         let tree = [(c(1), c(2)), (c(1), c(3)), (c(4), c(2)), (c(4), c(3))];
         assert!(check_ontology(&none, &tree, &[]).is_empty());
     }
@@ -429,30 +458,39 @@ mod tests {
     fn a_class_disjoint_with_its_own_ancestor_can_never_exist() {
         let none = HashMap::new();
         let parents = [(c(1), c(2)), (c(2), c(3))];
-        // 导入侧把 disjoint 的对称性展开成两行，这里照样给两行
+        // The import side expands disjoint symmetry into two rows, so two rows are given here
         let dis = [(c(1), c(3)), (c(3), c(1))];
         let d = check_ontology(&none, &parents, &dis);
         assert_eq!(kinds(&d), vec![Defect::DisjointWithAncestor]);
         assert_eq!(d[0].subject, c(1));
-        assert_eq!(d[0].other, Some(c(3)), "指出跟哪个祖先互斥——人要去改那一条");
+        assert_eq!(
+            d[0].other,
+            Some(c(3)),
+            "says which ancestor it is disjoint with"
+        );
     }
 
     #[test]
     fn two_disjoint_ancestors_make_a_class_unsatisfiable() {
         let none = HashMap::new();
-        // 1 同时是 2 与 3 的子类，而 2 与 3 互斥
+        // 1 is a subclass of both 2 and 3, and 2 and 3 are disjoint
         let parents = [(c(1), c(2)), (c(1), c(3))];
         let dis = [(c(2), c(3)), (c(3), c(2))];
         let d = check_ontology(&none, &parents, &dis);
         assert_eq!(kinds(&d), vec![Defect::InheritsDisjoint]);
-        assert_eq!(d.len(), 1, "展开成两行的 disjoint 不该报两遍");
+        assert_eq!(
+            d.len(),
+            1,
+            "a disjoint expanded to two rows must not be reported twice"
+        );
         assert_eq!(d[0].subject, c(1));
     }
 
     #[test]
     fn disjoint_between_unrelated_branches_is_the_point_of_disjoint() {
         let none = HashMap::new();
-        // 2 与 3 互斥，而 1 只挂在 2 下、4 只挂在 3 下——这正是 disjoint 的正常用法
+        // 2 and 3 are disjoint, 1 hangs only under 2 and 4 only under 3 -- this is exactly the
+        // normal use of disjoint
         let parents = [(c(1), c(2)), (c(4), c(3))];
         let dis = [(c(2), c(3)), (c(3), c(2))];
         assert!(check_ontology(&none, &parents, &dis).is_empty());
@@ -463,7 +501,8 @@ mod tests {
         let none = HashMap::new();
         let ring = [(c(1), c(2)), (c(2), c(1))];
         let dis = [(c(1), c(2)), (c(2), c(1))];
-        // 环 + 互斥同时存在：既要报环，也不能在上溯时转不出来
+        // Ring and disjointness at once: the ring has to be reported, and the climb upwards
+        // must not get stuck going round
         let d = check_ontology(&none, &ring, &dis);
         assert!(d.iter().any(|x| x.kind == Defect::SubclassCycle));
         assert!(d.iter().any(|x| x.kind == Defect::DisjointWithAncestor));
@@ -472,7 +511,7 @@ mod tests {
     #[test]
     fn nothing_declared_means_nothing_reported() {
         assert!(check_ontology(&HashMap::new(), &[], &[]).is_empty());
-        // 类层级齐全但一条 disjoint 都没有 → 没有判据
+        // A full class hierarchy but not one disjoint → no grounds to judge on
         let parents = [(c(1), c(2)), (c(2), c(3))];
         assert!(check_ontology(&HashMap::new(), &parents, &[]).is_empty());
     }
@@ -494,7 +533,7 @@ mod inverse_and_sub_property_tests {
         HashMap::from([(id, a)])
     }
 
-    /// 自己是自己的逆 —— 合法但绕远路，提示改用 symmetric。
+    /// Its own inverse -- legal but the long way round; we suggest symmetric instead.
     #[test]
     fn a_predicate_that_is_its_own_inverse_should_just_say_symmetric() {
         let a = Axioms {
@@ -505,7 +544,8 @@ mod inverse_and_sub_property_tests {
         assert_eq!(kinds(&d), vec![Defect::InverseOfItself]);
     }
 
-    /// 自己的逆 + 反对称 = 与 symmetric+asymmetric 同一个矛盾，换了个写法。
+    /// Its own inverse + asymmetric = the same contradiction as symmetric+asymmetric, in a
+    /// different spelling.
     #[test]
     fn its_own_inverse_and_asymmetric_is_the_same_contradiction_in_disguise() {
         let a = Axioms {
@@ -516,11 +556,11 @@ mod inverse_and_sub_property_tests {
         let d = check_ontology(&only(c(1), a), &[], &[]);
         assert!(
             kinds(&d).contains(&Defect::SymmetricAndAsymmetric),
-            "**要报成同一类**：读的人不该因为写法不同就以为是两回事"
+            "**report it as the same kind**: a different spelling should not make the reader think these are two different things"
         );
     }
 
-    /// 互指一致 —— 干净，什么都不该报。
+    /// A mutual pair -- clean, nothing should be reported.
     #[test]
     fn a_mutual_pair_is_clean() {
         let ax = HashMap::from([
@@ -542,10 +582,10 @@ mod inverse_and_sub_property_tests {
         assert!(check_ontology(&ax, &[], &[]).is_empty());
     }
 
-    /// `p⁻¹ = q` 而 `q⁻¹ = r` —— 两边指得不一样。
+    /// `p⁻¹ = q` while `q⁻¹ = r` -- the two sides point at different things.
     ///
-    /// **载入公理时只补空缺不覆盖**，所以这个矛盾不会被悄悄抹平；
-    /// 它必须在这里被报出来，否则没有任何地方会提。
+    /// **Loading the axioms only fills gaps, it does not overwrite**, so this contradiction is
+    /// not quietly smoothed over; it has to be reported here, or nowhere will mention it.
     #[test]
     fn an_inverse_that_does_not_point_back_is_reported() {
         let ax = HashMap::from([
@@ -568,13 +608,17 @@ mod inverse_and_sub_property_tests {
         let one = d
             .iter()
             .find(|x| x.kind == Defect::InverseNotMutual)
-            .expect("该报 InverseNotMutual");
+            .expect("should report InverseNotMutual");
         assert_eq!(one.subject, c(1));
         assert_eq!(one.other, Some(c(2)));
-        assert_eq!(one.path, vec![c(1), c(2), c(3)], "路径要说清指到哪去了");
+        assert_eq!(
+            one.path,
+            vec![c(1), c(2), c(3)],
+            "the path must spell out where it points"
+        );
     }
 
-    /// subPropertyOf 成环。
+    /// subPropertyOf closing into a ring.
     #[test]
     fn a_sub_property_ring_is_a_single_predicate_wearing_three_hats() {
         let mk = |parent: u8| Axioms {
@@ -587,11 +631,15 @@ mod inverse_and_sub_property_tests {
             .iter()
             .filter(|x| x.kind == Defect::SubPropertyCycle)
             .collect();
-        assert_eq!(ring.len(), 1, "**整条环只报一次**，不是每个成员报一遍");
+        assert_eq!(
+            ring.len(),
+            1,
+            "**the whole ring is reported once**, not once per member"
+        );
         assert_eq!(ring[0].path.len(), 3);
     }
 
-    /// 一条不成环的链不该被误报。
+    /// A chain that does not close into a ring should not be reported by mistake.
     #[test]
     fn a_chain_that_ends_is_not_a_ring() {
         let ax = HashMap::from([

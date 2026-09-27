@@ -1,18 +1,23 @@
-//! 忽略一个未匹配说法之后会发生什么，打在真库上。
+//! What happens after an unmatched phrasing is dismissed, run against a real database.
 //!
-//! 这里全是 SQL，`cargo check` 看不见。而这一段的行为**曾经是错的且不可见**：
-//! `record_miss` 带着 `WHERE dismissed_at IS NULL`，于是点一次「忽略」既停止呈现、
-//! 也停止计数。第一篇里出现一次的说法被忽略掉之后，后面二十篇都在用它，
-//! 计数仍停在 1——当初那个判断的依据早就不成立了，而没有任何人看得见。
+//! This is all SQL, which `cargo check` cannot see. And the behaviour of this stretch **used
+//! to be wrong and invisible**: `record_miss` carried a `WHERE dismissed_at IS NULL`, so one
+//! click on "dismiss" stopped both the presenting and the counting. After a phrasing that
+//! appeared once in the first document was dismissed, the next twenty documents all used it
+//! and the count still sat at 1 -- the basis for that original judgement had long stopped
+//! holding, and nobody could see it.
 //!
-//! 要钉住的是**抑制与计数分开**：
+//! What has to be pinned down is that **suppression and counting are separate**:
 //!
-//! - 忽略之后 `record_miss` 照样累加
-//! - `list_misses` 不再返回它（提案与自动扩本体一步没变）
-//! - `list_dismissed_misses` 返回它，且带的是**更新后的**计数
-//! - `restore_miss` 撤回之后它回到正常列表，计数是连续的而不是从头来过
+//! - after a dismissal `record_miss` keeps accumulating
+//! - `list_misses` no longer returns it (the suggestion and the auto-extend-the-ontology step
+//!   are unchanged)
+//! - `list_dismissed_misses` does return it, and with the **updated** count
+//! - after `restore_miss` undoes it, it is back in the normal list with a count that is
+//!   continuous rather than starting over
 //!
-//! 没有 `UTOPIA_DATABASE_URL` 时跳过而不是失败。自建自拆，绝不碰已有的库。
+//! Skipped rather than failed when there is no `UTOPIA_DATABASE_URL`. Builds and tears down
+//! its own data, and never touches an existing KB.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -52,42 +57,42 @@ async fn dismissing_stops_the_suggestion_but_not_the_counting() -> anyhow::Resul
 
     let run = async {
         use utopia_store::ontology as ont;
-        // 第一篇文档里出现了一次
+        // It appeared once in the first document
         ont::record_miss(&pool, kb, "relation_type", "acquired", Some("A → B")).await?;
         assert_eq!(
             count_of(&ont::list_misses(&pool, kb).await?, "acquired"),
             Some(1)
         );
 
-        // 用户看着「出现 1 次」，判断这是一次性措辞
+        // The user looks at "appeared 1 time" and judges it a one-off phrasing
         ont::dismiss_miss(&pool, kb, "relation_type", "acquired").await?;
         assert_eq!(
             count_of(&ont::list_misses(&pool, kb).await?, "acquired"),
             None,
-            "忽略之后不该再进建议列表"
+            "after a dismissal it should not be in the suggestion list any more"
         );
 
-        // 后面两篇也在说它。**关键断言**：计数必须继续走，否则那个判断
-        // 依据过期了也没人知道
+        // The next two documents say it too. **The key assertion**: the count has to keep
+        // going, otherwise the basis for that judgement goes stale and nobody knows
         ont::record_miss(&pool, kb, "relation_type", "acquired", Some("C → D")).await?;
         ont::record_miss(&pool, kb, "relation_type", "acquired", Some("E → F")).await?;
         assert_eq!(
             count_of(&ont::list_dismissed_misses(&pool, kb).await?, "acquired"),
             Some(3),
-            "忽略期间的出现次数必须照记"
+            "occurrences during the dismissal must still be recorded"
         );
         assert_eq!(
             count_of(&ont::list_misses(&pool, kb).await?, "acquired"),
             None,
-            "计数在涨，但抑制照旧"
+            "the count is climbing, but the suppression stands"
         );
 
-        // 人看见它涨到 3 了，撤回忽略
+        // The human sees it has climbed to 3 and undoes the dismissal
         ont::restore_miss(&pool, kb, "relation_type", "acquired").await?;
         assert_eq!(
             count_of(&ont::list_misses(&pool, kb).await?, "acquired"),
             Some(3),
-            "撤回之后计数是连续的，不是从头来过"
+            "after the undo the count is continuous, not started over"
         );
         assert_eq!(
             count_of(&ont::list_dismissed_misses(&pool, kb).await?, "acquired"),

@@ -1,13 +1,17 @@
--- 审计日志：谁在何时对什么做了什么（纯审计，不承载回滚等衍生功能）。
+-- Audit log: who did what to which thing and when (pure audit -- it carries no derived
+-- features such as rollback).
 --
--- **kb_id 与 actor_id 是裸 UUID，没有外键。** 台账不该依赖它所记录的对象存活：
--- kb_id 若级联删除，删掉一个知识库就删掉了它的全部审计记录——包括刚刚写下的
--- 那条 kb.deleted，删除是最需要留痕的动作，却成了唯一不留痕的。actor_id 若
--- SET NULL，一个用户被停用后他做过的每一次确认、驳回、合并都变成匿名。
--- 合规审计要的恰恰是这两个场景。
+-- **kb_id and actor_id are bare UUIDs, with no foreign key.** A ledger must not depend on the
+-- objects it records staying alive: if kb_id cascaded on delete, deleting one knowledge base
+-- would delete every audit record it has -- including the kb.deleted row just written; deletion
+-- is the action that most needs a trace, and it would become the only one leaving none. If
+-- actor_id were SET NULL, every confirmation, rejection and merge a user ever made would turn
+-- anonymous the moment that user was deactivated.
+-- Those two scenarios are precisely what a compliance audit is after.
 --
--- 这也是哈希链的前提：链要求记录只增不删，级联删除会在链中间挖掉一段，
--- 让它断得「合法」而无从分辨。
+-- This is also the precondition for the hash chain: the chain requires records to be
+-- append-only, and a cascading delete would carve a stretch out of the middle of it, letting it
+-- break "legitimately" and indistinguishably.
 CREATE TABLE audit_events (
     id          UUID PRIMARY KEY,
     kb_id       UUID,
@@ -15,36 +19,42 @@ CREATE TABLE audit_events (
     action      TEXT NOT NULL,
     target_kind TEXT NOT NULL,
     target_id   UUID,
-    -- 变更要点，按 action 语义自定
+    -- The gist of the change, shaped by whatever the action means
     detail      JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 从哪里做的。ISO 27001 A.8.15 要求日志覆盖 Where / How，即请求的来源；
-    -- 没有它，一个账号被盗用后的所有活动看起来与本人操作毫无差别。
-    -- 两列都可空：后台任务（攒批裁决、定时同步）没有客户端，本就该是空
+    -- Where it was done from. ISO 27001 A.8.15 requires logs to cover Where / How, i.e. the
+    -- origin of the request; without it, everything done with a stolen account looks no
+    -- different from the owner's own activity.
+    -- Both columns are nullable: background jobs (batched adjudication, scheduled sync) have
+    -- no client, and are supposed to be empty
     client_ip   TEXT,
     user_agent  TEXT,
-    -- 操作者的身份快照。actor_id 没有外键，用户停用时行会留下，但 LEFT JOIN
-    -- users 取不到名字，界面只剩一串 UUID。把当时的邮箱与显示名一并写进记录，
-    -- 台账才真正自包含
+    -- Identity snapshot of the actor. actor_id has no foreign key, so the row survives when
+    -- a user is deactivated, but a LEFT JOIN on users no longer yields a name and the UI is
+    -- left with a bare UUID. Writing the email and display name of that moment into the record
+    -- is what makes the ledger genuinely self-contained
     actor_label TEXT
 );
 CREATE INDEX audit_events_kb_time_idx ON audit_events (kb_id, created_at DESC);
 
--- 按 IP 排查（同一来源的登录失败、异常时段的活动）需要这条索引
+-- Investigating by IP (login failures from one origin, activity at odd hours) needs this index
 CREATE INDEX audit_events_client_ip_idx ON audit_events (client_ip, created_at DESC)
     WHERE client_ip IS NOT NULL;
 
--- 台账只增不改。应用本就只 INSERT，这道触发器挡的是绕过应用的那条路：
--- 运维直连数据库、一次手滑的 UPDATE、或者有人回头想抹掉自己的痕迹。
+-- The ledger is append-only. The application only ever INSERTs anyway; what this trigger
+-- blocks is the route around the application: an operator connected straight to the database,
+-- one slip-of-the-hand UPDATE, or somebody coming back to wipe their own traces.
 --
--- 它挡不住 superuser——那个身份可以 DROP TRIGGER 或 ALTER TABLE ... DISABLE
--- TRIGGER 之后从容修改。所以这一层的作用是把门槛从「顺手就能改」抬到「必须先
--- 动 DDL」，而 DDL 本身会留在数据库日志里。要让蓄意篡改也无所遁形，得靠后续
--- 的哈希链：改动会让链在被改的那一条上断开。
+-- It cannot stop a superuser -- that identity can DROP TRIGGER, or ALTER TABLE ... DISABLE
+-- TRIGGER, and then edit at leisure. So the job of this layer is to raise the bar from "you can
+-- change it on a whim" to "you have to touch DDL first", and DDL itself stays in the database
+-- log. Leaving deliberate tampering nowhere to hide takes the hash chain that comes later: an
+-- edit breaks the chain at exactly the record that was edited.
 --
--- 刻意不留应用层的绕过开关。审计不可变性一旦有开关，就等于没有。将来若要做
--- 保留期清理，那是特权运维动作，应显式 DROP TRIGGER、清理、再重建，全过程
--- 留在 DDL 记录里。
+-- Deliberately no application-level bypass switch. The moment audit immutability has a switch,
+-- it has none. If retention-period pruning is ever wanted, that is a privileged operations
+-- action: DROP TRIGGER explicitly, prune, then rebuild, with the whole sequence left in the DDL
+-- record.
 CREATE FUNCTION audit_events_immutable() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'audit_events is append-only (attempted %)', TG_OP
@@ -56,7 +66,8 @@ CREATE TRIGGER audit_events_no_update_delete
     BEFORE UPDATE OR DELETE ON audit_events
     FOR EACH ROW EXECUTE FUNCTION audit_events_immutable();
 
--- TRUNCATE 不触发行级触发器，单独挡一道，否则一句 TRUNCATE 就绕过了上面全部。
+-- TRUNCATE does not fire row-level triggers, so it is blocked separately; otherwise a single
+-- TRUNCATE walks around everything above.
 CREATE TRIGGER audit_events_no_truncate
     BEFORE TRUNCATE ON audit_events
     FOR EACH STATEMENT EXECUTE FUNCTION audit_events_immutable();

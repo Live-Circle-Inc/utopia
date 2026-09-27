@@ -1,31 +1,38 @@
-//! 包与包之间的同名词处置。
+//! How terms that share a name across packs are disposed of.
 //!
-//! 导入撞 key 时，`owl_import` 的默认判断是 [`Disposition::KeyTaken`]——跳过并报告，
-//! 不自动加后缀。那条理由（"重导入认不出自己上次建的是哪个"）针对的是**猜**出来的
-//! 后缀；本模块给的是**声明**的处置，重导入结果一样，所以不受那条约束。
+//! When an import collides on a key, `owl_import`'s default verdict is
+//! [`Disposition::KeyTaken`] -- skip it and report, do not append a suffix automatically. That
+//! reasoning ("a re-import cannot tell which of them it created last time") is aimed at
+//! **guessed** suffixes; what this module hands out are **declared** dispositions, which come
+//! out the same on a re-import, so that constraint does not bind here.
 //!
-//! 为什么需要它：预制包两两撞名约 20 处，而且分两类——
+//! Why it is needed: the prebuilt packs collide with one another in about 20 places, and those
+//! fall into two kinds --
 //!
-//! - `org:Organization` 与 `schema:Organization` 是**同一个东西**，跳过是对的，
-//!   但不该报成"冲突"让用户去裁一件没得裁的事
-//! - `org:role`（组织里的职位）与 `schema:role`（演员饰演的角色）**只是同名**，
-//!   跳过等于丢掉 W3C Org 存在的理由
+//! - `org:Organization` and `schema:Organization` are **the same thing**, so skipping is right,
+//!   but it should not be reported as a "conflict" that makes the user adjudicate something
+//!   there is nothing to adjudicate
+//! - `org:role` (a position within an organisation) and `schema:role` (the part an actor plays)
+//!   **merely share a name**, and skipping throws away the very reason W3C Org exists
 //!
-//! 只覆盖预制包。用户手动导入的词汇表不在这里——那是明确的意图，撞名该报给他看。
+//! Only the prebuilt packs are covered. Vocabularies a user imports by hand are not in here --
+//! that is explicit intent, and a name collision there ought to be reported to them.
 
-/// 同名词的处置。
+/// The disposition for a term that shares a name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Alignment {
-    /// 同义：已有的那个就是它，不必再建。跳过，但记作"已对齐"而非"冲突"
+    /// Synonym: the one already there is it, no need to create another. Skip it, but record it
+    /// as "aligned" rather than "conflict"
     SameAs,
-    /// 同名不同义：改用这个 key 建出来
+    /// Same name, different meaning: create it under this key instead
     Rename(&'static str),
 }
 
-/// (进来的 IRI, 已占位的 IRI) → 处置。
+/// (incoming IRI, IRI already taken) → disposition.
 ///
-/// 上游自己声明过的对齐优先抄：W3C Org 的文档声明了与 FOAF 的对应，
-/// PROV-O 声明了与 FOAF、Dublin Core 的对应。这里只记我们的包之间实际会撞的那些。
+/// Alignments upstream has declared itself are copied first: the W3C Org documentation declares
+/// its correspondence with FOAF, and PROV-O declares its correspondence with FOAF and Dublin
+/// Core. Only the ones our own packs actually collide on are recorded here.
 const TABLE: &[(&str, &str, Alignment)] = &[
     // ── W3C Org × schema.org ──────────────────────────────────────────
     (
@@ -43,15 +50,15 @@ const TABLE: &[(&str, &str, Alignment)] = &[
         "https://schema.org/location",
         Alignment::SameAs,
     ),
-    // org:Role 是"职位所承载的角色"（与 Post、Membership 配套），
-    // schema:role 是创作作品里的饰演关系。同名，无关
+    // org:Role is "the role a post carries" (it comes as a set with Post and Membership),
+    // schema:role is the playing-a-part relation inside a creative work. Same name, unrelated
     (
         "http://www.w3.org/ns/org#Role",
         "https://schema.org/Role",
         Alignment::Rename("org_role"),
     ),
-    // org:member 是带任期的成员关系（经由 Membership 具体化），
-    // schema:member 是泛指的从属。粒度不同，两个都要
+    // org:member is membership with a term of office (reified through Membership),
+    // schema:member is affiliation in the general sense. Different granularity, we want both
     (
         "http://www.w3.org/ns/org#member",
         "https://schema.org/member",
@@ -63,8 +70,8 @@ const TABLE: &[(&str, &str, Alignment)] = &[
         Alignment::Rename("org_member_of"),
     ),
     // ── PROV-O × schema.org ───────────────────────────────────────────
-    // prov:Agent 是 Person 与 Organization 的**超类**，不是同义词。
-    // 判成 SameAs 会把"施事者"这个抽象层整个抹掉
+    // prov:Agent is the **superclass** of Person and Organization, not a synonym.
+    // Judging it SameAs wipes out the entire "agent" abstraction layer
     (
         "http://www.w3.org/ns/prov#Agent",
         "https://schema.org/agent",
@@ -131,14 +138,15 @@ const TABLE: &[(&str, &str, Alignment)] = &[
         "https://schema.org/member",
         Alignment::SameAs,
     ),
-    // foaf:Agent 与 prov:Agent 同义（PROV-O 官方就是这么对齐的），
-    // 但都不等于 schema:agent
+    // foaf:Agent and prov:Agent are synonyms (that is exactly how PROV-O aligns them
+    // officially), but neither of them equals schema:agent
     (
         "http://xmlns.com/foaf/0.1/Agent",
         "https://schema.org/agent",
         Alignment::Rename("foaf_agent"),
     ),
-    // foaf:status 是即时通讯时代的在线状态，schema:status 是订单/动作状态
+    // foaf:status is the online presence of the instant-messaging era, schema:status is the
+    // status of an order/action
     (
         "http://xmlns.com/foaf/0.1/status",
         "https://schema.org/status",
@@ -146,7 +154,8 @@ const TABLE: &[(&str, &str, Alignment)] = &[
     ),
 ];
 
-/// 撞名时查这张表。两个 IRI 都不在预制包里就返回 `None`，走原来的 `KeyTaken`。
+/// Consulted on a name collision. If neither IRI is in a prebuilt pack it returns `None` and
+/// falls through to the original `KeyTaken`.
 pub fn lookup(incoming_iri: &str, existing_iri: &str) -> Option<Alignment> {
     TABLE
         .iter()
@@ -158,8 +167,9 @@ pub fn lookup(incoming_iri: &str, existing_iri: &str) -> Option<Alignment> {
 mod tests {
     use super::*;
 
-    // 命名空间前缀只在测试里拼 IRI 用；表里写的是完整 IRI，
-    // 因为那是要跟投影结果逐字符比对的东西，拼接会掩盖笔误
+    // The namespace prefixes are only used to build IRIs in the tests; the table spells out full
+    // IRIs, because those are the thing compared character by character against the projection
+    // results, and concatenation would hide a typo
     const SCHEMA: &str = "https://schema.org/";
     const ORG: &str = "http://www.w3.org/ns/org#";
     const PROV: &str = "http://www.w3.org/ns/prov#";
@@ -180,7 +190,8 @@ mod tests {
         );
     }
 
-    /// 不在表里的组合必须落回 `KeyTaken`——**默认是报告冲突，不是猜**
+    /// A pair that is not in the table has to fall back to `KeyTaken` -- **the default is to
+    /// report the conflict, not to guess**
     #[test]
     fn unknown_pairs_fall_through() {
         assert_eq!(
@@ -193,8 +204,9 @@ mod tests {
         );
     }
 
-    /// 方向敏感：表是 (进来的, 已占的)，反过来查不到。
-    /// 装包顺序不同时命中的是不同的条目，不该靠对称性蒙混
+    /// Direction-sensitive: the table is (incoming, already taken), and the reverse finds
+    /// nothing. A different pack install order hits a different entry, so this must not be
+    /// fudged by leaning on symmetry
     #[test]
     fn lookup_is_directional() {
         assert!(lookup(
@@ -204,16 +216,17 @@ mod tests {
         .is_none());
     }
 
-    /// Rename 出来的 key 必须过 `validate_key` 那套约束：小写字母数字下划线、不超 40
+    /// A key produced by Rename has to satisfy the `validate_key` constraints: lowercase
+    /// letters, digits and underscores, no longer than 40
     #[test]
     fn renamed_keys_are_valid() {
         for (_, _, al) in TABLE {
             if let Alignment::Rename(k) = al {
-                assert!(k.len() <= 40, "{k} 超过 40 字符");
+                assert!(k.len() <= 40, "{k} is over 40 characters");
                 assert!(
                     k.chars()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
-                    "{k} 含非法字符"
+                    "{k} has an illegal character"
                 );
             }
         }
@@ -225,34 +238,35 @@ mod tests {
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "对齐表里有重复的 (进来, 已占) 组合");
+        assert_eq!(seen.len(), n, "duplicate (incoming, taken) pairs in table");
     }
 
-    /// FOAF 常量在测试外没被引用，这里确认它拼对了
+    /// The FOAF constant is not referenced outside the tests; this confirms it is spelled right
     #[test]
     fn foaf_namespace_is_used() {
         assert!(lookup(&format!("{FOAF}Person"), &format!("{SCHEMA}Person")).is_some());
     }
 }
 
-/// 对齐表里的 IRI 必须真的出现在包里。
+/// Every IRI in the alignment table has to genuinely appear in a pack.
 ///
-/// 表是手写的字符串，写错一个字符它就静默失效——撞名照样走 `KeyTaken`，
-/// 只是再也不会命中。上游改前缀（schema.org 从 `http://` 迁到 `https://` 就发生过）
-/// 也是同一种失效。所以拿真包跑一遍投影，逐条核对。
+/// The table is hand-written strings, and one wrong character makes it fail silently -- a name
+/// collision still goes through `KeyTaken`, it just never matches again. An upstream prefix
+/// change (which is what happened when schema.org moved from `http://` to `https://`) is the
+/// same kind of failure. So project the real packs and check the table entry by entry.
 #[cfg(test)]
 mod against_real_packs {
     use super::*;
     use std::collections::HashSet;
     use utopia_ingest::ontology_rdf::{project, RdfFormat};
 
-    /// 把所有预制包投影一遍，收集出现过的 IRI
+    /// Projects every prebuilt pack and collects the IRIs that show up
     fn all_iris() -> HashSet<String> {
         let mut out = HashSet::new();
         for p in crate::ontology_packs::PACKS {
             let bytes = crate::ontology_packs::bytes(p).expect(p.id);
             let fmt = RdfFormat::detect(p.filename, &bytes);
-            let proj = project(&bytes, fmt).unwrap_or_else(|e| panic!("{} 投影失败：{e}", p.id));
+            let proj = project(&bytes, fmt).unwrap_or_else(|e| panic!("{} projection: {e}", p.id));
             out.extend(proj.classes.iter().map(|c| c.iri.clone()));
             out.extend(proj.properties.iter().map(|p| p.iri.clone()));
         }
@@ -273,7 +287,7 @@ mod against_real_packs {
         }
         assert!(
             missing.is_empty(),
-            "对齐表里这些 IRI 在任何预制包里都找不到，表已失效：\n  {}",
+            "these alignment-table IRIs are in no prebuilt pack at all, the table has gone stale:\n  {}",
             missing.join("\n  ")
         );
     }

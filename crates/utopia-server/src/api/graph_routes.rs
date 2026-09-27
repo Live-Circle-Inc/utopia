@@ -19,7 +19,7 @@ pub(super) async fn require_kb(
     utopia_store::access::require_kb(&state.pool, user, kb_id, min).await
 }
 
-/// `at`：可选 as-of 日期（YYYY-MM-DD 或 RFC3339）——服务端时间旅行。
+/// `at`: optional as-of date (YYYY-MM-DD or RFC3339) -- server-side time travel.
 fn parse_at(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -32,20 +32,24 @@ fn parse_at(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, 
         .map_err(|_| AppError::Validation("Invalid `at` (expected YYYY-MM-DD or RFC3339)".into()))
 }
 
-/// 总览一次画多少个节点的**默认值**。上限本身是合理的——画一万个点没人看得懂；
-/// 骗人的是把它当成规模显示，所以接口同时回总数
+/// The **default** number of nodes the overview draws at once. The cap itself is reasonable --
+/// nobody can make sense of ten thousand dots; what misleads is presenting it as the size, so the
+/// endpoint returns the total alongside it
 const GRAPH_NODE_CAP: i64 = 150;
-/// 调得再高也得有个天花板。**这个数不是拍的**：节点按度数降序取，越往后越是
-/// 边缘节点，而力导布局是 O(n²) 量级的——超过这个数，先垮的是「拖得动」
-/// 而不是「看得清」。要真看上万个点，那是另一种视图，不是把这个调大
+/// However high you turn it up there still has to be a ceiling. **This number was not pulled out
+/// of the air**: nodes are taken in descending degree order, so the further down you go the more
+/// peripheral they are, and force-directed layout is on the order of O(n²) -- past this number
+/// what breaks first is "you can still drag it around", not "you can still see it". If you really
+/// want to look at tens of thousands of dots, that is a different view, not this knob turned up
 const GRAPH_NODE_CAP_MAX: i64 = 1000;
 
 #[derive(Deserialize)]
 pub struct OverviewQuery {
     #[serde(default)]
     pub at: Option<String>,
-    /// 画多少个。不给就用默认值；给了也钳在 [10, GRAPH_NODE_CAP_MAX]——
-    /// 界面上的按钮只给几档，但接口是公开的，别让一个 `limit=999999` 把库拖垮
+    /// How many to draw. Absent, the default is used; supplied, it is still clamped to
+    /// [10, GRAPH_NODE_CAP_MAX] -- the UI only offers a few steps, but the endpoint is public,
+    /// and one `limit=999999` should not be able to drag the database down
     #[serde(default)]
     pub limit: Option<i64>,
 }
@@ -58,8 +62,9 @@ pub async fn overview(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
     let at = parse_at(q.at.as_deref())?;
-    // 画多少个是渲染的事，库里有多少是知识库的事——两个数都回，界面才说得出
-    // 「画了 150 个，共 325 个」而不是把上限说成规模
+    // How many get drawn is rendering's business; how many the database holds is the knowledge
+    // base's business -- return both numbers and the UI can say "drew 150 of 325" instead of
+    // passing the cap off as the size
     let limit = q
         .limit
         .unwrap_or(GRAPH_NODE_CAP)
@@ -114,8 +119,9 @@ pub async fn search_entities(
     if query.q.trim().is_empty() {
         return Ok(Json(json!({ "entities": [], "total": 0 })));
     }
-    // 一并回总数：「宁分勿合」本来就会造出一堆同名，固定十条时想找的那个
-    // 可能根本不在这十条里，而界面上看不出来
+    // Return the total as well: "split rather than merge" inevitably produces a pile of
+    // same-named entities, and with a fixed ten rows the one you are looking for may not be among
+    // those ten at all -- and the UI gives no sign of it
     let (entities, total) = utopia_store::graph::search_entities(
         &state.pool,
         kb_id,
@@ -134,18 +140,23 @@ pub async fn entity_detail(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
     let (entity, facts) = utopia_store::graph::entity_detail(&state.pool, kb_id, entity_id).await?;
-    // 推出来的那些**单独回一个键**，不掺进 `facts`。前端据此给它们自己的一档：
-    // 一条派生边跟一条断言边混在同一个列表里，用户看不出「这条是文档里写的」
-    // 和「这条是引擎推的」的区别，而那正是推理会污染知识的样子
+    // The inferred ones **come back under their own key**; they are not mixed into `facts`. The
+    // frontend gives them their own tier on that basis: with a derived edge and an asserted edge
+    // in the same list, the user cannot tell "this one is written in the document" from "this one
+    // was inferred by the engine" -- and that is exactly what reasoning polluting knowledge looks
+    // like
     let derived =
         utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id).await?;
-    // 同名的那些**打开面板时就给**，不是等改名之后才回。
+    // The same-named ones are **handed over when the panel opens**, not returned only after a
+    // rename.
     //
-    // 从前它只随 `update_entity` 的响应回来，于是「把同名的合并进来」这个动作
-    // 只有先改一次名才够得着——而两个张伟并存是「宁分勿合」的正当产物，不是
-    // 改名改出来的。合并入口该长在能看见同名的地方。
+    // It used to come back only in `update_entity`'s response, which meant the "merge the
+    // same-named one in" action was reachable only by renaming something first -- and two Zhang
+    // Weis coexisting is a legitimate product of "split rather than merge", not something a
+    // rename created. The merge entry point belongs where the same-named ones are visible.
     let same_name = utopia_store::graph::same_name_peers(&state.pool, kb_id, entity_id).await?;
-    // 没落地的派生（0017 §3）也单独一个键：它们连 `derived_facts` 都不在
+    // Derivations that never landed (0017 §3) get their own key too: they are not even in
+    // `derived_facts`
     let blocked =
         utopia_store::reasoning::blocked_for_entity(&state.pool, kb_id, entity_id).await?;
     Ok(Json(json!({
@@ -162,10 +173,13 @@ pub struct EntityPatch {
     pub canonical_name: Option<String>,
 }
 
-/// 人工修正实体的类型或名字。抽取给的是初判，此前判错只能整库重抽。
+/// Manually correcting an entity's type or name. What extraction gives is a first judgement, and
+/// before this a wrong one could only be fixed by re-extracting the whole database.
 ///
-/// 改名撞上同名实体不拦（两个张伟是"宁分勿合"的正当产物），改完把同名的报回去，
-/// 由界面提示是否合并——判定它们是否真是同一个，是人的事。
+/// A rename colliding with a same-named entity is not blocked (two Zhang Weis are a legitimate
+/// product of "split rather than merge"); once renamed, the same-named ones are reported back and
+/// the UI asks whether to merge -- deciding whether they really are the same one is a human's
+/// job.
 pub async fn update_entity(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -185,8 +199,10 @@ pub async fn update_entity(
     )
     .await?;
 
-    // 台账快照自包含：类型以后被删掉，这条记录仍然读得懂。
-    // P4 要按 from/to 聚合"一个月里 37 个实体从 Product 挪到 Concept"，所以分开记两个动作。
+    // The ledger snapshot is self-contained: if the type is deleted later, this record is still
+    // readable.
+    // P4 wants to aggregate by from/to -- "37 entities moved from Product to Concept this month"
+    // -- so the two actions are recorded separately.
     if before.type_key != after.type_key {
         let _ = utopia_store::audit::record(
             &state.pool,
@@ -231,8 +247,10 @@ pub async fn fact_evidence(
     Ok(Json(json!({ "evidence": evidence })))
 }
 
-/// 一条派生事实的证明（0002 R2）：前提按推导顺序，每条带证据，一路到原句。
-/// 派生已失效或不存在时 `proof` 为 null——不是错误，界面据此退回文本前提
+/// The proof of one derived fact (0002 R2): premises in derivation order, each with its evidence,
+/// all the way down to the original sentence.
+/// When the derivation has been invalidated or does not exist, `proof` is null -- that is not an
+/// error, and the UI falls back to textual premises on that basis
 pub async fn derived_proof(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -243,8 +261,9 @@ pub async fn derived_proof(
     Ok(Json(json!({ "proof": proof })))
 }
 
-/// 没落地的派生的证明链（0017 §3）：前提在那条 `derived_contradiction` 违规的
-/// `path` 里，展开方式与落了地的一样。违规不存在时 `steps` 为 null
+/// The proof chain of a derivation that never landed (0017 §3): the premises live in the `path`
+/// of that `derived_contradiction` violation, and are expanded the same way as for one that did
+/// land. When the violation does not exist, `steps` is null
 pub async fn blocked_proof(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -255,7 +274,8 @@ pub async fn blocked_proof(
     Ok(Json(json!({ "steps": steps })))
 }
 
-/// 手动触发抽取（failed 重试 / 补配模型后补抽）。
+/// Manually triggering extraction (retrying a failure / catching up after a model was
+/// configured).
 pub async fn extract(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -263,16 +283,20 @@ pub async fn extract(
 ) -> ApiResult<Json<serde_json::Value>> {
     let doc = utopia_store::documents::get(&state.pool, document_id).await?;
     require_kb(&state, &user, doc.kb_id, Role::Editor).await?;
-    // 手动触发 = 强制全量：清增量标记、解雇在跑的任务、置 queued、建任务，一个事务办完
+    // Manual trigger = forced full run: clear the incremental marker, fire the running job, set
+    // queued, create the job -- all in one transaction
     let job_id = utopia_store::documents::queue_extraction_one(&state.pool, document_id).await?;
     state.emit_document(doc.kb_id, document_id);
     Ok(Json(json!({ "job_id": job_id })))
 }
 
-/// 图谱重建（清算语义，KB admin）：清空整个图层后全量重抽。
-/// 与来源级重抽的分工——重抽保留既有决策，重建放弃它们，换取
-/// "当前语料 × 当前本体"的确定性重演（早期脏抽取、本体大改后的收场手段）。
-/// 决策台账与裁决缓存刻意保留（见 store::graph::purge_graph）。
+/// Rebuilding the graph (settlement semantics, KB admin): wipe the entire graph layer, then
+/// re-extract everything.
+/// The division of labour against source-level re-extraction -- re-extraction preserves existing
+/// decisions, a rebuild abandons them, in exchange for a deterministic replay of "current corpus
+/// x current ontology" (the way out of early dirty extractions, or of a large ontology change).
+/// The decision ledger and the adjudication cache are deliberately preserved (see
+/// store::graph::purge_graph).
 pub async fn rebuild(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -280,7 +304,8 @@ pub async fn rebuild(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Admin).await?;
     let (entities, facts) = utopia_store::graph::purge_graph(&state.pool, kb_id).await?;
-    // 任务由 queue_extraction 与状态同事务建好，这里只负责推送
+    // The jobs are created by queue_extraction in the same transaction as the status, so all
+    // this does is push
     let ids = utopia_store::documents::queue_extraction(&state.pool, kb_id, None).await?;
     for id in &ids {
         state.emit_document(kb_id, *id);
@@ -313,8 +338,9 @@ fn default_history_per() -> i64 {
     30
 }
 
-/// 实体的认知变更历史（记录时间轴）：我们何时这么认为、又何时改了主意。
-/// 与 entity_detail（有效时间轴，只看现行）互补。
+/// An entity's epistemic change history (the record-time axis): when we thought this, and when we
+/// changed our mind.
+/// Complementary to entity_detail (the valid-time axis, showing only what is current).
 pub async fn entity_history(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

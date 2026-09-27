@@ -1,79 +1,96 @@
-//! 告警中心（0005）。**Review 管知识的对错，告警管系统的死活。**
+//! Alert centre (0005). **Review is about whether the knowledge is correct; alerts are about
+//! whether the system is alive.**
 //!
-//! **一次故障一行，写完不再改。** 这张表刻意没有状态机：没有"已解决"，
-//! 没有自愈，没有把多次故障并成一行。
+//! **One failure, one row, never edited again.** This table deliberately has no state machine:
+//! no "resolved", no self-healing, no collapsing several failures into a single row.
 //!
-//! 曾经有过，代价是每种新告警都得自己实现一遍"怎么算修好了"——
-//! `source.sync_failed` 有天然的成功信号（同步成功了），`llm.unreachable` 没有，
-//! 就得为它单独造一个后台探针；第三种告警要造第三套，而漏写清除编译期看不出来，
-//! 症状是告警永远亮着。更根本的是**那不是告警中心该回答的问题**：现在还坏不坏，
-//! 来源页面上写着、文档状态里写着。告警的职责是让人去看一眼，不是当实时看板。
+//! It did once, and the price was that every new alert kind had to implement "what counts as
+//! fixed" all over again -- `source.sync_failed` has a natural success signal (the sync
+//! succeeded), `llm.unreachable` does not, so it needed a background probe built just for it;
+//! a third alert kind would need a third mechanism, and a forgotten clear is invisible at
+//! compile time, the symptom being an alert that stays lit forever. More fundamentally,
+//! **that is not the question the alert centre should be answering**: whether something is
+//! still broken right now is written on the source page and in the document status. An alert's
+//! job is to make someone go take a look, not to be a live dashboard.
 //!
-//! 去重也不做。「同一个源连续 24 小时每小时失败」是 24 条不是 1 条——
-//! 要写成 1 条就得判断"这是复发还是一直没好"，而那**在数据上无法区分**，
-//! 除非引入时钟或者成功信号。漏报比行数贵得多，所以宁可多写行，
-//! 靠 [`purge_older_than`] 收尾。
+//! No dedup either. "The same source failing every hour for 24 hours straight" is 24 rows, not
+//! 1 -- writing it as 1 would mean deciding "is this a recurrence or has it just never
+//! recovered", and that is **indistinguishable in the data** unless you bring in a clock or a
+//! success signal. A missed alert costs far more than a row does, so we would rather write the
+//! extra rows and let [`purge_older_than`] clean up.
 
 use sqlx::PgPool;
 use utopia_core::models::{Role, User};
 use utopia_core::AppResult;
 use uuid::Uuid;
 
-/// 告警 kind。**字符串写死在这里而不是散在调用点**：界面按它查措辞，
-/// 拼错一个字母就会退回显示代号，而这种错编译期看不出来。
+/// Alert kinds. **The strings are pinned here rather than scattered across call sites**: the UI
+/// looks up its wording by them, so one mistyped letter falls back to showing the raw code, and
+/// that kind of mistake is invisible at compile time.
 pub mod kind {
-    /// 库级：某个来源同步失败。`min_role = editor`
+    /// KB-level: some source failed to sync. `min_role = editor`
     pub const SOURCE_SYNC_FAILED: &str = "source.sync_failed";
-    /// 系统级：模型端点没给出可用的回答——连不上，或者连上了但回来的不是这个 API。
-    /// 端点干净地回 4xx 不算：那说明它就是模型 API，只是密钥或配额不对。
-    /// 配额那一种见 [`LLM_RATE_LIMITED`]
+    /// System-level: the model endpoint gave no usable answer -- unreachable, or reachable but
+    /// what came back is not this API. A clean 4xx from the endpoint does not count: that means
+    /// it really is the model API, just with the wrong key or quota.
+    /// For the quota case see [`LLM_RATE_LIMITED`]
     pub const LLM_UNREACHABLE: &str = "llm.unreachable";
-    /// 系统级：端点在限流，退避重试用尽后仍然过不去。`min_role = admin`
+    /// System-level: the endpoint is rate limiting and it still will not go through after the
+    /// backoff retries are exhausted. `min_role = admin`
     ///
-    /// **与 [`LLM_UNREACHABLE`] 分开，因为该做的事不同**：端点不可达要去查
-    /// 网络或地址，配额打满要去降并发或升档，找的人和动作都不一样。
+    /// **Kept separate from [`LLM_UNREACHABLE`] because what you have to do differs**: an
+    /// unreachable endpoint means going and checking the network or the address, a maxed-out
+    /// quota means lowering concurrency or upgrading the plan -- different people, different
+    /// actions.
     ///
-    /// severity 是 `warning` 不是 `error`：配额会自己恢复，端点挂了不会。
+    /// severity is `warning`, not `error`: quota recovers on its own, a dead endpoint does not.
     ///
-    /// 它补的是「退避重试」留下的那一半。重试之后不再丢数据，但一篇文档
-    /// 真的被配额挡在外面时，没有这条告警就没有任何人知道——
-    /// 实测一次跑测里 4 篇失败，一半是不可达（有告警），一半是限流（静默）。
+    /// This fills in the half that "backoff retry" left behind. After retrying we no longer
+    /// lose data, but when a document really does get shut out by the quota, without this alert
+    /// nobody knows at all -- in one measured run 4 documents failed, half of them unreachable
+    /// (alerted) and half of them rate limited (silent).
     pub const LLM_RATE_LIMITED: &str = "llm.rate_limited";
-    /// 系统级：账号付不起请求——欠费或套餐配额用尽。`min_role = admin`
+    /// System-level: the account cannot pay for requests -- overdue balance or the plan's quota
+    /// is used up. `min_role = admin`
     ///
-    /// **`error` 而不是 `warning`，正因为它跟限流的区别是「会不会自己好」**：
-    /// 配额到点重置，欠费不会。在有人去充值之前，这个部署的抽取与向量化
-    /// 一直是停的。
+    /// **`error` rather than `warning`, precisely because the difference from rate limiting is
+    /// "will it get better on its own"**: quota resets on schedule, an overdue balance does not.
+    /// Until somebody tops up, extraction and vectorisation on this deployment stay stopped.
     pub const LLM_OUT_OF_CREDIT: &str = "llm.out_of_credit";
-    /// 库级：数据源挂上了，它的库表结构却没摄进来。`min_role = admin`
+    /// KB-level: the data source got mounted, but its schema was never ingested. `min_role = admin`
     ///
-    /// **这一条描述的不是那次失败，是它留下的状态**：源挂着，而问数看不见它有
-    /// 哪些表——`query_data` 照样入列，模型却只能瞎猜列名。挂载那一刻的报错
-    /// 只有点按钮的人看得见，此后这个库就一直这样静默地缺着。
+    /// **This one describes not that failure but the state it left behind**: the source is
+    /// mounted, yet data questions cannot see which tables it has -- `query_data` still gets
+    /// queued, but the model can only guess at column names. The error at the moment of
+    /// mounting is visible only to the person who clicked the button, and from then on this KB
+    /// just stays silently incomplete.
     pub const SCHEMA_SYNC_FAILED: &str = "data_source.schema_sync_failed";
-    /// 库级：映射探索跑完了，一条口径都没提出来。`severity = info`，`min_role = editor`——
-    /// 不是故障，是"你在等的那件事没有结果"，而页面上没有别的地方能说这句话（#223）
+    /// KB-level: mapping exploration finished and did not propose a single definition.
+    /// `severity = info`, `min_role = editor` -- not a failure, but "the thing you were waiting
+    /// for produced no result", and there is nowhere else on the page that can say that (#223)
     pub const MAPPING_EXPLORATION_EMPTY: &str = "mapping.exploration_empty";
 }
 
-/// 一次故障。打包成结构体不只是为了参数个数——调用点写 `severity: "error"`
-/// 比"第三个位置参数是 error"好读得多，而告警源只会越来越多。
+/// One failure. Packing it into a struct is not just about the argument count -- writing
+/// `severity: "error"` at the call site reads far better than "the third positional argument is
+/// error", and the number of alert sources will only grow.
 pub struct NewAlert<'a> {
-    /// None = 系统级
+    /// None = system-level
     pub kb_id: Option<Uuid>,
     pub severity: &'a str,
-    /// 用 [`kind`] 里的常量，别写字面量
+    /// Use the constants in [`kind`], do not write literals
     pub kind: &'a str,
     pub min_role: Role,
     /// document / source / system
     pub subject_type: Option<&'a str>,
     pub subject_id: Option<Uuid>,
-    /// 给人看的那份：名字、报错原文。**名字要在这里存一份**——
-    /// 对象被删之后 `subject_id` 就解析不出名字了，而告警该留得住
+    /// The part people look at: names, the original error text. **The name has to be stored
+    /// here** -- once the object is deleted `subject_id` no longer resolves to a name, and an
+    /// alert should outlast it
     pub detail: serde_json::Value,
 }
 
-/// 记一次故障。就是一条 INSERT，没有冲突处理，没有回读。
+/// Record one failure. Just an INSERT: no conflict handling, no read-back.
 pub async fn raise(pool: &PgPool, a: NewAlert<'_>) -> AppResult<Uuid> {
     let id = Uuid::now_v7();
     sqlx::query(
@@ -94,10 +111,11 @@ pub async fn raise(pool: &PgPool, a: NewAlert<'_>) -> AppResult<Uuid> {
     Ok(id)
 }
 
-/// 保留期清理。**纯原子的代价就在这里**：一个坏掉的来源按小时同步，
-/// 一天写 24 行；不清理这张表会长成第二个日志文件。
+/// Retention cleanup. **This is exactly where the purely atomic design costs you**: a broken
+/// source syncing hourly writes 24 rows a day; without cleanup this table grows into a second
+/// log file.
 ///
-/// 一并删掉已读记录（外键 CASCADE）。
+/// Read receipts go with it (foreign key CASCADE).
 pub async fn purge_older_than(pool: &PgPool, days: i32) -> AppResult<u64> {
     let n = sqlx::query("DELETE FROM alerts WHERE created_at < now() - make_interval(days => $1)")
         .bind(days)
@@ -106,10 +124,12 @@ pub async fn purge_older_than(pool: &PgPool, days: i32) -> AppResult<u64> {
     Ok(n.rows_affected())
 }
 
-/// 可见性谓词，**只写这一份**。列表、未读数、全部已读各查各的，
-/// 但"谁能看见什么"是同一条规则；抄三遍迟早会漂。
+/// The visibility predicate, **written exactly once**. The list, the unread count and
+/// mark-all-read each run their own query, but "who can see what" is one single rule; copy it
+/// three times and it will drift sooner or later.
 ///
-/// `$1` = user_id、`$2` = is_admin、`$3` = 可见 kb 数组、`$4` = 对应角色的秩。
+/// `$1` = user_id, `$2` = is_admin, `$3` = the array of visible kbs, `$4` = the rank of the
+/// matching role.
 const VISIBLE: &str = "
     CASE
         WHEN a.kb_id IS NULL THEN $2::bool
@@ -123,56 +143,62 @@ const VISIBLE: &str = "
                     ELSE 3 END)
     END";
 
-/// 搜索匹配的是**库名、对象详情、kind 代号**，不是界面上那句标题。
+/// Search matches the **KB name, the subject detail and the kind code**, not the headline shown
+/// in the UI.
 ///
-/// 标题的措辞在客户端（0004：服务端不产出展示文案），所以服务端搜不到它。
-/// 这不是将就：人会去搜的是来源名、库名、报错原文——那些语言中立、
-/// 而且就在 detail 里。按类别找东西该用筛选，不是搜索框。
+/// The headline's wording lives in the client (0004: the server produces no display copy), so
+/// the server cannot search it. This is not a compromise: what people go looking for is a source
+/// name, a KB name, the original error text -- those are language-neutral, and they are right
+/// there in detail. Finding things by category is what a filter is for, not the search box.
 const SEARCH: &str = "
     ($5::text IS NULL
      OR a.kind ILIKE '%' || $5 || '%'
      OR COALESCE(k.name, '') ILIKE '%' || $5 || '%'
      OR a.detail::text ILIKE '%' || $5 || '%')";
 
-/// 一组：**连着的**、同 `(kb, kind)` 的几次故障。
+/// A group: several **consecutive** failures with the same `(kb, kind)`.
 ///
-/// 存储是原子的（一次故障一行），折叠只影响读。分组在服务端做而不是前端，
-/// 是因为**分页得按组分**：前端折叠的话一页只能取固定行数，一段连续故障
-/// 跨了页边界就会断成两组，点一下也只标到边界为止。
+/// Storage is atomic (one failure, one row); collapsing only affects reads. Grouping happens on
+/// the server rather than the front end because **pagination has to be by group**: if the front
+/// end collapsed, a page could only fetch a fixed number of rows, so a run of consecutive
+/// failures that straddles a page boundary would break into two groups, and one click would only
+/// mark up to that boundary.
 #[derive(sqlx::FromRow)]
 pub struct AlertGroup {
     pub kb_id: Option<Uuid>,
     pub kb_name: Option<String>,
     pub kind: String,
-    /// 组里最重的那一档
+    /// The heaviest severity in the group
     pub severity: String,
-    /// 这一组几次
+    /// How many times in this group
     pub count: i64,
-    /// 其中我没读过的几次
+    /// How many of those I have not read
     pub unread: i64,
-    /// 组里最新与最早的时刻。**标已读按这个区间圈**，不用把 id 列表发给前端——
-    /// 一组可能有几百条
+    /// The newest and oldest timestamps in the group. **Mark-as-read fences by this range**
+    /// instead of sending the front end an id list -- a group can hold hundreds of rows
     pub latest_at: chrono::DateTime<chrono::Utc>,
     pub earliest_at: chrono::DateTime<chrono::Utc>,
-    /// 明细，最多 [`GROUP_LINES`] 条，新的在前
+    /// Details, at most [`GROUP_LINES`] of them, newest first
     pub lines: Vec<serde_json::Value>,
 }
 
-/// 一组里最多带回几条明细。面板里列不下更多，而一组可能有几百条——
-/// 全发过来只是让首屏更慢
+/// How many detail lines a group brings back at most. The panel cannot list any more than that,
+/// and a group can hold hundreds -- sending them all just makes the first paint slower
 const GROUP_LINES: i64 = 5;
 
-/// 一页分组，外加总组数。
+/// One page of groups, plus the total group count.
 pub struct GroupPage {
     pub items: Vec<AlertGroup>,
     pub total: i64,
 }
 
-/// 相邻同类折叠：两个 `row_number()` 相减（gaps and islands）。
+/// Collapsing adjacent same-kind rows: subtracting two `row_number()`s (gaps and islands).
 ///
-/// 全局序号减去"同 (kb, kind) 内的序号"，连着的同类会得到同一个差值，
-/// 中间插进别的故障就会让差值变化——于是差值就是组号。
-/// `PARTITION BY kb_id` 把 NULL 当作相等，所以系统级告警自然归成一组。
+/// The global sequence number minus "the sequence number within the same (kb, kind)" gives the
+/// same difference for consecutive rows of the same kind, and another failure slipping in between
+/// makes that difference change -- so the difference *is* the group number.
+/// `PARTITION BY kb_id` treats NULL as equal, so system-level alerts naturally fall into one
+/// group.
 const ISLANDS: &str = "
     SELECT v.*,
            row_number() OVER (ORDER BY v.created_at DESC, v.id DESC)
@@ -180,7 +206,7 @@ const ISLANDS: &str = "
                               ORDER BY v.created_at DESC, v.id DESC) AS grp
     FROM v";
 
-/// 这个人能看见的告警，**按组分页**，时间倒序。
+/// The alerts this person can see, **paginated by group**, newest first.
 pub async fn list_groups(
     pool: &PgPool,
     user: &User,
@@ -189,7 +215,8 @@ pub async fn list_groups(
     offset: i64,
 ) -> AppResult<GroupPage> {
     let (kb_ids, kb_roles) = visible(pool, user).await?;
-    // 空串当没搜：前端清空搜索框时不该变成"搜一个空字符串"
+    // An empty string counts as no search: clearing the search box should not turn into
+    // "search for an empty string"
     let q = q.map(str::trim).filter(|s| !s.is_empty());
     let base = format!(
         "WITH v AS (
@@ -205,7 +232,8 @@ pub async fn list_groups(
     let sql = format!(
         "{base}
          SELECT kb_id, max(kb_name) AS kb_name, kind,
-                -- severity 按轻重取最大，不能按字典序：那样 warning 会压过 error
+                -- severity takes the max by seriousness, not lexicographically: that way
+                -- warning would outrank error
                 CASE max(CASE severity WHEN 'error' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END)
                     WHEN 3 THEN 'error' WHEN 2 THEN 'warning' ELSE 'info' END AS severity,
                 count(*) AS count,
@@ -228,7 +256,7 @@ pub async fn list_groups(
         .bind(offset)
         .fetch_all(pool)
         .await?;
-    // 总**组**数，不是总行数——翻页控件数的是组
+    // The total number of **groups**, not of rows -- the pager counts groups
     let count_sql =
         format!("{base} SELECT count(*) FROM (SELECT 1 FROM isl GROUP BY kb_id, kind, grp) g");
     let (total,): (i64,) = sqlx::query_as(&count_sql)
@@ -242,10 +270,10 @@ pub async fn list_groups(
     Ok(GroupPage { items, total })
 }
 
-/// 把一整组标已读。**按时间区间圈**，不按 id 列表——一组可能有几百条，
-/// 把 id 全发给前端再发回来只是白跑一趟。
+/// Mark a whole group read. **Fenced by time range**, not by id list -- a group can hold
+/// hundreds of rows, and sending all the ids to the front end and back again is a wasted trip.
 ///
-/// 可见性照查：不能让人靠猜 kind 把看不见的告警标掉。
+/// Visibility is still checked: nobody gets to guess a kind and mark away alerts they cannot see.
 pub async fn mark_group_read(
     pool: &PgPool,
     user: &User,
@@ -260,7 +288,7 @@ pub async fn mark_group_read(
          SELECT a.id, $1 FROM alerts a
          WHERE ({VISIBLE})
            AND a.kind = $5
-           -- IS NOT DISTINCT FROM：系统级告警的 kb_id 是 NULL，= 比不出来
+           -- IS NOT DISTINCT FROM: a system-level alert has a NULL kb_id, which = cannot compare
            AND a.kb_id IS NOT DISTINCT FROM $6
            AND a.created_at BETWEEN $7 AND $8
          ON CONFLICT DO NOTHING"
@@ -279,7 +307,7 @@ pub async fn mark_group_read(
     Ok(n.rows_affected())
 }
 
-/// 我的未读数。
+/// My unread count.
 pub async fn unread_count(pool: &PgPool, user: &User) -> AppResult<i64> {
     let (kb_ids, kb_roles) = visible(pool, user).await?;
     let sql = format!(
@@ -297,10 +325,11 @@ pub async fn unread_count(pool: &PgPool, user: &User) -> AppResult<i64> {
     Ok(n)
 }
 
-/// 把我能看见的全标已读。
+/// Mark everything I can see as read.
 ///
-/// 一条 SQL 而不是逐条 insert：逐条要先把列表取回来，而"能看见什么"
-/// 已经在 [`VISIBLE`] 里写过一遍了，取回来再遍历等于把同一条规则用两次。
+/// One SQL statement rather than inserting row by row: row by row would mean fetching the list
+/// first, and "what can be seen" is already written out once in [`VISIBLE`], so fetching it and
+/// iterating means using the same rule twice.
 pub async fn mark_all_read(pool: &PgPool, user: &User) -> AppResult<u64> {
     let (kb_ids, kb_roles) = visible(pool, user).await?;
     let sql = format!(
@@ -319,16 +348,17 @@ pub async fn mark_all_read(pool: &PgPool, user: &User) -> AppResult<u64> {
     Ok(n.rows_affected())
 }
 
-/// 可见 KB 拆成两个平行数组：Postgres 没有元组数组的方便写法，
-/// `unnest(a, b)` 两列并排展开是标准做法。
+/// The visible KBs split into two parallel arrays: Postgres has no convenient syntax for an
+/// array of tuples, and expanding two columns side by side with `unnest(a, b)` is the standard
+/// approach.
 async fn visible(pool: &PgPool, user: &User) -> AppResult<(Vec<Uuid>, Vec<i32>)> {
     let roles = crate::access::visible_kb_roles(pool, user).await?;
     Ok(roles.into_iter().map(|(id, r)| (id, rank(r))).unzip())
 }
 
-/// 角色的序，用来跟 `alerts.min_role` 比大小。
-/// 跟 [`Role`] 的 `PartialOrd` 同序，也跟 [`VISIBLE`] 里那个 CASE 同序——
-/// 三处必须一致
+/// The ordering of roles, used to compare against `alerts.min_role`.
+/// Same order as [`Role`]'s `PartialOrd`, and the same order as that CASE in [`VISIBLE`] --
+/// all three have to agree
 fn rank(r: Role) -> i32 {
     match r {
         Role::Viewer => 0,

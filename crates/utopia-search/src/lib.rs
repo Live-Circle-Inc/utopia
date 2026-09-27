@@ -1,5 +1,7 @@
-//! utopia-search: 内嵌 Tantivy 全文索引（jieba 中文分词）+ RRF 融合。
-//! 单索引多 KB：kb_id 作过滤字段；chunk 正文在 Postgres，索引里只存 id 映射。
+//! utopia-search: an embedded Tantivy full-text index (jieba Chinese tokenization) plus RRF
+//! fusion.
+//! One index, many KBs: kb_id is the filter field; chunk bodies live in Postgres, the index
+//! only holds the id mapping.
 
 mod docs;
 pub use docs::{DocsIndex, DocsSection};
@@ -66,7 +68,7 @@ impl SearchIndex {
         let analyzer = index
             .tokenizers()
             .get(JIEBA)
-            .context("jieba tokenizer 未注册")?;
+            .context("jieba tokenizer is not registered")?;
 
         Ok(Self {
             writer: Mutex::new(writer),
@@ -79,14 +81,15 @@ impl SearchIndex {
         })
     }
 
-    /// 重建某文档的索引条目（先删后加，幂等），随后 commit。
+    /// Rebuild one document's index entries (delete first, then add, so it is idempotent),
+    /// then commit.
     pub fn reindex_document(
         &self,
         kb_id: &str,
         document_id: &str,
         chunks: &[(String, String)],
     ) -> anyhow::Result<()> {
-        let mut writer = self.writer.lock().expect("writer 锁中毒");
+        let mut writer = self.writer.lock().expect("writer lock poisoned");
         writer.delete_term(Term::from_field_text(self.f_document_id, document_id));
         for (chunk_id, text) in chunks {
             let mut doc = TantivyDocument::default();
@@ -97,22 +100,24 @@ impl SearchIndex {
             writer.add_document(doc)?;
         }
         writer.commit()?;
-        // 写后即可读：不等 reader 的异步重载窗口
+        // Readable immediately after the write: do not wait out the reader's async reload
+        // window
         self.reader.reload()?;
         Ok(())
     }
 
     pub fn delete_document(&self, document_id: &str) -> anyhow::Result<()> {
-        let mut writer = self.writer.lock().expect("writer 锁中毒");
+        let mut writer = self.writer.lock().expect("writer lock poisoned");
         writer.delete_term(Term::from_field_text(self.f_document_id, document_id));
         writer.commit()?;
         self.reader.reload()?;
         Ok(())
     }
 
-    /// 索引里有多少条分块。**启动时拿它跟库里的数对账**——索引目录是独立于
-    /// 数据库的一份文件（换机器、卷没挂上、损坏都可能让它落空），而落空之后
-    /// 检索只会静默回零，界面上看不出任何异样。
+    /// How many chunks the index holds. **At startup, reconcile it against the count in the
+    /// database** -- the index directory is a set of files independent of the database (a new
+    /// machine, an unmounted volume, or corruption can all leave it empty), and once it is
+    /// empty, search just silently returns nothing with no sign of anything wrong in the UI.
     pub fn len(&self) -> usize {
         self.reader.searcher().num_docs() as usize
     }
@@ -121,9 +126,11 @@ impl SearchIndex {
         self.len() == 0
     }
 
-    /// BM25 检索（限定 kb）。
-    /// 查询用与索引完全一致的 jieba analyzer 切词后按 OR 组合——
-    /// 不能走 QueryParser：CJK 整句会被当成短语查询（要求词连续出现），召回归零。
+    /// BM25 search (scoped to one kb).
+    /// The query is tokenized with exactly the same jieba analyzer as the index and the terms
+    /// are combined with OR -- we cannot go through QueryParser: a whole CJK sentence gets
+    /// treated as a phrase query (the words must appear consecutively), and recall drops to
+    /// zero.
     pub fn search(&self, kb_id: &str, query: &str, limit: usize) -> anyhow::Result<Vec<Hit>> {
         let mut analyzer = self.analyzer.clone();
         let mut stream = analyzer.token_stream(query);
@@ -170,7 +177,8 @@ impl SearchIndex {
     }
 }
 
-/// Reciprocal Rank Fusion：融合多路召回的排名（k=60 为经验常数）。
+/// Reciprocal Rank Fusion: fuses the rankings from several retrieval paths (k=60 is the
+/// usual empirical constant).
 pub fn rrf_fuse(lists: &[Vec<String>], limit: usize) -> Vec<String> {
     const K: f64 = 60.0;
     let mut scores: HashMap<String, f64> = HashMap::new();

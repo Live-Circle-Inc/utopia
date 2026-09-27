@@ -1,6 +1,9 @@
-//! Agentic 对话：模型自主调用工具（文档检索 / 实体查找 / 时态事实）收集证据后作答。
-//! 事件序列：step*（行动轨迹）| sources（引用清单，随检索增量更新）| delta*（增量文本）→ done | error。
-//! 模型不支持 tool-calling 时自动降级为一次性 RAG 注入。
+//! Agentic conversation: the model calls tools on its own (document search / entity lookup /
+//! temporal facts) to gather evidence, then answers.
+//! Event sequence: step* (the action trail) | sources (the citation list, updated incrementally
+//! as retrieval goes) | delta* (incremental text) → done | error.
+//! When the model does not support tool-calling it degrades automatically to a one-shot RAG
+//! injection.
 
 use super::tools;
 use crate::live::Frame;
@@ -22,25 +25,29 @@ use crate::llm_util;
 use crate::retrieval;
 use crate::state::AppState;
 
-/// 回放几个已认下的实体。上限是因为长会话会攒出几十个，全贴回去就把
-/// 省下来的上下文又花掉了；按首次出现排序，早认下的通常是这场对话的主角。
+/// Replay a handful of already-identified entities. The cap is there because a long
+/// conversation piles up dozens of them, and pasting them all back spends the context we just
+/// saved; sorted by first appearance, since the ones identified early are usually this
+/// conversation's protagonists.
 const KNOWN_ENTITY_LIMIT: usize = 20;
 
 const MAX_HISTORY: usize = 20;
 const MAX_ROUNDS: usize = 6;
 
-/// `remember` 曾整个停用过一段（见 `docs/decisions/0015`）：它那时会把一句话直接
-/// 变成图上一条活边，实测里「记住 Acme 把总部搬到了深圳」落成的是一条**空谓词、
-/// 0.9 置信**的边，而助手宣称的和图里得到的不是一回事。
+/// `remember` was disabled outright for a while (see `docs/decisions/0015`): back then it
+/// turned a sentence straight into a live edge on the graph -- in practice "remember that Acme
+/// moved its headquarters to Shenzhen" landed as an edge with an **empty predicate and 0.9
+/// confidence**, so what the assistant claimed and what the graph got were not the same thing.
 ///
-/// 现在抽取侧接上了 `pending_facts`：记忆抽出的事实先等人点头，再进账本。
-/// 这个开关留着，是为了下次再发现「工具会悄悄改图」时有地方立刻拉闸——
-/// 宁可没有这个工具，也不要一个会悄悄改图的工具。
+/// Extraction now goes through `pending_facts`: facts extracted from a memory wait for a human
+/// nod before they enter the ledger. This switch stays so that the next time we find "a tool
+/// quietly rewrites the graph" there is somewhere to pull the lever at once -- better no such
+/// tool at all than a tool that quietly rewrites the graph.
 pub(super) const REMEMBER_ENABLED: bool = true;
 
 #[derive(Deserialize)]
 pub struct ChatReq {
-    /// 缺省 = 新建会话（SSE 首个 `conversation` 事件回传 id）
+    /// Absent = create a new conversation (the first SSE `conversation` event returns the id)
     #[serde(default)]
     pub conversation_id: Option<Uuid>,
     pub message: String,
@@ -120,23 +127,25 @@ fn tools_schema(can_write: bool, data_source_names: &[String]) -> serde_json::Va
     tools
 }
 
-/// 执行之前先看这次调用说清楚了没有。
+/// Before running a call, check whether it said what it wanted clearly.
 ///
-/// **两种「没说清」以前都会安静地变成一次正常调用。**
+/// **Both flavours of "did not say it clearly" used to turn silently into a normal call.**
 ///
-/// 一是参数解析不出来。模型的输出撞上 token 上限时，`arguments` 会在半路断掉，
-/// 那串 JSON 不完整。从前这里是 `unwrap_or_else(|_| json!({}))`——空对象，
-/// 接着 `search_chunks` 里 `args["query"].as_str().unwrap_or(&query)` 回落到
-/// **用户那句原话**，于是一次被截断的调用变成「拿用户的原问题去检索」，
-/// 而轨迹上显示的是一条完全正常的 `search · 6 sources`。
+/// The first is arguments that do not parse. When the model's output hits the token limit,
+/// `arguments` gets cut off mid-way and that JSON string is incomplete. This used to be
+/// `unwrap_or_else(|_| json!({}))` -- an empty object -- and then
+/// `args["query"].as_str().unwrap_or(&query)` inside `search_chunks` fell back to
+/// **the user's own sentence**, so a truncated call turned into "search with the user's
+/// original question", while the trail showed a perfectly normal `search · 6 sources`.
 ///
-/// 二是必填参数干脆没给。同一个回落，同一个结果。
+/// The second is a required argument simply not given. Same fallback, same result.
 ///
-/// 两种都不该猜。**回落产出的是一个看起来没问题的错误答案**，那比报错坏得多——
-/// 报错模型会重试，猜出来的答案没有人会去核。
+/// Neither should be guessed at. **A fallback produces a wrong answer that looks fine**, and
+/// that is far worse than an error -- on an error the model retries, whereas nobody goes and
+/// checks an answer that was guessed.
 ///
-/// 判据直接取自工具表里的 `required`：加一个必填参数，这里自动跟上，
-/// 不必记得来改第二处。
+/// The criteria come straight from `required` in the tool schema: add a required argument and
+/// this follows automatically, with no second place to remember to change.
 fn check_call(
     tools: &serde_json::Value,
     name: &str,
@@ -165,8 +174,9 @@ fn check_call(
         .map(|t| &t["function"]);
     let required = function.and_then(|f| f["parameters"]["required"].as_array());
     for key in required.into_iter().flatten().filter_map(|k| k.as_str()) {
-        // 空串与 null 都算没给：`{"query": ""}` 检索出来的东西与问题无关，
-        // 而它同样会显示成一条正常的轨迹
+        // An empty string and null both count as not given: what `{"query": ""}` retrieves
+        // has nothing to do with the question, and it shows up as a perfectly normal trail
+        // entry all the same
         let missing = match args.get(key) {
             None | Some(serde_json::Value::Null) => true,
             Some(serde_json::Value::String(s)) => s.trim().is_empty(),
@@ -181,9 +191,10 @@ fn check_call(
                 ),
             ));
         }
-        // 判据同样取自工具表：schema 里写了 `format: uuid` 的参数，格式也在这一关挡。
-        // 编出来的 id 到了工具里只能回「本库没有这篇文档」，模型会把它读成
-        // 「库里真的没有」而放弃——那是又一个看起来没问题的错误答案
+        // The criteria come from the tool schema here too: an argument declared `format: uuid`
+        // in the schema has its format stopped at this gate as well. A made-up id can only come
+        // back from the tool as "this base has no such document", which the model reads as "the
+        // base really does not have it" and gives up -- another wrong answer that looks fine
         let is_uuid =
             function.is_some_and(|f| f["parameters"]["properties"][key]["format"] == "uuid");
         if is_uuid
@@ -210,11 +221,13 @@ const MEMORY_PROMPT: &str = "\
     confirmation before entering the graph; never say a fact is already in the graph. \
     Never invent memories, and never call it for small talk.";
 
-/// 工具的 JSON schema——**给模型看的那一份**。
+/// The tools' JSON schema -- **the copy the model sees**.
 ///
-/// 留在 `chat.rs` 而不是 `tools.rs`：它是提示词的一部分，随对话策略走；
-/// `tools.rs` 只管拿到参数之后干什么（见那个模块顶上的说明）。
-/// MCP 也读它，所以对同模块开放——两边描述同一批工具，各写一份必然分叉。
+/// It lives in `chat.rs` rather than `tools.rs`: it is part of the prompt and follows the
+/// conversation strategy, while `tools.rs` only deals with what happens once the arguments are
+/// in hand (see the note at the top of that module).
+/// MCP reads it too, hence the visibility to the same module -- both sides describe the same
+/// set of tools, and a separate copy on each side would inevitably diverge.
 pub(super) fn base_tools() -> serde_json::Value {
     json!([
         {
@@ -399,14 +412,17 @@ pub async fn chat(
     Json(req): Json<ChatReq>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let kb = utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
-    // 写工具跟人走：editor 及以上的对话才带 remember，viewer 纯只读
-    // 挂载的数据源决定 query_data 是否入列（问数是读，viewer 亦可用）
+    // Write tools follow the person: only an editor-or-above conversation carries remember, a
+    // viewer is strictly read-only
+    // The mounted data sources decide whether query_data joins the list (Ask is a read, so a
+    // viewer may use it too)
     let mounted_sources = utopia_store::datasources::mounted(&state.pool, kb_id).await?;
-    // 语义层：人确认过的 指标/维度 → 数据资产 映射，直接进 system prompt——
-    // 问数优先用确认口径，而不是每次从 schema 猜。
+    // The semantic layer: human-confirmed metric/dimension → data asset mappings, straight
+    // into the system prompt -- Ask prefers a confirmed definition over guessing from the
+    // schema every time.
     //
-    // 从前这里按 `confidence >= 0.75` 捞事实,而那个阈值是拿浮点数编码一个
-    // 二值状态(提议 0.6 / 确认 1.0)。现在读 `status = confirmed`(0011)
+    // This used to pull facts by `confidence >= 0.75`, and that threshold was a float encoding
+    // a binary state (proposed 0.6 / confirmed 1.0). It now reads `status = confirmed` (0011)
     let mappings = if mounted_sources.is_empty() {
         Vec::new()
     } else {
@@ -428,8 +444,10 @@ pub async fn chat(
         return Err(AppError::Validation("Missing user message".into()).into());
     }
 
-    // 会话持久化：有 id 则校验归属，无则以首句为题新建；用户消息即刻落库,
-    // 上下文由服务端从库里拼——前端只送新消息
+    // Conversation persistence: with an id, check ownership; without one, create a
+    // conversation titled after the first sentence. The user message is stored immediately, and
+    // the context is assembled server-side from the database -- the frontend only sends the new
+    // message
     let conversation_id = match req.conversation_id {
         Some(id) => {
             utopia_store::conversations::require_owned(&state.pool, kb_id, user.id, id).await?;
@@ -453,22 +471,28 @@ pub async fn chat(
     .await?;
     let workspace_id = kb.workspace_id;
 
-    // 注册表在生成器之前取出来：下面那个 `async_stream!` 会把 `state` 整个搬走
+    // Pull the registry out before the generator: the `async_stream!` below moves `state` in
+    // its entirety
     let live = state.live.clone();
 
-    // 生成过程不挂在这条连接上。
+    // The generation does not hang off this connection.
     //
-    // **切走一次就丢一个回答**，而且丢得比看上去彻底：整段生成住在下面这个
-    // 生成器里，助手消息只在走完时落库；浏览器一导航，axum 丢掉响应体、
-    // 生成器 future 被丢弃，于是 LLM 调用当场取消，那句 `append_message`
-    // 永远不执行。实测掐断连接时已经收到 1219 字节的正文，二十秒后库里
-    // 只剩用户那一行——**那个回答不是存在但没显示，是根本没被生成完**。
+    // **Navigating away once loses an answer**, and loses it more thoroughly than it looks: the
+    // whole generation lives in the generator below, and the assistant message is only stored
+    // when it runs to the end. The moment the browser navigates, axum drops the response body
+    // and the generator future is dropped, so the LLM call is cancelled on the spot and that
+    // `append_message` never runs. Measured: 1219 bytes of prose had already arrived when the
+    // connection was cut, and twenty seconds later the database held only the user's row --
+    // **that answer was not there-but-unshown, it was never finished being generated**.
     //
-    // 所以把生成器交给一个独立任务去驱动，这条连接降级成一个订阅者。
-    // 任务不随连接消失，答案照常写完、照常落库，人回来就在。
+    // So the generator is handed to an independent task to drive, and this connection is
+    // demoted to a subscriber. The task does not vanish with the connection: the answer is
+    // written out and stored as usual, and it is there when the person comes back.
     //
-    // 代价说清楚：**没人看的时候仍然在花钱**。这是有意的——丢答案比多跑一轮贵，
-    // 而 `MAX_ROUNDS` 已经给了上限。send 失败（接收端没了）不中断，那正是要点。
+    // The cost, stated plainly: **we keep spending money while nobody is watching**. That is
+    // deliberate -- losing an answer is more expensive than one extra round, and `MAX_ROUNDS`
+    // already caps it. A failed send (no receiver left) does not interrupt anything, which is
+    // exactly the point.
     let producer = async_stream::stream! {
         let ds_names: Vec<String> = mounted_sources.iter().map(|d| d.name.clone()).collect();
         let tools = tools_schema(can_write, &ds_names);
@@ -488,9 +512,10 @@ pub async fn chat(
                 system_prompt.push_str(
                     "\nSemantic layer (confirmed definitions — use these instead of guessing from schema):",
                 );
-                // 从前这里直接把整份 JSON 打进去。现在字段是列，只挑问数用得上的
-                // 那几样铺开——`sql` 与 `expr` 是「怎么算」，`unit` 是答里必须带的
-                // 量纲，`summary` 是给模型的一句人话
+                // This used to dump the whole JSON in. Now that the fields are columns, only
+                // the few Ask has any use for are laid out -- `sql` and `expr` are "how it is
+                // computed", `unit` is the dimension the answer has to carry, and `summary` is
+                // one sentence of plain language for the model
                 for m in &mappings {
                     let how = m
                         .sql
@@ -517,12 +542,13 @@ pub async fn chat(
         }
         let mut msgs: Vec<serde_json::Value> =
             vec![json!({ "role": "system", "content": system_prompt })];
-        /* **上一轮做过什么，按它当时发生的位置放回去。**
-           最后那条助手消息是它的结论；带 `tool_calls` 的消息与 tool 结果
-           发生在它之前，所以插在它前面——顺序就是真实顺序，模型读起来
-           就是「我问了、我查了、我答了」。
-           少了这一段，跨轮之后它只看得见自己写的散文，于是接着说「翻译」
-           时重查一遍（还可能落到另一批同名实体上）。 */
+        /* **Put what the previous round did back where it actually happened.**
+           The last assistant message is its conclusion; the message carrying `tool_calls` and
+           the tool results happened before it, so they go in ahead of it -- the order is the
+           real order, and the model reads it as "I was asked, I looked it up, I answered".
+           Without this section, across rounds it only sees the prose it wrote itself, so when
+           the next message says "translate" it looks everything up again (and may land on a
+           different batch of same-named entities). */
         let last_assistant = history
             .turns
             .iter()
@@ -535,14 +561,15 @@ pub async fn chat(
             }
             msgs.push(json!({ "role": role, "content": content }));
         }
-        // **前几轮已经认下的实体，连 id 一起交回去。**
+        // **The entities identified in earlier rounds, handed back with their ids.**
         //
-        // 少了这一段，模型只看得见上一轮的最终答案文字，不知道自己搜过什么、
-        // 拿到过哪些 id，于是从名字重搜一遍。更隐蔽的是同名歧义时两轮可能落到
-        // **不同的实体**上，前后两个答案讲的不是同一个节点。
+        // Without this section the model only sees the final answer text of the previous round;
+        // it does not know what it searched for or which ids it got, so it searches by name all
+        // over again. More insidiously, under name ambiguity two rounds can land on
+        // **different entities**, and the two answers are then not about the same node.
         //
-        // 贴在历史之后、当前问题之前——位置就是服从性，跟抽取里 known_block
-        // 紧挨正文是同一条理由。
+        // Pasted after the history and before the current question -- position is compliance,
+        // the same reason known_block sits right next to the text in extraction.
         if !history.entities.is_empty() {
             let lines: Vec<String> = history.entities
                 .iter()
@@ -567,22 +594,26 @@ pub async fn chat(
             }));
         }
 
-        // 会话 id 先行下发（新会话由此告知前端）
+        // The conversation id goes out first (this is how the frontend learns about a new one)
         yield Frame::new("conversation", json!({ "id": conversation_id }).to_string());
 
-        // 引用清单与这一轮认下的实体。**攒在工具外面**——`[3]` 里的 3 取决于
-        // 之前已经引过几个，各个工具各算各的会让同一个 chunk 拿到两个号
+        // The citation list and the entities identified this round. **Accumulated outside the
+        // tools** -- the 3 in `[3]` depends on how many have been cited already, and letting
+        // each tool count for itself would give the same chunk two numbers
         let mut sink = tools::ToolSink::default();
-        // 落库累积：assistant 全文与行动轨迹（历史回放用）
+        // Accumulated for storage: the assistant's full text and the action trail (for
+        // history replay)
         let mut answer_acc = String::new();
         let mut steps_acc: Vec<serde_json::Value> = Vec::new();
-        // 这一轮的工具往返，原样留一份落库：下一轮回放它，模型才知道自己做过什么
+        // This round's tool round-trip, a verbatim copy kept for storage: the next round
+        // replays it, which is how the model knows what it did
         let mut exchange_acc: Vec<serde_json::Value> = Vec::new();
 
         let mut rounds = 0usize;
         loop {
             if rounds >= MAX_ROUNDS {
-                // 弹药耗尽：命令模型就现有证据作答（流式）
+                // Out of ammunition: order the model to answer from the evidence gathered
+                // above (streaming)
                 msgs.push(json!({
                     "role": "user",
                     "content": "(system) Tool budget exhausted. Answer now from the evidence gathered above.",
@@ -612,13 +643,15 @@ pub async fn chat(
                 return;
             }
 
-            // 主链路全程流式：正文增量即时转发，工具调用在流末归并到达
+            // The main path streams throughout: prose deltas are forwarded immediately, and
+            // tool calls arrive merged at the end of the stream
             let deltas = match client.chat_tools_stream(&msgs, &tools).await {
                 Ok(s) => s,
                 Err(e) => {
                     if rounds == 0 {
-                        // 模型可能不支持 tool-calling：降级为一次性 RAG 注入
-                        tracing::warn!(error = %e, "tool-calling 不可用，降级为一次性 RAG");
+                        // The model may not support tool-calling: degrade to a one-shot RAG
+                        // injection
+                        tracing::warn!(error = %e, "tool-calling unavailable, using RAG once");
                         let chunks =
                             retrieval::hybrid(&state, kb_id, workspace_id, &query, 8)
                                 .await
@@ -705,7 +738,8 @@ pub async fn chat(
                 return;
             }
 
-            // 工具轮带了叙述文本：与后续轮次的正文之间补一个段落分隔
+            // The tool round carried narration text: add a paragraph break between it and the
+            // prose of the rounds that follow
             if turn.content.is_some() && !answer_acc.is_empty() {
                 answer_acc.push_str("\n\n");
                 yield delta_event("\n\n");
@@ -715,7 +749,8 @@ pub async fn chat(
             exchange_acc.push(call_msg.clone());
             msgs.push(call_msg);
             for call in &turn.tool_calls {
-                // **说不清自己要做什么的调用不执行。** 把话回给模型，让它重来
+                // **A call that cannot say what it means to do is not run.** Hand the words
+                // back to the model and let it start over
                 let args = match check_call(&tools, &call.name, &call.arguments) {
                     Ok(args) => args,
                     Err((message, step)) => {
@@ -734,17 +769,20 @@ pub async fn chat(
                     actor: Some(user.id),
                 };
                 let (result, step) = tools::dispatch(&ctx, &mut sink, &call.name, &args).await;
-                // **这一步发生在正文的哪个位置。**
+                // **Where in the prose this step happened.**
                 //
-                // 模型是边说边调的：说一句、查一下、再说一句。SSE 上 `delta` 与
-                // `step` 本来就是交替发出去的，顺序不用额外记；而**历史回放没有
-                // 那条时间线**——落库的只有拼好的整段正文和一个扁平的 steps 数组，
-                // 于是重新打开一场对话，所有调用都堆在正文最前面，读起来像是
-                // 先查了七次再一口气说完。记下偏移，回放才能把话再断开。
+                // The model talks and calls as it goes: say a sentence, look something up, say
+                // another. On SSE, `delta` and `step` are already emitted alternately, so the
+                // order needs no extra bookkeeping -- but **history replay has no such
+                // timeline**: all that is stored is the assembled prose and a flat steps
+                // array, so reopening a conversation piles every call at the very front of the
+                // prose, reading as if it had looked things up seven times and then said
+                // everything in one breath. Recording the offset is what lets replay break the
+                // prose apart again.
                 //
-                // 单位是 **UTF-16 码元**，因为切分发生在浏览器里，而 JS 的
-                // `String.prototype.length` 数的就是它。用字节数或 `chars()`
-                // 在中文和 emoji 上都会切歪
+                // The unit is **UTF-16 code units**, because the splitting happens in the
+                // browser, and that is what JS's `String.prototype.length` counts. A byte count
+                // or `chars()` both cut in the wrong place on Chinese and emoji
                 let mut step = step;
                 if let Some(obj) = step.as_object_mut() {
                     obj.insert("at".into(), json!(answer_acc.encode_utf16().count()));
@@ -765,28 +803,31 @@ pub async fn chat(
         }
     };
 
-    // 生成登记在案，然后**这条连接也只是去「接上」它**——与刷新之后
-    // 那条重连走的是同一段代码。两条路分开写的话，迟早只有一条是对的
+    // The generation is registered, and then **this connection merely goes and "attaches" to
+    // it** -- the same code path as the reconnect after a refresh. Written as two separate
+    // paths, sooner or later only one of them would be right
     let handle = live.begin(conversation_id).await;
     let attached = live.attach(conversation_id).await;
     tokio::spawn(async move {
         let mut producer = std::pin::pin!(producer);
         while let Some(frame) = producer.next().await {
-            // 没有订阅者是常态（人走了）。**照发不误**：这里中断就等于
-            // 把「切走一次丢一个回答」原样搬回来
+            // Having no subscriber is normal (the person left). **Emit regardless**: stopping
+            // here would bring back "navigate away once, lose an answer" exactly as it was
             handle.emit(frame).await;
         }
-        // 注销之后再接上的人得到「没有在跑的」，那时答案已经落库
+        // Anyone attaching after deregistration gets "nothing is running", and by then the
+        // answer is already stored
         handle.finish().await;
     });
 
     Ok(sse_from(attached))
 }
 
-/// 把一次「接上」变成 SSE：先补一份快照，再照常收增量。
+/// Turn one "attach" into SSE: a snapshot first, then the deltas as usual.
 ///
-/// `None` = 这个会话没有在跑的生成。回一条 `idle` 而不是 404——**客户端
-/// 每次打开会话都会问一次**，而「没有在跑」是最常见的答案，不是错误
+/// `None` = no generation is running for this conversation. Reply with an `idle` rather than a
+/// 404 -- **the client asks once every time a conversation is opened**, and "nothing is
+/// running" is the most common answer, not an error
 fn sse_from(
     attached: Option<(
         crate::live::Snapshot,
@@ -806,10 +847,11 @@ fn sse_from(
                     yield to_event(&frame);
                     if done { return; }
                 }
-                // 生成结束、发送端销毁：正常收尾
+                // Generation over, the sender destroyed: a normal ending
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                // 这个客户端读得太慢，被广播缓冲甩下了。**说出来**——
-                // 静默继续会让它少掉中间一段而毫不知情
+                // This client read too slowly and the broadcast buffer left it behind. **Say
+                // so** -- carrying on silently would leave it missing a stretch in the middle
+                // without knowing
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     yield to_event(&Frame::new(
                         "error",
@@ -827,21 +869,23 @@ fn to_event(frame: &Frame) -> Result<Event, Infallible> {
     Ok(Event::default().event(frame.event).data(&frame.data))
 }
 
-/// 接上一次正在跑的生成（刷新页面之后走这里）。
+/// Attach to a generation that is still running (this is the path after a page refresh).
 pub async fn reattach(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((kb_id, conversation_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
-    // **归属要查。** 会话 id 是可以猜的，而这条流会把别人的回答一字不差地念出来
+    // **Ownership must be checked.** A conversation id can be guessed, and this stream would
+    // read someone else's answer out word for word
     utopia_store::conversations::require_owned(&state.pool, kb_id, user.id, conversation_id)
         .await?;
     Ok(sse_from(state.live.attach(conversation_id).await))
 }
 
-/// 生成器产出的是 `Frame`，不是 `axum` 的 `Event`。
-/// **广播与快照都要读回事件的内容**，而 `Event` 读不回来（见 `live`）
+/// The generator yields `Frame`, not `axum`'s `Event`.
+/// **Both the broadcast and the snapshot need to read an event's contents back**, and an
+/// `Event` cannot be read back (see `live`)
 fn delta_event(text: &str) -> Frame {
     Frame::new(
         "delta",
@@ -867,7 +911,8 @@ fn source_json(n: usize, c: &ChunkView) -> serde_json::Value {
     })
 }
 
-/// 降级路径的系统提示（tool-calling 不可用时的一次性注入）。
+/// The system prompt for the degraded path (the one-shot injection when tool-calling is
+/// unavailable).
 fn legacy_system_prompt(chunks: &[ChunkView]) -> String {
     if chunks.is_empty() {
         return "You are an enterprise knowledge base assistant. No relevant sources were \
@@ -907,12 +952,13 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 会话管理（列表 / 回放 / 删除）
+// Conversation management (list / replay / delete)
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
 pub struct ConversationsQuery {
-    /// 搜标题与消息正文两处：人记得住的往往是问过的那句话，不是标题
+    /// Searches both the title and the message bodies: what a person remembers is usually the
+    /// sentence they asked, not the title
     #[serde(default)]
     pub q: Option<String>,
     #[serde(default)]
@@ -947,10 +993,10 @@ pub struct RenameConversationReq {
     pub title: String,
 }
 
-/// 改会话标题。
+/// Rename a conversation.
 ///
-/// **标题本来是从第一句话自动取的**，而一段对话跑偏是常态——改名让人能按
-/// 自己记得的方式找回它。
+/// **The title is taken automatically from the first sentence**, and a conversation drifting
+/// off it is the norm -- renaming lets a person find it again the way they remember it.
 pub async fn rename_conversation(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -963,7 +1009,7 @@ pub async fn rename_conversation(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 历史回放：消息含落库的行动轨迹（steps）与引用（sources）。
+/// History replay: messages carry the stored action trail (steps) and citations (sources).
 pub async fn conversation_detail(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -992,27 +1038,33 @@ mod tests {
 
     // --- check_call ---------------------------------------------------------
 
-    /// 参数在半路断掉——模型撞上 token 上限时就长这样。
+    /// Arguments cut off mid-way -- this is exactly what it looks like when the model hits the
+    /// token limit.
     ///
-    /// **从前这里回落成空对象，然后 `search_chunks` 拿用户那句原话去检索。**
-    /// 得到的是一条看起来完全正常的 `search · 6 sources`，和一个基于错误输入
-    /// 的答案。没人会去核一个看起来正常的答案，所以这一条必须是拒绝
+    /// **This used to fall back to an empty object, and then `search_chunks` went searching
+    /// with the user's own sentence.** What came out was a perfectly normal-looking
+    /// `search · 6 sources`, and an answer based on the wrong input. Nobody checks an answer
+    /// that looks normal, so this one has to be a refusal
     #[test]
     fn arguments_cut_off_mid_json_do_not_become_a_search() {
         let tools = tools_schema(false, &[]);
         let err = check_call(&tools, "search_chunks", "{\"query\": \"Acme reven")
-            .expect_err("残缺 JSON 必须拒绝，而不是回落");
-        assert_eq!(err.1["kind"], "tool", "轨迹上要显示成一次没做成的调用");
+            .expect_err("truncated JSON must be refused, not fallen back on");
+        assert_eq!(
+            err.1["kind"], "tool",
+            "the trail must show a call that did not run"
+        );
         assert_eq!(err.1["detail"], "bad arguments");
         assert!(
             err.0.contains("not valid JSON") && err.0.contains("again"),
-            "回给模型的话要说清没执行、并让它重来：{}",
+            "the reply to the model must say it did not run and tell it to retry: {}",
             err.0
         );
     }
 
-    /// 空串与缺字段是同一件事：`{"query": ""}` 检索回来的东西与问题无关，
-    /// 而它同样会显示成一条正常轨迹
+    /// An empty string and a missing field are the same thing: what `{"query": ""}` retrieves
+    /// has nothing to do with the question, and it shows up as a normal trail entry all the
+    /// same
     #[test]
     fn an_empty_required_argument_counts_as_missing() {
         let tools = tools_schema(false, &[]);
@@ -1023,33 +1075,35 @@ mod tests {
             "{\"query\": null}",
         ] {
             let Err(err) = check_call(&tools, "search_chunks", raw) else {
-                panic!("{raw} 应当被拒");
+                panic!("{raw} should be refused");
             };
             assert_eq!(err.1["detail"], "missing query", "{raw}");
         }
     }
 
-    /// **判据取自工具表本身。** 这条守的是「加了必填参数却忘了改校验」——
-    /// query_data 只在挂了数据源时才出现在表里，它的两个必填参数
-    /// 从没在别处被单独写过一遍
+    /// **The criteria come from the tool schema itself.** This one guards against "a required
+    /// argument was added but the validation was forgotten" -- query_data only appears in the
+    /// schema when a data source is mounted, and its two required arguments have never been
+    /// written down separately anywhere else
     #[test]
     fn the_schema_is_the_only_place_required_is_written_down() {
         let tools = tools_schema(false, &["warehouse".into()]);
         let err = check_call(&tools, "query_data", "{\"data_source\": \"warehouse\"}")
-            .expect_err("缺 sql 必须拒绝");
+            .expect_err("a missing sql must be refused");
         assert_eq!(err.1["detail"], "missing sql");
         check_call(
             &tools,
             "query_data",
             "{\"data_source\": \"warehouse\", \"sql\": \"SELECT 1\"}",
         )
-        .expect("两个都给了就该放行");
+        .expect("with both given it should pass");
     }
 
-    /// 合规的调用原样通过，**可选参数一个不少**。
+    /// A well-formed call passes through untouched, **with not one optional argument lost**.
     ///
-    /// 这一关只判「说清了没有」，不做过滤——把 args 重新组装一遍的话，
-    /// 加一个可选参数就得记得来这里加一次，而忘记的后果是它安静地失效
+    /// This gate only judges "was it said clearly", it does not filter -- reassembling args
+    /// would mean every new optional argument has to be remembered here too, and the
+    /// consequence of forgetting is that it silently stops working
     #[test]
     fn a_well_formed_call_passes_through_untouched() {
         let tools = tools_schema(false, &[]);
@@ -1058,21 +1112,26 @@ mod tests {
             "entity_facts",
             "{\"entity_id\": \"1f8ac10b-58cc-4372-a567-0e02b2c3d479\", \"at\": \"2026-03-15\"}",
         )
-        .expect("必填给了就该放行");
-        assert_eq!(args["at"], "2026-03-15", "可选参数不能在这一关被吃掉");
+        .expect("with the required ones given it should pass");
+        assert_eq!(
+            args["at"], "2026-03-15",
+            "an optional argument must not be eaten here"
+        );
     }
 
-    /// 全文只能按 id 读，而 id 是模型从检索结果里抄来的——抄错、抄漏
-    /// 都得在这里停住
+    /// The full text can only be read by id, and the id is copied by the model out of the
+    /// search results -- copying it wrong and leaving it out both have to stop here
     #[test]
     fn get_document_without_an_id_does_not_run() {
         let tools = tools_schema(false, &[]);
-        let err = check_call(&tools, "get_document", "{}").expect_err("缺 document_id 必须拒绝");
+        let err = check_call(&tools, "get_document", "{}")
+            .expect_err("a missing document_id must be refused");
         assert_eq!(err.1["detail"], "missing document_id");
     }
 
-    /// 不是 uuid 的 id 到了工具里只能回「本库没有这篇文档」——模型会把它读成
-    /// 「库里真的没有」而收手，于是一次抄错的 id 变成一个否定的答案
+    /// An id that is not a uuid can only come back from the tool as "this base has no such
+    /// document" -- the model reads that as "the base really does not have it" and stops, so
+    /// one mis-copied id turns into a negative answer
     #[test]
     fn a_document_id_that_is_not_a_uuid_does_not_run() {
         let tools = tools_schema(false, &[]);
@@ -1081,7 +1140,7 @@ mod tests {
             "{\"document_id\": \"1f8ac10b-58cc-4372\"}",
         ] {
             let Err(err) = check_call(&tools, "get_document", raw) else {
-                panic!("{raw} 应当被拒");
+                panic!("{raw} should be refused");
             };
             assert_eq!(err.1["detail"], "invalid document_id", "{raw}");
         }
@@ -1090,17 +1149,18 @@ mod tests {
             "get_document",
             "{\"document_id\": \"1f8ac10b-58cc-4372-a567-0e02b2c3d479\"}",
         )
-        .expect("真的 uuid 就该放行");
+        .expect("a real uuid should pass");
     }
 
-    /// `changes` 早就在自己那一支里拒绝缺失的 `since`——**它是唯一做对的一个**。
-    /// 这条钉住两件事：新的统一关卡与它一致，而它自己那道对日期格式的检查
-    /// （`2026-13-45` 这种）仍然要留着，因为 check_call 只看有没有、不看对不对
+    /// `changes` has long refused a missing `since` in its own branch -- **it is the only one
+    /// that got this right**. This pins down two things: the new shared gate agrees with it,
+    /// and its own check on the date format (things like `2026-13-45`) still has to stay,
+    /// because check_call only looks at whether something is there, not whether it is right
     #[test]
     fn the_one_tool_that_already_refused_still_refuses() {
         let tools = tools_schema(false, &[]);
         assert!(check_call(&tools, "changes", "{}").is_err());
         check_call(&tools, "changes", "{\"since\": \"2026-13-45\"}")
-            .expect("格式错的日期不归这一关管，交给 changes_window");
+            .expect("a malformed date is not this gate's job, that is changes_window's");
     }
 }

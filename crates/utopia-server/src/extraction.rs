@@ -1,6 +1,9 @@
-//! 图谱抽取任务：逐分块调用 LLM → 实体消解 v2 → 事实 + 证据写入账本。
-//! 与摄入管道分离（两段式可用）：索引完成即可搜可问，抽取慢慢跑。
-//! 消解灰区只入审核队列并触发独立的攒批裁决任务——LLM 裁决永不阻塞本任务。
+//! Graph extraction job: call the LLM chunk by chunk → entity resolution v2 → write facts and
+//! evidence into the ledger.
+//! Separate from the ingest pipeline (usable in two stages): once indexing is done it is
+//! searchable and answerable, while extraction takes its time.
+//! Resolution grey areas only go into the review queue and trigger a separate batched
+//! adjudication job -- LLM adjudication never blocks this job.
 
 use crate::llm_util;
 use crate::predicate_match::PredicateIndex;
@@ -9,16 +12,20 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// 限流最多退避重试几次。**只对 429 生效**：密钥错了重试一万次还是错。
+/// How many times a rate limit is backed off and retried. **Only applies to 429**: a wrong key
+/// is still wrong after ten thousand retries.
 const RATE_LIMIT_TRIES: u32 = 5;
-/// 单次退避的上限。总等待因此封顶在两分钟出头，一个配额永远打满的账号
-/// 会干脆地失败，而不是把 worker 槽占死。
+/// Cap on a single backoff. Total waiting is therefore capped at a little over two minutes, so
+/// an account whose quota is permanently maxed out fails cleanly instead of pinning a worker
+/// slot forever.
 const RATE_LIMIT_CAP: Duration = Duration::from_secs(60);
 
-/// 退避的抖动。**不引 `rand`**：这里只要「别让 N 个分块同时醒来」，纳秒时钟
-/// 就够散，而多一个依赖要跟着走供应链。
+/// Jitter for the backoff. **No `rand` dependency**: all that is wanted here is "do not let N
+/// chunks wake up at the same moment", and the nanosecond clock spreads them well enough, while
+/// one more dependency drags a supply chain along with it.
 ///
-/// 取半区间（base/2 到 base）而不是全区间：退避仍然单调增长，只是错开。
+/// A half interval (base/2 to base) rather than the full one: the backoff still grows
+/// monotonically, it is only staggered.
 fn jitter(base: Duration) -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -28,18 +35,20 @@ fn jitter(base: Duration) -> Duration {
     base / 2 + Duration::from_millis(if half == 0 { 0 } else { nanos % half })
 }
 
-/// 抽取的 chat 调用，**限流会退避重试**。
+/// The chat call for extraction, **with backoff and retry on rate limits**.
 ///
-/// 限流与其他失败的区别是它会自己好，所以从前那句「跳过该分块」用在它身上
-/// 就是把一分钟的等待换成永久的数据缺口——实测一次 1884 块的灌入里
-/// 55/60 篇文档整篇失败，而端点一直是好的。
+/// What separates a rate limit from other failures is that it heals by itself, so the old
+/// "skip this chunk" line, applied to it, traded a one-minute wait for a permanent hole in the
+/// data -- measured on one 1884-chunk ingest, 55 of 60 documents failed in their entirety while
+/// the endpoint was fine the whole time.
 ///
-/// 两处容易写错：
+/// Two things are easy to get wrong:
 ///
-/// - **退避期间不能占着许可。** 许可只包住真正的调用，睡觉之前就还回去，
-///   否则一个在等的分块会挡住本来可以通过的另一个。
-/// - **`Retry-After` 多数厂商不发**，所以它只是「有则更准」，判据是错误类型
-///   本身；没有它就走指数退避。
+/// - **The permit must not be held during backoff.** The permit wraps only the actual call and
+///   is handed back before going to sleep, otherwise one waiting chunk blocks another that
+///   would have gone through.
+/// - **Most vendors do not send `Retry-After`**, so it is only "more precise when present";
+///   the criterion is the error type itself, and without it we take exponential backoff.
 async fn chat_retrying_rate_limits(
     state: &AppState,
     settings: &utopia_core::models::LlmSettings,
@@ -48,7 +57,7 @@ async fn chat_retrying_rate_limits(
 ) -> anyhow::Result<String> {
     let mut backoff = Duration::from_secs(2);
     for attempt in 1..=RATE_LIMIT_TRIES {
-        // 许可只包住调用本身，出了这个块就还回去
+        // The permit wraps only the call itself and is handed back on leaving this block
         let outcome = {
             let _permit = llm_util::acquire_chat(state, settings).await;
             client.chat(messages).await
@@ -61,40 +70,43 @@ async fn chat_retrying_rate_limits(
             return Err(err);
         };
         if attempt == RATE_LIMIT_TRIES {
-            return Err(err.context(format!("限流退避 {RATE_LIMIT_TRIES} 次仍未通过")));
+            return Err(err.context(format!("still throttled after {RATE_LIMIT_TRIES} backoffs")));
         }
         let delay = jitter(hit.retry_after.unwrap_or(backoff).min(RATE_LIMIT_CAP));
         tracing::warn!(
             attempt,
             delay_ms = delay.as_millis() as u64,
             from_header = hit.retry_after.is_some(),
-            "端点限流，退避后重试"
+            "endpoint rate limited, retrying after backoff"
         );
         tokio::time::sleep(delay).await;
         backoff = (backoff * 2).min(RATE_LIMIT_CAP);
     }
-    unreachable!("循环内必定 return")
+    unreachable!("the loop always returns")
 }
 
 const MIN_CONFIDENCE: f32 = 0.6;
 
-/// 这串字**是不是一个东西的名字**。
+/// Whether this string **is the name of a thing**.
 ///
-/// 判据是**词数**不是字符数。字符数分不开真假：
-/// `US District Court for the Northern District of California`（57 字符）是真实体，
-/// 而 `removal was driven by growing discontent and distrust with Altman`（65 字符）
-/// 是一整个从句——两者字符数相近，词数也相近（9 vs 10），但后者带着**限定动词**。
+/// The criterion is **word count**, not character count. Character count cannot tell the real
+/// from the fake: `US District Court for the Northern District of California` (57 characters)
+/// is a real entity, while `removal was driven by growing discontent and distrust with Altman`
+/// (65 characters) is an entire clause -- the character counts are close, the word counts are
+/// close too (9 vs 10), but the latter carries a **finite verb**.
 ///
-/// 所以两条一起看：词数封顶挡住长句，而**句中的限定动词**挡住那些不长的从句。
-/// 机构名会长（"US District Court for the Northern District of California"），
-/// 但不会出现 "was driven by"、"showed"、"giving off" 这种谓语。
+/// So the two rules work together: the word cap stops long sentences, while a **finite verb in
+/// the string** stops the clauses that are not long. Institution names get long
+/// ("US District Court for the Northern District of California"), but they never contain
+/// predicates like "was driven by", "showed", "giving off".
 ///
-/// 上限取 12 个词：实测真实体里最长的机构名是 9 个词，留三个词的余量。
-/// 而被挡下的那些平均 14 个词。
+/// The cap is 12 words: measured, the longest institution name among the real entities was
+/// 9 words, leaving three words of headroom. The ones that got blocked averaged 14 words.
 const MAX_NAME_WORDS: usize = 12;
 
-/// 句子里的谓语标志。**只列限定形式**——`used`、`flying` 这类分词在名词短语里
-/// 完全正常（"equipment used by X"），列进去会误伤真实体。
+/// Markers of a predicate in a sentence. **Finite forms only** -- participles like `used` and
+/// `flying` are perfectly normal inside a noun phrase ("equipment used by X"), and listing them
+/// would hit real entities.
 const CLAUSE_MARKERS: &[&str] = &[
     "was", "were", "is", "are", "has", "have", "had", "will", "would", "showed", "said", "says",
     "became", "went", "came", "did", "does", "gave", "took", "made",
@@ -115,16 +127,17 @@ fn is_entity_name(name: &str) -> bool {
     if words.len() > MAX_NAME_WORDS {
         return false;
     }
-    // 一个词的名字不可能是从句，别让 "Is" 这种专名被误伤
+    // A one-word name cannot be a clause; do not let proper names like "Is" get hit
     if words.len() > 2 && words.iter().any(|w| CLAUSE_MARKERS.contains(&w.as_str())) {
         return false;
     }
-    // 部分格：`745 of OpenAI's 770 employees` 是一个数量描述，不是一个东西。
-    // 它没有限定动词，词数也不多，上面两条都接不住它。
+    // Partitive: `745 of OpenAI's 770 employees` is a quantity description, not a thing.
+    // It has no finite verb and is not many words, so neither rule above catches it.
     //
-    // 判据收得很窄——**首词是纯数字且第二词是 of**。真实体里以数字开头的
-    //（`3M`、`7-Eleven`、`23andMe`）首词不是纯数字；`2023 Nobel Prize` 首词是纯数字，
-    // 但第二个词不是 `of`。宽一格就会误伤它们。
+    // The criterion is kept very narrow -- **the first word is all digits and the second is of**.
+    // Real entities that start with a number (`3M`, `7-Eleven`, `23andMe`) do not have an
+    // all-digit first word; `2023 Nobel Prize` does, but its second word is not `of`. One notch
+    // wider and they get hit.
     if words.len() >= 3
         && words[1] == "of"
         && !words[0].is_empty()
@@ -135,8 +148,9 @@ fn is_entity_name(name: &str) -> bool {
     true
 }
 
-/// 记一条丢弃信号。抽取器有七处 `continue`，每一处都是"事实抽出来了、被挡掉、
-/// 什么都不说"。信号写失败绝不能带垮整篇文档的抽取，所以这里吞掉错误。
+/// Record a drop signal. The extractor has seven `continue` sites, and every one of them is
+/// "a fact was extracted, got blocked, and nothing was said about it". Failing to write the
+/// signal must never take down extraction of the whole document, so errors are swallowed here.
 async fn drop_signal(
     state: &AppState,
     kb_id: Uuid,
@@ -156,20 +170,23 @@ async fn drop_signal(
     .await;
 }
 
-/// 这一轮抽完了没有——没抽完就给出**要写进 graph_error 的那句话**。
+/// Whether this round finished extracting -- and when it did not, **the sentence that goes
+/// into graph_error**.
 ///
-/// 判据是「全抽完」而不是某个比例：任何比例都是拍的，而这里本来就有一个不需要拍的
-/// 判据——每一块都成了才叫抽完。
+/// The criterion is "every chunk done" rather than some percentage: any percentage is made up,
+/// while there is already a criterion here that needs no making up -- it counts as done only
+/// when every single chunk succeeded.
 ///
-/// `attempted` 是**本轮取到的分块数**，不是文档总块数：重试只取
-/// `extracted_at IS NULL` 的块，所以第二轮的分母天然更小。措辞里说「本轮」，
-/// 别让读的人以为文档只有那么几块。
+/// `attempted` is **the number of chunks picked up this round**, not the document's total: a
+/// retry only picks up chunks with `extracted_at IS NULL`, so the denominator on the second
+/// round is naturally smaller. The wording says "this round" so the reader does not come away
+/// thinking the document only has that many chunks.
 fn incomplete_reason(unextracted: &[(i32, String)], attempted: usize) -> Option<String> {
     if unextracted.is_empty() {
         return None;
     }
-    // 只举前三个：原因往往同一个（供应商不通就是所有块都不通），
-    // 全列出来只是把同一句话抄二十遍
+    // Only the first three are listed: the reason is usually the same one (if the vendor is
+    // down then every chunk is down), and listing them all just copies one sentence twenty times
     let sample: Vec<String> = unextracted
         .iter()
         .take(3)
@@ -177,22 +194,24 @@ fn incomplete_reason(unextracted: &[(i32, String)], attempted: usize) -> Option<
         .collect();
     let more = unextracted.len().saturating_sub(sample.len());
     let tail = if more > 0 {
-        format!("；另有 {more} 个")
+        format!("; {more} more")
     } else {
         String::new()
     };
     Some(format!(
-        "本轮 {attempted} 个分块里 {} 个没能抽取：{}{tail}",
+        "{} of this round's {attempted} chunks could not be extracted: {}{tail}",
         unextracted.len(),
-        sample.join("；")
+        sample.join("; ")
     ))
 }
 
-/// 自动扩本体的唯一入队点。**成功与失败两条路都要走到它。**
+/// The only enqueue point for auto-extending the ontology. **Both the success and the failure
+/// path have to reach it.**
 ///
-/// 开关在这里重读，而不是沿用调用方手上那份：失败路径压根没加载过 kb，
-/// 而成功路径那份是文档**开抽时**读的——一篇 73 块的文档要跑一个多小时，
-/// 期间有人在设置里关掉了开关，沿用旧值就是拿一小时前的意图办事。
+/// The switch is re-read here instead of reusing the caller's copy: the failure path never
+/// loaded the kb at all, and the success path's copy was read when the document **started**
+/// extracting -- a 73-chunk document runs for well over an hour, and if someone turned the
+/// switch off in settings during that time, reusing the old value acts on an hour-old intent.
 async fn enqueue_bootstrap(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
     if !utopia_store::kbs::get(&state.pool, kb_id)
         .await?
@@ -212,8 +231,9 @@ async fn enqueue_bootstrap(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// `proposed_by`：这篇文档若是记忆日志，抽出的事实等人点头，这一列记「谁说的」。
-/// 批量摄入的文档传 None——那条路不经待确认队列，这个值用不上
+/// `proposed_by`: if this document is a memory log, the extracted facts wait for a human nod
+/// and this column records "who said it". Bulk-ingested documents pass None -- that path does
+/// not go through the pending queue, so the value is unused
 pub async fn extract_document(
     state: &AppState,
     document_id: Uuid,
@@ -222,7 +242,7 @@ pub async fn extract_document(
     match run(state, document_id, proposed_by).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            // 原因随状态落库：只进日志的错误等于没有错误
+            // The reason is stored with the status: an error only in the log is no error at all
             let _ = utopia_store::documents::set_graph_failed(
                 &state.pool,
                 document_id,
@@ -231,16 +251,20 @@ pub async fn extract_document(
             .await;
             if let Ok(doc) = utopia_store::documents::get(&state.pool, document_id).await {
                 state.emit_document(doc.kb_id, document_id);
-                // **失败也要触发自动扩本体。**
+                // **Failure has to trigger the ontology auto-extend too.**
                 //
-                // 入队从前只写在成功路径上，于是这一串会把知识库永久卡住：
-                // 前 14 篇成功（每篇都看到还有别的在飞，不触发），第 15 篇重试
-                // 耗尽变 failed —— 这时 extraction_idle 恰好为真（failed 不算
-                // queued/extracting），可**再没有任何一篇文档会完成来做这次检查**。
-                // 结果是提案堆在池子里、本体永远停在种子那几个关系、半张图永远是
-                // 兜底谓词，而界面上没有任何东西说这件事发生过。
+                // The enqueue used to live only on the success path, so this sequence would
+                // wedge a knowledge base forever: the first 14 documents succeed (each one
+                // sees others still in flight, so it does not trigger), the 15th exhausts its
+                // retries and turns failed -- at which point extraction_idle happens to be
+                // true (failed counts as neither queued nor extracting), yet **no document
+                // will ever complete again to run this check**. The result is proposals piling
+                // up in the pool, the ontology frozen forever on its few seed relations, half
+                // the graph forever on the fallback predicate, and nothing in the UI saying
+                // this ever happened.
                 //
-                // 任务本身幂等且会重查开关与门槛，所以这里多入队一次是安全的。
+                // The job itself is idempotent and re-checks the switch and the threshold, so
+                // enqueueing once more here is safe.
                 let _ = enqueue_bootstrap(state, doc.kb_id).await;
             }
             Err(e)
@@ -248,12 +272,14 @@ pub async fn extract_document(
     }
 }
 
-/// mention → 实体 id。同一文档内同名同类型直接复用（单文档语境里罕有同名不同人，
-/// 也把消解调用摊薄到每个名字一次）；跨文档歧义由 resolve_mention 的画像比对处理。
+/// mention → entity id. Within one document the same name and type is reused directly (in a
+/// single-document context one name is rarely two different people, and it also thins the
+/// resolution calls down to once per name); cross-document ambiguity is handled by
+/// resolve_mention's profile comparison.
 async fn resolve(
     state: &AppState,
     kb_id: Uuid,
-    // None = 模型给的类型不在本体里，或这个库根本还没有类（0009）
+    // None = the model's type is not in the ontology, or this kb has no classes yet (0009)
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
@@ -269,7 +295,8 @@ async fn resolve(
     }
     let r =
         utopia_store::resolution::resolve_mention(&state.pool, kb_id, type_id, name, ctx).await?;
-    // 疑似重复对（同名灰区 / 类型漂移）入审核队列，攒批裁决任务收尾统一触发
+    // Suspected duplicate pairs (same-name grey area / type drift) go into the review queue;
+    // the batched adjudication job is triggered once at the finish
     for review in &r.reviews {
         utopia_store::resolution::create_review(
             &state.pool,
@@ -295,29 +322,39 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
     let client = llm_util::chat_client(&settings)
         .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
 
-    // 所有权凭证：重抽会自增 epoch，本任务据此察觉自己已被接管（见分块循环）
+    // Ownership token: a re-extraction bumps the epoch, and this job uses it to notice it has
+    // been taken over (see the chunk loop)
     let my_epoch = utopia_store::documents::extract_epoch(&state.pool, document_id).await?;
     utopia_store::documents::set_graph_status(&state.pool, document_id, "extracting").await?;
     state.emit_document(doc.kb_id, document_id);
     let etypes = utopia_store::graph::entity_types(&state.pool, doc.kb_id).await?;
-    // 这一轮落过的事实（新建或重复观察）：结尾对它们跑一遍签名检查
+    // Facts landed this round (newly created or observed again): the signature check runs over
+    // them at the finish
     let mut touched_facts: Vec<Uuid> = Vec::new();
     let rtypes = utopia_store::graph::relation_types(&state.pool, doc.kb_id).await?;
-    // 关系与属性分道：属性走字面值通道，不进关系清单。
+    // Relations and attributes part ways here: attributes take the literal-value channel and
+    // never enter the relation list.
     //
-    // **本体里没有对应关系时就没有谓词**（见 `facts.predicate_id`）。原词落进
-    // fact_evidence.proposed_predicate，显示时由 fact_surface_predicate() 取回。
+    // **When the ontology has no matching relation there is no predicate** (see
+    // `facts.predicate_id`). The original wording lands in
+    // fact_evidence.proposed_predicate and is fetched back by fact_surface_predicate() for
+    // display.
     //
-    // 从前这里是一个叫 related_to 的兜底关系，且刻意不列给模型——它摆进提示词就成了
-    // 逃生舱，模型读到说不清的关系时不去写原文说法，直接挑这个万能选项。
-    // 现在它连行都没有了，逃生舱和"记得别列它"这两件事一起消失。
+    // This used to be a fallback relation called related_to, deliberately not listed to the
+    // model -- put it in the prompt and it becomes an escape hatch: reading a relation it
+    // cannot pin down, the model stops writing the original wording and just picks the
+    // catch-all option. Now the row itself is gone, and the escape hatch and the "remember not
+    // to list it" disappeared together.
     //
-    // **这两件事必须一起做，缺一件比都不做更糟。** 只删库里的行不够，还要删
-    // `DEFAULT_RELATION_TYPES` 里的种子——而这里的排除过滤已经跟着删了。于是
-    // `ensure_default_ontology` 七分钟后把行种回来，`related_to` 第一次被**列进
-    // 提示词给模型看**。0001 量过：359 次使用里 321 次是模型从清单上挑的。
-    // 谁要往种子表里加回一个兜底关系，先看 0010——不过那张表现在已经没有了
-    // （`#128`），连播种函数一起退场。
+    // **These two things have to be done together; doing one of them is worse than doing
+    // neither.** Deleting the row in the database is not enough, the seed in
+    // `DEFAULT_RELATION_TYPES` has to go too -- and the exclusion filter here had already been
+    // deleted along with it. So `ensure_default_ontology` seeded the row back seven minutes
+    // later, and for the first time `related_to` was **listed in the prompt for the model to
+    // see**. 0001 measured it: of 359 uses, 321 were the model picking it off the list.
+    // Anyone wanting to add a fallback relation back into the seed table should read 0010
+    // first -- though that table is gone now (`#128`), retired along with the seeding
+    // function.
     let type_key_by_id: HashMap<Uuid, &str> =
         etypes.iter().map(|t| (t.id, t.key.as_str())).collect();
     let attr_meta: HashMap<&str, &utopia_core::models::RelationType> = rtypes
@@ -327,14 +364,18 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         .collect();
     let type_ids: HashMap<&str, Uuid> = etypes.iter().map(|t| (t.key.as_str(), t.id)).collect();
     let rel_ids: HashMap<&str, Uuid> = rtypes.iter().map(|r| (r.key.as_str(), r.id)).collect();
-    // 模型说出的谓词往本体已有关系上落：写法、时态、被动都对齐（见 predicate_match）。
-    // 没有它的时候，`produces` 明明在词表里，模型写 `produced_by` 就被降级扔了
+    // Predicates the model says are landed onto relations the ontology already has: spelling,
+    // tense and passive voice all get aligned (see predicate_match). Without it, `produces` was
+    // right there in the vocabulary, yet the model writing `produced_by` got downgraded and
+    // thrown away
     let pred_index = PredicateIndex::build(&rtypes);
-    // 「本体认不认识这个说法」——字面值那一档与关系那一档必须用同一个判据。
-    // 分开写的话，模糊匹配得上的谓词会先被字面值那一档当成属性分流走，
-    // 同一个词在两条路上得到相反的回答
+    // "Does the ontology know this wording" -- the literal-value branch and the relation branch
+    // have to use one and the same criterion. Written separately, a predicate that fuzzy-matches
+    // would first be diverted as an attribute by the literal branch, and the same word would get
+    // opposite answers on the two paths
     let known_predicate = |p: &str| rel_ids.contains_key(p) || pred_index.lookup(p).is_some();
-    // 时态对账只对带唯一性约束的状态关系生效（本体元数据）：(functional, inverse_functional, temporal)
+    // Temporal reconciliation only applies to state relations with a uniqueness constraint
+    // (ontology metadata): (functional, inverse_functional, temporal)
     let rel_meta: HashMap<Uuid, (bool, bool, String)> = rtypes
         .iter()
         .map(|r| {
@@ -349,15 +390,17 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         .map(|t| (t.id, t.parents.as_slice()))
         .collect();
 
-    // **本体全铺还是按分块检索。**
+    // **Lay out the whole ontology, or retrieve per chunk.**
     //
-    // 全铺是今天的行为，小本体下它对且便宜：40 个类约 2k 字符，检索反而是多余的
-    // 往返。大本体下它是灾难——schema.org 实测每个分块 108k tokens，而同一份语料
-    // 只给种子类时抽到 25 个实体、给全量时只剩 18 个。**多给的那 959 个类
-    // 吃掉了 7 个实体。**
+    // Laying it all out is today's behaviour, and with a small ontology it is both correct and
+    // cheap: 40 classes is about 2k characters, and retrieval would just be a pointless round
+    // trip. With a large ontology it is a disaster -- schema.org measured 108k tokens per chunk,
+    // and on the same corpus giving only the seed classes extracted 25 entities while giving
+    // the full set left only 18. **Those 959 extra classes ate 7 entities.**
     //
-    // 所以按预算切换：装得下就全铺，装不下就每块检索。判据量的是**实际要排的
-    // 那段字**（build_lists 自己数），不是另写一个估算公式——公式会跟排版分叉。
+    // So it switches on a budget: lay it all out if it fits, retrieve per chunk if it does not.
+    // The criterion measures **the actual text that will be laid out** (build_lists counts it
+    // itself) rather than a separate estimation formula -- a formula would drift from the layout.
     let full = build_lists(&etypes, &rtypes, None, None);
     let budget = utopia_store::access::ontology_prompt_budget(&state.pool).await?;
     let retrieve_per_chunk = full.chars() > budget;
@@ -365,19 +408,23 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         tracing::info!(
             %document_id, chars = full.chars(), budget,
             classes = etypes.len(),
-            "本体超出提示词预算，改为按分块检索候选"
+            "ontology exceeds the prompt budget, switching to per-chunk candidate retrieval"
         );
     }
-    // 内置类恒在：检索漏掉的分块仍要有地方落脚，否则模型无类可选
+    // Builtin classes are always present: a chunk that retrieval misses still needs somewhere
+    // to land, otherwise the model has no class to pick
     let seed_classes: HashSet<Uuid> = etypes.iter().filter(|t| t.builtin).map(|t| t.id).collect();
 
-    // 属性 domain 允许子类：主语类型沿 parent 链上溯命中 domain 即可
-    // 沿 subClassOf 上溯。**广度优先 + 访问集**，不是单链循环：
-    // 一个类可以有多个父（FOAF 的 Person 同时是 Agent 与 SpatialThing），
-    // 而菱形继承会从两条路到达同一个祖先，没有访问集就会重复展开。
+    // An attribute's domain admits subclasses: it is enough for the subject type to hit the
+    // domain while walking up the parent chain.
+    // Walk up subClassOf. **Breadth first plus a visited set**, not a single-chain loop:
+    // a class can have several parents (FOAF's Person is both Agent and SpatialThing),
+    // and diamond inheritance reaches the same ancestor by two routes, which without a visited
+    // set gets expanded twice.
     //
-    // 深度上限换成了访问集：写入侧 set_parents 已经查环，这里再靠"最多走十层"
-    // 兜底既挡不住宽的图，也会悄悄放过深的层级。
+    // The depth cap was replaced by the visited set: set_parents on the write side already
+    // checks for cycles, and a "walk at most ten levels" backstop here neither stops a wide
+    // graph nor stops quietly letting deep hierarchies through.
     let type_matches_domain = |ty: Uuid, domain: Uuid| -> bool {
         let mut seen: HashSet<Uuid> = HashSet::new();
         let mut queue = vec![ty];
@@ -394,13 +441,17 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         }
         false
     };
-    // 本轮要从头讲一遍这篇文档的故事，旧信号先清掉（重抽自动作数）
+    // This round retells this document's story from the start, so old signals are cleared
+    // first (a re-extraction counts automatically)
     let _ = utopia_store::extraction_drops::clear_for_document(&state.pool, document_id).await;
 
-    // **记忆抽出的事实先等人点头**（0015）。一句 remember 一次一句、人就在对话里，
-    // 确认成本最低的时刻就是说完那句话的时候；而批量摄入一次上万条，逐条确认
-    // 不可能，那条路仍旧乐观写入 + 事后审阅。判据只有一个：这篇是不是记忆日志。
-    // 实体照常消解并创建——`pending_facts.subject_id` 是外键，这是 0018 定下的取舍
+    // **Facts extracted from memory wait for a human nod first** (0015). A remember is one
+    // sentence at a time with the human right there in the conversation, so the cheapest moment
+    // to confirm is the moment they finish saying it; bulk ingest lands tens of thousands at
+    // once, where confirming them one by one is impossible, so that path still writes
+    // optimistically and reviews afterwards. There is exactly one criterion: is this a memory
+    // log. Entities are resolved and created as usual -- `pending_facts.subject_id` is a foreign
+    // key, a trade-off settled in 0018
     let await_nod = utopia_store::memory::is_memory_document(&state.pool, document_id).await?;
     let mut pending_count = 0usize;
 
@@ -408,31 +459,39 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
     let chunks = utopia_store::documents::chunks_for_extraction(&state.pool, document_id).await?;
 
     let mut doc_cache: HashMap<(Option<Uuid>, String), Uuid> = HashMap::new();
-    // 本文档已经认下的实体，按首次出现排序，送进后续分块的提示词。
+    // Entities this document has already committed to, ordered by first appearance, fed into
+    // the prompt of the chunks that follow.
     //
-    // **按 entity_id 去重，不按名字**：第 3 块写"上海研究院"若消解到了第 1 块的
-    // "星云科技上海研究院"，那它不该以第二个名字进清单——清单里每个实体只有
-    // 一个展示形态，就是这篇文档第一次用的那个。中文里全称先出现，所以这也是较全的那个。
+    // **Deduplicated by entity_id, not by name**: if chunk 3 writes "上海研究院" ("Shanghai
+    // Research Institute") and it resolves to chunk 1's "星云科技上海研究院" ("Nebula Tech
+    // Shanghai Research Institute"), it must not enter the list under that second name -- every
+    // entity in the list has exactly one display form, the one this document used first. In
+    // Chinese the full name comes first, so that is also the more complete one.
     let mut doc_entities: Vec<(Uuid, String, String)> = Vec::new();
-    // 整块没抽成的：(seq, 原因)。收尾时据此拒绝把这篇文档标成 done
+    // Chunks that failed wholesale: (seq, reason). Used at the finish to refuse marking this
+    // document done
     let mut unextracted: Vec<(i32, String)> = Vec::new();
     let mut needs_adjudication = false;
     let mut conflicts_found = false;
     let mut fact_count = 0usize;
-    // 不设分块上限：静默截断等于丢知识，长文档的成本由部署者自己权衡
-    // （成本优化走 prompt 前缀缓存与更新时 chunk 级跳过，而非丢数据）
+    // No cap on chunks: silent truncation means losing knowledge, and the cost of a long
+    // document is for the operator to weigh themselves (cost optimisation goes through prompt
+    // prefix caching and chunk-level skipping on update, not through dropping data)
     for chunk in chunks.iter() {
-        // 被接管则安静退场：不写 failed、不碰状态，舞台留给新任务。
-        // 检查放在调用 LLM 之前——取消粒度即一个分块，不必等整篇跑完
+        // If taken over, leave quietly: do not write failed, do not touch the status, leave
+        // the stage to the new job. The check sits before the LLM call -- cancellation
+        // granularity is one chunk, there is no need to wait for the whole document to finish
         if utopia_store::documents::extract_epoch(&state.pool, document_id).await? != my_epoch {
-            tracing::info!(%document_id, "抽取任务已被新一轮接管，退出");
+            tracing::info!(%document_id, "extraction taken over by a newer round, exiting");
             return Ok(());
         }
         let ctx: Option<&[f32]> = chunk.embedding.as_ref().map(|v| v.as_slice());
-        // 本体装得下就用全量那份；装不下就拿**这一块自己的向量**检索候选。
-        // 向量是现成的——实体消解本来就在用它（上面那个 ctx），检索一次
-        // 嵌入都不用加。检索不出来（没配嵌入模型、或这块没向量）就退回全量：
-        // 提示词大是慢，没有类可选是抽不出东西
+        // If the ontology fits, use the full listing; if it does not, retrieve candidates with
+        // **this chunk's own vector**. The vector is already at hand -- entity resolution is
+        // using it anyway (that ctx above), so retrieval costs not one extra embedding call. If
+        // retrieval comes up empty (no embedding model configured, or this chunk has no vector)
+        // it falls back to the full listing: a big prompt is slow, having no class to pick means
+        // nothing gets extracted at all
         let lists = if retrieve_per_chunk {
             match ctx {
                 Some(v) => chunk_lists(state, doc.kb_id, v, &etypes, &rtypes, &seed_classes)
@@ -457,33 +516,35 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             &known,
             &chunk.text,
         );
-        // 这两处 continue 跳过的是**整个分块**——它一条事实都没产出。
-        // 记下来，收尾时据此决定这篇文档算不算抽完（见循环之后）
+        // These two `continue`s skip **the whole chunk** -- it produced not a single fact.
+        // Record it, and use it at the finish to decide whether this document counts as fully
+        // extracted (see after the loop)
         let reply = match chat_retrying_rate_limits(state, &settings, &client, &messages).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "抽取调用失败，跳过该分块");
-                unextracted.push((chunk.seq, format!("调用失败：{e}")));
+                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "extraction call failed, skipping this chunk");
+                unextracted.push((chunk.seq, format!("call failed: {e}")));
                 continue;
             }
         };
         let extraction = match utopia_extract::parse_response(&reply) {
             Ok(x) => x,
             Err(e) => {
-                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "抽取结果解析失败，跳过该分块");
-                unextracted.push((chunk.seq, format!("结果解析失败：{e}")));
+                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "parsing the extraction result failed, skipping this chunk");
+                unextracted.push((chunk.seq, format!("parsing the result failed: {e}")));
                 continue;
             }
         };
-        // **跳过了什么必须说出来。** 逐项解析救回了整块，但被跳过的那几条
-        // 如果不落信号，就成了另一种「部分抽取报告成完成」（#108 修过一次）
+        // **What got skipped has to be said out loud.** Per-item parsing rescued the chunk as
+        // a whole, but if the few items that were skipped leave no signal, that is just another
+        // flavour of "partial extraction reported as complete" (#108 fixed it once already)
         if extraction.truncated {
             drop_signal(
                 state,
                 doc.kb_id,
                 document_id,
                 utopia_store::extraction_drops::reason::TRUNCATED_REPLY,
-                &format!("分块 #{} 的输出被截断", chunk.seq),
+                &format!("output for chunk #{} was truncated", chunk.seq),
                 None,
             )
             .await;
@@ -495,7 +556,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 seq = chunk.seq,
                 entities = extraction.skipped_entities,
                 facts = extraction.skipped_facts,
-                "跳过了结构不合的条目"
+                "skipped items with a malformed shape"
             );
             drop_signal(
                 state,
@@ -503,7 +564,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 document_id,
                 utopia_store::extraction_drops::reason::MALFORMED_ITEM,
                 &format!(
-                    "分块 #{} 跳过 {} 个实体 / {} 条事实",
+                    "chunk #{} skipped {} entities / {} facts",
                     chunk.seq, extraction.skipped_entities, extraction.skipped_facts
                 ),
                 None,
@@ -511,15 +572,15 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             .await;
         }
 
-        // 实体消解：名称 → 实体 id（本分块的事实按原文名字连线）
+        // Entity resolution: name → entity id (facts in this chunk are wired by original name)
         let mut entity_ids: HashMap<String, Uuid> = HashMap::new();
-        // 名称 → 声明类型（属性 domain 校验用：salary 不能挂在 Organization 上）
+        // name → declared type (for attribute domain checks: salary cannot hang off Organization)
         let mut entity_type_of: HashMap<String, Option<Uuid>> = HashMap::new();
         for e in &extraction.entities {
             let name = e.name.trim();
             if !is_entity_name(name) {
-                // 从前这里是静默 `continue`——正是 `drop_signal` 当初为之而建的
-                // 那种"抽出来了、被挡掉、什么都不说"
+                // This used to be a silent `continue` -- exactly the "extracted, blocked, and
+                // nothing said about it" that `drop_signal` was built for in the first place
                 drop_signal(
                     state,
                     doc.kb_id,
@@ -531,18 +592,22 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 .await;
                 continue;
             }
-            // 降级时记住模型提议的那个词：本体装不下不等于它说错了。
-            // 只留计数的话，日后想加 model 类就找不出那 43 个实体——它们混在
-            // concept 里面，唯一的出路是整库重抽
+            // When downgrading, remember the word the model proposed: the ontology having no
+            // room for it does not mean the model said it wrong. Keep only a count and later,
+            // when you want to add a model class, those 43 entities cannot be found -- they are
+            // mixed in among concept, and the only way out is re-extracting the whole kb
             let mut proposed: Option<&str> = None;
             let type_id = match type_ids.get(e.type_key.as_str()) {
                 Some(id) => Some(*id),
                 None => {
-                    // 白名单外类型：**留空**，并记入未匹配统计（本体扩展的信号）。
+                    // A type outside the allowlist: **leave it empty** and count it as a miss
+                    // (the signal for extending the ontology).
                     //
-                    // 从前这里降级到 concept 那行哨兵。现在「还没判出来」就是
-                    // `type_id IS NULL`（0009）——实体照常建、事实照常落、证据照常有，
-                    // 只是暂时没有类型。之后装一个包再跑类型消解，它会被重新分配
+                    // This used to downgrade to that concept sentinel row. Now "not judged
+                    // yet" simply is `type_id IS NULL` (0009) -- the entity is created, the
+                    // fact lands, the evidence is there as usual, it just has no type for the
+                    // moment. Install a pack later and run type resolution, and it gets
+                    // reassigned
                     let _ = utopia_store::ontology::record_miss(
                         &state.pool,
                         doc.kb_id,
@@ -568,9 +633,11 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             if let Some(p) = proposed {
                 let _ = utopia_store::resolution::set_proposed_type(&state.pool, id, p).await;
             }
-            // 模型自己的说法。**跟 proposed_type 分开存**：那一列的含义是
-            // "本体里没有"，增长回路靠它的稀有性设门槛；这一列每个实体都有。
-            // 与粗类同名的不记——那不是更具体的说法，只是把清单抄了一遍
+            // The model's own wording. **Stored separately from proposed_type**: that column
+            // means "not in the ontology", and the growth loop sets its threshold on how rare
+            // it is; this column is present on every entity. Nothing is recorded when it
+            // matches the coarse class name -- that is not a more specific wording, it is just
+            // the list copied back
             if let Some(st) = e
                 .specific_type
                 .as_deref()
@@ -580,12 +647,14 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             {
                 let _ = utopia_store::resolution::set_specific_type(&state.pool, id, st).await;
             }
-            // 只记模型自己声明过类型的：主宾兜底那条路没有类型可依，
-            // 把一个猜出来的类型放进清单等于让后续分块照着猜的抄。
+            // Only entities whose type the model declared itself are recorded: the
+            // subject/object fallback path has no type to go on, and putting a guessed type
+            // into the list means the chunks that follow copy the guess.
             //
-            // 本体装不下那个类时用模型自己的说法（proposed）：这份清单是给后文
-            // 认人用的，"同一个名字别写成两个实体"才是它的活。从前这里只能写死
-            // concept，反倒把几个不同的词抹平成同一个标签
+            // When the ontology has no room for that class, the model's own wording (proposed)
+            // is used: this list exists so later text can recognise the same people, and "do
+            // not write one name as two entities" is its whole job. This used to be hardcoded
+            // to concept, which instead flattened several different words into one label
             if !doc_entities.iter().any(|(eid, _, _)| *eid == id) {
                 let tk = type_id
                     .and_then(|t| type_key_by_id.get(&t).copied())
@@ -600,7 +669,8 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
         for f in &extraction.facts {
             let confidence = f.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
             if confidence < MIN_CONFIDENCE {
-                // 设计上的阈值，但用户同样无从知道"抽到了，只是不够自信"
+                // A deliberate threshold, but the user still has no way to know "it was
+                // extracted, just not confidently enough"
                 drop_signal(
                     state,
                     doc.kb_id,
@@ -614,12 +684,14 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             }
             let from = f.valid_from.as_deref().and_then(utopia_extract::parse_time);
             let to = f.valid_to.as_deref().and_then(utopia_extract::parse_time);
-            // **两端各记各的粒度**（见 `facts.valid_to_precision`）。从前一个精度列描述两个端点，
-            // 于是「2020 年开始、2023-05-06 结束」这种只能共用一个值。
+            // **Each end records its own precision** (see `facts.valid_to_precision`). One
+            // precision column used to describe both endpoints, so "started in 2020, ended
+            // 2023-05-06" had to make the two share a single value.
             //
-            // 模型给的 valid_to = "unknown" 表示**原文说它结束了、但没说哪天**。
-            // parse_time 解不出它（本来就不是日期），落在这里显式认掉——
-            // 不认的话它退化成 None，那条事实就又变回"仍在持续"了
+            // A valid_to = "unknown" from the model means **the text said it ended but not on
+            // which day**. parse_time cannot parse it (it is not a date to begin with), so it
+            // is recognised explicitly here -- otherwise it degrades to None and that fact
+            // turns back into "still ongoing"
             let ended_unknown = f
                 .valid_to
                 .as_deref()
@@ -634,9 +706,11 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                     .or(ended_unknown.then_some(utopia_store::graph::ENDED_UNKNOWN)),
             };
 
-            // 属性事实：谓词命中属性 → 字面值通道。datatype 校验失败宁缺勿脏；
-            // domain 校验（含子类上溯）挡住"把 salary 挂到 Organization"这类张冠李戴。
-            // 模型偶尔照抄清单里的 "person.salary" 全限定名——剥掉类前缀再查一次
+            // Attribute facts: the predicate hits an attribute → the literal-value channel. A
+            // failed datatype check prefers nothing over dirty data; the domain check (walking
+            // up subclasses) stops mix-ups like "hanging salary off Organization". The model
+            // occasionally copies the fully qualified "person.salary" from the list -- strip the
+            // class prefix and look it up once more
             let attr_hit = attr_meta.get(f.predicate.as_str()).or_else(|| {
                 f.predicate
                     .rsplit_once('.')
@@ -644,9 +718,11 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             });
             if let Some(attr) = attr_hit {
                 let subject_name = f.subject.trim();
-                // 主语没在 entities 里声明：类型不明，domain 无从校验，属性不落。
-                // 关系路径遇到同样的缺失会兜底按 concept 消解——这里学不来，
-                // 按 concept 解出来 domain 照样不匹配，只是从这里掉进下面那一档
+                // The subject was not declared in entities: the type is unknown, the domain
+                // cannot be checked, so the attribute does not land. The relation path falls
+                // back to resolving as concept on the same omission -- that cannot be copied
+                // here, since resolving as concept fails the domain check all the same, it
+                // would only fall from here into the branch below
                 let Some((&subject_id, &subject_type)) = entity_ids
                     .get(subject_name)
                     .zip(entity_type_of.get(subject_name))
@@ -662,12 +738,14 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                     .await;
                     continue;
                 };
-                // 不可达：store 层强制 attribute 必有 domain，且 domain 不可改，
-                // 无 domain 的属性连提示词都进不去。留着是防御，不需要信号
+                // Unreachable: the store layer requires every attribute to have a domain and
+                // the domain is immutable, and an attribute without one never even makes it
+                // into the prompt. Kept as a defence, needs no signal
                 if attr.domains.is_empty() {
                     continue;
                 }
-                // **任一 domain 命中即可**：属性挂在多个类下时，主语属于其中之一就算数
+                // **Any one domain matching is enough**: when an attribute hangs off
+                // several classes, the subject belonging to one of them counts
                 if !attr
                     .domains
                     .iter()
@@ -695,7 +773,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 }
                 let raw = match (&f.value, &f.object) {
                     (Some(v), _) => v.clone(),
-                    // 模型偶尔把值放进 object：宽容接住
+                    // The model occasionally puts the value in object: catch it leniently
                     (None, Some(o)) if !o.trim().is_empty() => {
                         serde_json::Value::String(o.trim().to_string())
                     }
@@ -714,7 +792,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 };
                 let datatype = attr.datatype.as_deref().unwrap_or("text");
                 let Some(normalized) = utopia_extract::normalize_attr_value(datatype, &raw) else {
-                    tracing::debug!(%document_id, attr = attr.key, ?raw, "属性值不合 datatype，跳过");
+                    tracing::debug!(%document_id, attr = attr.key, ?raw, "attribute value does not fit the datatype, skipping");
                     drop_signal(
                         state,
                         doc.kb_id,
@@ -728,7 +806,8 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 };
                 let mut object_value = serde_json::json!({ "value": normalized });
                 if let Some(u) = attr.unit.as_deref().filter(|u| !u.is_empty()) {
-                    // 单位随事实落笔：类型上的单位以后改了，旧值仍按记录时的单位读
+                    // The unit is written down with the fact: if the unit on the type
+                    // changes later, old values are still read in the unit they were recorded in
                     object_value["unit"] = serde_json::json!(u);
                 }
                 if await_nod {
@@ -765,8 +844,9 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 )
                 .await?;
                 touched_facts.push(fact_id);
-                // 属性谓词也留原词：模型偶尔照抄 "person.salary" 全限定名，
-                // 命中的是剥掉前缀后的 key，原样是什么值得留着
+                // Attribute predicates keep the original wording too: the model occasionally
+                // copies the fully qualified "person.salary", the hit is on the key with the
+                // prefix stripped, and what it literally said is worth keeping
                 utopia_store::graph::add_evidence(
                     &state.pool,
                     fact_id,
@@ -779,7 +859,8 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                     continue;
                 }
                 fact_count += 1;
-                // 单值属性 = functional：新值闭合旧值（属性历史由此而来）
+                // A single-valued attribute = functional: a new value closes the old one
+                // (this is where attribute history comes from)
                 if attr.functional && attr.temporal == "state" {
                     let report = utopia_store::temporal::reconcile_new_fact(
                         &state.pool,
@@ -801,20 +882,28 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 continue;
             }
 
-            // **词表外的字面值：既不丢，也不给它编一个实体。**
+            // **A literal outside the vocabulary: neither dropped, nor invented into an
+            // entity.**
             //
-            // 走到这里说明谓词既不是已知属性也还没查关系表。它带着字面值时
-            // 有两种走法，从前两种都不好：
-            //   value 有而 object 空 → 掉进下面的"宾语必填"，整条静默消失；
-            //   object 里塞着字面值 → 按 concept 消解，凭空造出一个叫「2015」
-            //     的实体，图里多一个假节点，事后再修还得改事实的形状。
-            // 现在都存成 object_value 且没有谓词：值在图里、有证据、有时态，
-            // 原词进 proposed_predicate，消解那一遍只需换谓词，形状已经是对的。
+            // Reaching here means the predicate is neither a known attribute nor has the
+            // relation table been consulted yet. When it carries a literal there are two ways
+            // it can go, and both used to be bad:
+            //   value set and object empty → falls into "object is required" below, and the
+            //     whole item vanishes silently;
+            //   a literal stuffed into object → resolved as concept, conjuring an entity called
+            //     "2015" out of thin air, one fake node more in the graph, and fixing it
+            //     afterwards means changing the shape of the fact.
+            // Now both are stored as object_value with no predicate: the value is in the graph,
+            // with evidence and with validity, the original wording goes into
+            // proposed_predicate, and the resolution pass only has to swap the predicate -- the
+            // shape is already right.
             //
-            // object 里的东西算不算字面值，判据从严：**模型没把它声明成实体**，
-            // 且**它本身解得出数字或日期**。"杭州"两条都不满足，"2015"都满足。
-            // 文本值的属性（schema.org 里 323 个）在这一档仍会变成实体——
-            // 那里没有可靠判据，猜错会吃掉真实体，不猜
+            // Whether the thing in object counts as a literal is judged strictly: **the model
+            // did not declare it as an entity**, and **it parses as a number or a date on its
+            // own**. "杭州" (a city name) satisfies neither, "2015" satisfies both. Attributes
+            // with text values (323 of them in schema.org) still turn into entities in this
+            // branch -- there is no reliable criterion there, and guessing wrong eats real
+            // entities, so we do not guess
             let literal = match (&f.value, f.object.as_deref().map(str::trim)) {
                 (Some(v), None | Some("")) if !known_predicate(f.predicate.as_str()) => {
                     Some(v.clone())
@@ -900,7 +989,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 continue;
             }
 
-            // 关系事实：宾语必填
+            // Relation facts: the object is required
             let Some(object_name) = f.object.as_deref().map(str::trim).filter(|s| !s.is_empty())
             else {
                 drop_signal(
@@ -914,17 +1003,21 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 .await;
                 continue;
             };
-            // **未声明的主宾也要过同一道判据。**
+            // **Undeclared subjects and objects have to pass the same criterion.**
             //
-            // 从前守卫只装在上面那条声明实体的路上，而这里绕过了它：模型把一整句话
-            // 写进 `object`、那句话没出现在 entities 里，这里就转头把它造成了实体。
-            // 实测（ai-timeline-ends × schema.org）421 个实体里 76 个无类型，
-            // 最长的那个 111 字符——"thermal-imaging equipment used by volunteers
-            // flying over the site showed at least 33 generators giving off heat"，
-            // 那是一整个从句，不是一个东西。**守卫拦住了前门，后门是开的。**
+            // The guard used to sit only on the declared-entity path above, and this path went
+            // around it: the model writes a whole sentence into `object`, that sentence never
+            // shows up in entities, and this code turns around and creates it as an entity.
+            // Measured (ai-timeline-ends × schema.org): 76 of 421 entities had no type, the
+            // longest of them 111 characters -- "thermal-imaging equipment used by volunteers
+            // flying over the site showed at least 33 generators giving off heat", which is an
+            // entire clause, not a thing. **The guard held the front door, the back door stood
+            // open.**
             //
-            // 这类实体的害处不止于此：它们永远匹配不到别处的任何提及，
-            // 在图上是孤点（实测 59 个），还会拖累消解——每一个都要跟已有实体比一遍。
+            // The harm of these entities does not stop there: they never match any mention
+            // anywhere else, they are isolated points in the graph (59 of them, measured), and
+            // they drag resolution down as well -- every one has to be compared against the
+            // existing entities.
             if !is_entity_name(f.subject.trim()) || !is_entity_name(object_name) {
                 drop_signal(
                     state,
@@ -942,8 +1035,10 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 continue;
             }
 
-            // 主宾未在 entities 中声明时先建出来（模型偶尔漏报）。没有 entities 那条
-            // 记录就没有类型可依，留空即可——0009 之前这里只能塞 concept
+            // When the subject or object was not declared in entities, create it first (the
+            // model occasionally omits them). Without that entities record there is no type to
+            // go on, so leaving it empty is fine -- before 0009 all this could do was stuff in
+            // concept
             let subject_id = match entity_ids.get(f.subject.trim()) {
                 Some(id) => *id,
                 None => {
@@ -977,9 +1072,12 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             if subject_id == object_id {
                 continue;
             }
-            // 先尽量落到本体已有的关系上（写法/时态/被动），**落不上才降级**为 related_to
-            // 并记入未匹配统计。降级会把原意抹平成"有关联"——原词写进证据行的
-            // proposed_predicate，是这条事实身上唯一还留着原意的地方（谓词消解据此映射回本体）
+            // First try hard to land on a relation the ontology already has (spelling / tense /
+            // passive), and **only downgrade** to related_to when it cannot, counting it as a
+            // miss. A downgrade flattens the original meaning into "is related to" -- the
+            // original wording written into the evidence row's proposed_predicate is the only
+            // place on this fact where that meaning still survives (predicate resolution maps
+            // it back into the ontology from there)
             let (predicate_id, swap) = match pred_index.lookup(f.predicate.as_str()) {
                 Some((id, swap)) => (Some(id), swap),
                 None => {
@@ -991,48 +1089,62 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                         Some(&format!("{} → {}", f.subject, object_name)),
                     )
                     .await;
-                    // 本体里没有对应的关系 → **就是没有谓词**（见 `facts.predicate_id`）。
-                    // 原意留在证据的 proposed_predicate 里，显示时取回。
-                    // 从前这里落到 related_to 上，还要额外担心"兜底关系被删了"——
-                    // 那条失败模式连同它的 continue 一起消失了
+                    // No matching relation in the ontology → **there simply is no predicate**
+                    // (see `facts.predicate_id`). The original meaning stays in the evidence's
+                    // proposed_predicate and is fetched back for display.
+                    // This used to land on related_to, which also meant worrying about "the
+                    // fallback relation got deleted" -- that failure mode is gone along with
+                    // its continue
                     (None, false)
                 }
             };
-            // 被动说法命中的是同一条边的反向：`ChatGPT produced_by OpenAI` 与
-            // `OpenAI produces ChatGPT` 是同一条边，存的时候要按本体的方向来，
-            // 否则它跟已有的那 130 条 produces 各存各的，图上是两条相反的箭头
+            // A passive wording hits the reverse of the same edge: `ChatGPT produced_by OpenAI`
+            // and `OpenAI produces ChatGPT` are one and the same edge, and it has to be stored
+            // in the ontology's direction, otherwise it is stored apart from the 130 existing
+            // produces facts and the graph shows two opposing arrows
             let (subject_id, object_id) = if swap {
                 (object_id, subject_id)
             } else {
                 (subject_id, object_id)
             };
 
-            // **主语违反 domain、而宾语符合时，按本体声明的方向把它掰正。**
+            // **When the subject violates the domain while the object fits it, straighten it
+            // out into the direction the ontology declares.**
             //
-            // 先试过提示词，三轮都没赢：违反率从 57% 压到 35%，但压下去的全是
-            // 类型判错那一半；**真·反向纹丝不动**（22.7% → 17.1% → 17.6%，
-            // 后两个在噪声里）。模型看得见 `employee (organization → person)`，
-            // 就是不照做——英语的 "X is an employee of Y" 太强。
+            // The prompt was tried first and lost three rounds running: the violation rate went
+            // from 57% down to 35%, but everything it pushed down was the half that was a type
+            // misjudgement; **true reversals did not budge** (22.7% → 17.1% → 17.6%, the last
+            // two inside the noise). The model can see `employee (organization → person)` and
+            // simply does not follow it -- English's "X is an employee of Y" is too strong.
             //
-            // 这不是新原则：`produced_by` 命中 `produces` 时（见上面那个 `swap`）
-            // 早就在自动翻转主宾了，区别只在触发条件是**措辞**还是**签名**。
+            // This is not a new principle: when `produced_by` hits `produces` (see that `swap`
+            // above) subject and object have long been flipped automatically; the only
+            // difference is whether the trigger is the **wording** or the **signature**.
             //
-            // 当初反对自动对调的理由是实体类型不可靠——实测 Elon Musk 被判成
-            // `researcher`。那个前提已经不成立：祖先地板与签名类恒在修好之后，
-            // 同一批人判成了 `person`。而判据本身很窄——**主语违反且宾语符合**，
-            // 两侧都要对上才动。
+            // The original objection to swapping automatically was that entity types are
+            // unreliable -- Elon Musk was measured being judged a `researcher`. That premise no
+            // longer holds: after the ancestor floor and the always-present signature classes
+            // were fixed, the same people came out as `person`. And the criterion itself is
+            // narrow -- **the subject violates and the object fits** -- both sides have to line
+            // up before anything moves.
             //
-            // **但绝不静默。** 掰正要留信号：0001 反对的是「用可能错的声明驱动
-            // 自动动作」，而看得见、可复查、可反悔的动作不属于那一类。
+            // **But never silently.** Straightening has to leave a signal: what 0001 objected
+            // to was "driving automatic actions off possibly wrong declarations", and an action
+            // that is visible, reviewable and reversible is not of that kind.
             let (predicate_id, subject_id, object_id) = if let Some(pid) = predicate_id {
-                // 类型**从库里的实体读**，不用抽取器手上那份 `entity_type_of`：
-                // 那份只覆盖模型在这一块里声明过的实体，而宾语常是别处已存在的实体，
-                // 这一块没重新声明它，于是查不到、判不了、掰不动。实测差别不小——
-                // 用声明那份时反向只降到 7.0%，剩下的正是宾语类型查不到的那些
+                // Types are **read from the entities in the database**, not from the
+                // extractor's own `entity_type_of`: that map only covers entities the model
+                // declared in this chunk, while the object is often an entity that already
+                // exists elsewhere and this chunk did not declare again, so it cannot be looked
+                // up, cannot be judged, cannot be straightened. The difference is far from
+                // small -- with the declared map, reversals only came down to 7.0%, and the
+                // remainder was exactly the objects whose type could not be found
                 //
-                // 判断本身在 store（`ontology::judge_direction`），**与采纳共用**（#190）：
-                // 写谓词的路不止这一条，守卫只装在一条上就等于没装。查不出来（库错）
-                // 按没有判据处理，照原样落——宁可少掰一条，不能因为一次查询失败丢事实
+                // The judgement itself lives in the store (`ontology::judge_direction`) and is
+                // **shared with adoption** (#190): more than one path writes a predicate, and a
+                // guard installed on only one of them is no guard at all. A failed lookup (a
+                // database error) is treated as having no criterion and lands as-is -- better to
+                // straighten one fact fewer than to lose a fact over one failed query
                 let fit = utopia_store::ontology::judge_direction(
                     &state.pool,
                     pid,
@@ -1050,7 +1162,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                             utopia_store::extraction_drops::reason::DIRECTION_CORRECTED,
                             &f.predicate,
                             Some(&format!(
-                                "{} → {} 按签名掰正为 {} → {}",
+                                "{} → {} straightened to {} → {} by signature",
                                 f.subject,
                                 f.object.as_deref().unwrap_or("?"),
                                 f.object.as_deref().unwrap_or("?"),
@@ -1061,20 +1173,25 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                         (Some(pid), object_id, subject_id)
                     }
                     utopia_store::ontology::Fit::Neither => {
-                        // **对调也不合法 → 退回没有谓词。**
+                        // **Swapping is not legal either → fall back to no predicate.**
                         //
-                        // 这不是方向问题，是这个关系压根不适用：schema.org 的
-                        // `affectedBy` 是医学检验用的，模型要表达「受……影响」时按名字
-                        // 撞了上来；`amount` 属于融资工具而不是公司，模型没造那个中间
-                        // 节点就把边挂到了公司上。
+                        // This is not a direction problem, this relation simply does not apply:
+                        // schema.org's `affectedBy` is for medical tests, and the model ran
+                        // into it by name while trying to express "affected by ..."; `amount`
+                        // belongs to a financing instrument rather than to a company, and the
+                        // model hung the edge on the company because it never created that
+                        // intermediate node.
                         //
-                        // 从前照原样落库，等于**用本体的名义说一件本体不同意的事**——
-                        // 图上写着 "OpenAI affectedBy …"，读者会以为那是一条医学断言。
-                        // 这是自信的错误，比空谓词严重得多。
+                        // Landing it as-is used to mean **saying something the ontology
+                        // disagrees with, in the ontology's name** -- the graph reads "OpenAI
+                        // affectedBy ...", and a reader takes that for a medical assertion.
+                        // That is a confident error, far worse than an empty predicate.
                         //
-                        // 退回空谓词不丢信息：原词落进 `fact_evidence.proposed_predicate`，
-                        // 显示时由 `fact_surface_predicate()` 取回（0010）。主宾、时间、
-                        // 证据全都留着，只是不再冒认一个本体关系。**诚实的沉默。**
+                        // Falling back to an empty predicate loses no information: the original
+                        // wording lands in `fact_evidence.proposed_predicate` and is fetched
+                        // back for display by `fact_surface_predicate()` (0010). Subject,
+                        // object, time and evidence are all kept, it just stops claiming an
+                        // ontology relation it does not have. **Honest silence.**
                         drop_signal(
                             state,
                             doc.kb_id,
@@ -1082,7 +1199,7 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                             utopia_store::extraction_drops::reason::DOMAIN_MISMATCH,
                             &f.predicate,
                             Some(&format!(
-                                "{} — {} → 主宾都对不上，退回原文说法",
+                                "{} — {} → neither subject nor object fits, kept original wording",
                                 f.subject, f.predicate
                             )),
                         )
@@ -1131,9 +1248,11 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 )
                 .await?;
                 touched_facts.push(fact_id);
-                // 重复观察也要挂证据：多来源相互印证，任一来源删除后事实不孤儿化。
-                // 表层谓词随每次观察落笔——甲块说 "runs on"、乙块说 "optimized for"
-                // 会并进同一条事实，放事实上就是先写者胜，放证据上两个都留着
+                // A repeat observation gets evidence attached too: several sources corroborate
+                // each other, and deleting any one of them does not orphan the fact. The
+                // surface predicate is written down with every observation -- one chunk says
+                // "runs on", another says "optimized for", and they merge into the same fact;
+                // on the fact that would be first writer wins, on the evidence both are kept
                 utopia_store::graph::add_evidence(
                     &state.pool,
                     fact_id,
@@ -1146,10 +1265,13 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                     continue;
                 }
                 fact_count += 1;
-                // 时态对账：带唯一性约束的状态关系落新事实即检测矛盾（纯规则点查，
-                // 自动闭合走"作废+改写"，拿不准进 fact_conflicts 人裁）
-                // 没有谓词就没有关系元数据，也就不参与时态对账——
-                // 一条说不出是什么关系的边，本来就不可能带唯一性约束
+                // Temporal reconciliation: for state relations with a uniqueness constraint, a
+                // new fact triggers contradiction detection right away (a pure rule-based point
+                // lookup; automatic closing goes through "void + rewrite", and anything unclear
+                // goes to fact_conflicts for a human to rule on).
+                // No predicate means no relation metadata, and therefore no part in temporal
+                // reconciliation -- an edge that cannot say what relation it is could never have
+                // carried a uniqueness constraint in the first place
                 if let Some((pid, (func, inv_func, temporal))) =
                     predicate_id.and_then(|id| rel_meta.get(&id).map(|m| (id, m)))
                 {
@@ -1184,52 +1306,64 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
             }
         }
 
-        // 本块抽取完成即打标：更新时被认领的块携带标记跳过；中断的抽取可续跑
-        // （LLM 调用/解析失败的块在上方 continue 掉，不打标，下次重试）
+        // Mark the chunk as soon as it finishes extracting: on update a claimed chunk carries
+        // the mark and is skipped, and an interrupted extraction can resume (chunks whose LLM
+        // call or parsing failed were `continue`d above, are left unmarked, and are retried
+        // next time)
         utopia_store::documents::mark_chunk_extracted(&state.pool, chunk.id).await?;
     }
-    // 队列里多了东西才叫醒人：Review 的计数与对话里那张确认卡都靠这一声
+    // People are only woken when something was actually added to the queue: the Review count
+    // and that confirmation card in the conversation both depend on this one call
     if pending_count > 0 {
-        tracing::info!(%document_id, pending_count, "记忆抽出的事实进了待确认队列");
+        tracing::info!(%document_id, pending_count, "memory facts went into the pending queue");
         state.emit_pending(doc.kb_id);
         state.emit_review(doc.kb_id);
     }
 
-    // 消歧后缀在实体创建时算会早于其事实写入——收尾时对本文档涉及的名字统一刷新
+    // Disambiguation suffixes computed at entity creation time would run before their facts
+    // are written -- so every name this document touched is refreshed in one pass at the finish
     let names: std::collections::HashSet<&str> =
         doc_cache.keys().map(|(_, name)| name.as_str()).collect();
     for name in names {
         utopia_store::resolution::refresh_disambiguators(&state.pool, doc.kb_id, name).await?;
     }
 
-    // 出口再验一次：接管可能发生在最后一个分块之后，那时循环里的检查已经跑完。
-    // 漏掉这里，被顶替的任务会把 done 写在一篇 extracted_at 刚被清空的文档上——
-    // 界面显示"已完成"，实则一条都没抽，要等新任务开跑才纠正回来。
+    // Check once more on the way out: a takeover can happen after the last chunk, by which
+    // time the check inside the loop has already run. Miss this and the displaced job writes
+    // done on a document whose extracted_at was just cleared -- the UI shows "complete" while
+    // in fact nothing was extracted, and it is only corrected once the new job starts running.
     if utopia_store::documents::extract_epoch(&state.pool, document_id).await? != my_epoch {
-        tracing::info!(%document_id, "抽取任务已被新一轮接管，收尾时退出");
+        tracing::info!(%document_id, "extraction taken over by a newer round, exiting at the finish");
         return Ok(());
     }
 
-    // **有分块没抽成就不许标 done。**
+    // **If any chunk failed to extract, done must not be written.**
     //
-    // 从前这里无条件写 done：一次网络抖动让六篇文档 60 块里只抽成 12 块，
-    // 六篇全部显示"抽取完成"，八成的内容没进图，而界面上没有任何东西说出来。
-    // 失败只进了日志，而只进日志的错误等于没有错误。
+    // This used to write done unconditionally: one network hiccup left only 12 of 60 chunks
+    // across six documents extracted, all six showed "extraction complete", eighty percent of
+    // the content never made it into the graph, and nothing in the UI said so.
+    // The failures only reached the log, and an error that only reaches the log is no error.
     //
-    // 返回 Err 之后这条链是完整的：`extract_document` 落 graph_failed + 原因，
-    // 界面上那篇文档变成可点开看错误的 failed；任务按 30s×attempts² 退避重试，
-    // 而已抽成的分块带着 extracted_at 会被跳过——所以重试很便宜，网络恢复就自愈。
-    // 重试耗尽才留在 failed，那时它说的是实话。
+    // The chain is complete once Err is returned: `extract_document` records graph_failed plus
+    // the reason, and that document becomes a failed one in the UI that can be clicked open to
+    // see the error; the job retries with 30s×attempts² backoff, and chunks that already
+    // succeeded carry extracted_at and get skipped -- so retrying is cheap and it heals itself
+    // the moment the network comes back. Only once the retries are exhausted does it stay
+    // failed, and by then it is telling the truth.
     //
-    // 判据是"全抽完"而不是某个比例：任何比例都是拍的，而这里本来就有一个
-    // 不需要拍的判据——**每一块都成了才叫抽完**。
+    // The criterion is "every chunk done" rather than some percentage: any percentage is made
+    // up, while there is already a criterion here that needs no making up -- **it counts as
+    // done only when every single chunk succeeded**.
     if let Some(msg) = incomplete_reason(&unextracted, chunks.len()) {
         return Err(anyhow::anyhow!(msg));
     }
-    // 刚落的事实立刻过一遍签名。写入时只掰方向（judge_direction）；掰不动的
-    // ——两个方向都对不上、或宾语没类型判不了——从前要等人按 Review 里的
-    // Run check 才露面，Axioms 一直是 0，图里却躺着反向事实（#222）。
-    // 检查失败不影响抽取本身：事实已经在库里，下一次 Run check 仍然查得到
+    // Facts that just landed go through the signature check immediately. Writing only
+    // straightens the direction (judge_direction); the ones it cannot straighten -- neither
+    // direction fits, or the object has no type so it cannot be judged -- used to surface only
+    // when someone pressed Run check in Review, so Axioms stayed at 0 while reversed facts lay
+    // in the graph (#222).
+    // A failed check does not affect extraction itself: the facts are already in the database,
+    // and the next Run check still finds them
     if !touched_facts.is_empty() {
         match utopia_store::reasoning::signature_breaks(
             &state.pool,
@@ -1248,18 +1382,21 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
                 {
                     Ok(_) => state.emit_review(doc.kb_id),
                     Err(e) => {
-                        tracing::warn!(%document_id, error = %e, "抽取后的签名违规没记进队列")
+                        tracing::warn!(%document_id, error = %e, "post-extraction signature violations were not recorded in the queue")
                     }
                 }
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(%document_id, error = %e, "抽取后的签名检查失败"),
+            Err(e) => {
+                tracing::warn!(%document_id, error = %e, "post-extraction signature check failed")
+            }
         }
     }
     utopia_store::documents::set_graph_status(&state.pool, document_id, "done").await?;
     state.emit_document(doc.kb_id, document_id);
 
-    // 灰区对进了审核队列 → 触发攒批裁决任务（独立后台跑，抽取本身到此已完成）
+    // Grey-area pairs went into the review queue → trigger the batched adjudication job (runs
+    // independently in the background; extraction itself is finished at this point)
     if needs_adjudication {
         utopia_store::jobs::enqueue(
             &state.pool,
@@ -1271,43 +1408,50 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
     if needs_adjudication || conflicts_found {
         state.emit_review(doc.kb_id);
     }
-    // 自动扩本体：开关开着、且这一批都抽完了，由最后一篇触发。
-    // 判据是显式开关而不是"本体有没有被碰过"——后者是从行为推断意图，
-    // 推错的后果很荒唐（在提案上点一次 Add 就永久关掉建议），而且一旦为假
-    // 就永不再真，本体会冻结在第一批文档碰巧包含的词汇上。
-    // 并发下可能入队两次，任务自己会重查开关与状态
+    // Ontology auto-extend: with the switch on and this batch fully extracted, the last
+    // document triggers it. The criterion is the explicit switch rather than "has the ontology
+    // been touched" -- the latter infers intent from behaviour, and getting that inference wrong
+    // is absurd (one click of Add on a proposal turns suggestions off forever); worse, once it
+    // is false it is never true again, and the ontology freezes on whatever vocabulary the
+    // first batch of documents happened to contain.
+    // Under concurrency it may be enqueued twice; the job re-checks the switch and the status
+    // itself
     enqueue_bootstrap(state, doc.kb_id).await?;
 
-    tracing::info!(%document_id, facts = fact_count, "图谱抽取完成");
+    tracing::info!(%document_id, facts = fact_count, "graph extraction complete");
     Ok(())
 }
 
-/// 宾语位上的这串东西，是不是一个字面值而不是实体的名字。
+/// Whether the string in the object position is a literal rather than the name of an entity.
 ///
-/// **只认数字与日期。** 这是个会吃掉真实体的判断，所以宁可漏认：
-/// 漏了不过是维持今天的行为（造一个 concept 实体），认错了却是把一个
-/// 真实体降成一段文本，图里少一个节点。
+/// **Numbers and dates only.** This judgement can eat real entities, so it prefers to miss:
+/// a miss merely keeps today's behaviour (creating a concept entity), while getting it wrong
+/// demotes a real entity to a piece of text and the graph loses a node.
 ///
-/// "2015"、"2023-03"、"6" 认；"杭州"、"首席技术官"、"3M"、"V3" 不认。
-/// 调用方还额外要求模型**没有**把它声明成实体——两道门一起过才算数。
+/// Yes for "2015", "2023-03", "6"; no for "杭州" (a city name), "首席技术官" ("CTO"), "3M",
+/// "V3". The caller additionally requires that the model did **not** declare it as an entity --
+/// it only counts when both gates are passed.
 fn looks_literal(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
         return false;
     }
-    // 纯数字（含小数与正负号）。用 f64 解而不是自己扫字符：
-    // "3M"、"V3"、"２０１５"（全角）都会失败，正是想要的
+    // All digits (decimals and a sign included). Parsed with f64 rather than scanning the
+    // characters by hand: "3M", "V3" and "２０１５" (full-width) all fail, which is exactly
+    // what we want
     if s.parse::<f64>().is_ok() {
         return true;
     }
-    // 日期：复用抽取侧那个解析器，它认 2015 / 2015-03 / 2015-03-01 等
+    // Dates: reuse the parser on the extraction side, which accepts 2015 / 2015-03 /
+    // 2015-03-01 and so on
     utopia_extract::parse_time(s).is_some()
 }
 
-/// 提示词里那三段清单：类、关系、属性。
+/// The three listings in the prompt: classes, relations, attributes.
 ///
-/// **抽出来是为了让"全给"和"按分块检索"共用同一段排版逻辑。**两条路各排一份
-/// 的话迟早分叉，而分叉在这里的后果是提示词说的与代码认的不是一回事。
+/// **Factored out so that "give everything" and "retrieve per chunk" share one and the same
+/// layout logic.** Let each path lay out its own copy and they drift apart sooner or later, and
+/// drifting here means the prompt says one thing while the code accepts another.
 struct PromptLists {
     types: Vec<(String, String, String)>,
     relations: Vec<utopia_extract::PromptRelation>,
@@ -1315,8 +1459,9 @@ struct PromptLists {
 }
 
 impl PromptLists {
-    /// 这三段铺进提示词有多长。budget 判据用它——**量的是实际要排的那段字**，
-    /// 不是另写一个估算公式（公式会跟排版分叉）。
+    /// How long these three listings are once laid into the prompt. The budget criterion uses
+    /// it -- **it measures the actual text that will be laid out**, not a separate estimation
+    /// formula (a formula would drift from the layout).
     fn chars(&self) -> usize {
         self.types
             .iter()
@@ -1331,16 +1476,20 @@ impl PromptLists {
     }
 }
 
-/// 从一个**选择集**排出三段清单。`None` = 全给（本体小于预算时的老路）。
+/// Lay out the three listings from a **selection set**. `None` = give everything (the old path
+/// for when the ontology is smaller than the budget).
 ///
-/// 三处细节都是选择带来的，全给时它们不会触发：
+/// All three details below come from selecting; with everything given they never trigger:
 ///
-/// 1. **签名只能提到选中的类**。`works_at (person → organization)` 里那两个 key
-///    必须是模型看得见的——写一个没铺出去的类名，等于教它输出一个不存在的类型。
-///    整侧都没选中就退回 `*`。
-/// 2. **属性跟着 domain 走**。属性行是 `class.attr`，它的类没铺出去这行就没意义。
-///    这也顺带解决了属性段（占提示词 28%）的裁剪，不用单独处理。
-/// 3. **内置类恒在**。检索漏掉的分块仍然要有地方落脚，否则模型无类可选。
+/// 1. **A signature may only mention selected classes**. The two keys in
+///    `works_at (person → organization)` have to be ones the model can see -- writing a class
+///    name that was not laid out teaches it to output a type that does not exist.
+///    If a whole side went unselected it falls back to `*`.
+/// 2. **Attributes follow their domain**. An attribute line is `class.attr`, and the line is
+///    meaningless if its class was not laid out. That also takes care of trimming the
+///    attribute section (28% of the prompt) as a side effect, with no separate handling.
+/// 3. **Builtin classes are always present**. A chunk that retrieval misses still needs
+///    somewhere to land, otherwise the model has no class to pick.
 fn build_lists(
     etypes: &[utopia_core::models::EntityType],
     rtypes: &[utopia_core::models::RelationType],
@@ -1361,7 +1510,8 @@ fn build_lists(
         .map(|t| (t.key.clone(), t.label.clone(), t.description.clone()))
         .collect();
 
-    // 一侧的类一个都没铺出去就写 `*`：签名是导向，指向看不见的类只会误导
+    // If not one class on a side was laid out, write `*`: a signature is guidance, and
+    // pointing at classes that cannot be seen only misleads
     let sig_of = |ids: &[Uuid]| -> String {
         let mut keys: Vec<&str> = ids
             .iter()
@@ -1419,15 +1569,17 @@ fn build_lists(
     }
 }
 
-/// 每块检索多少个类 / 关系 / 属性。**待测**——跟预算一样，定它们要那条曲线。
+/// How many classes / relations / attributes are retrieved per chunk. **To be measured** --
+/// just like the budget, settling them takes that curve.
 const PER_CHUNK_CLASSES: i64 = 40;
 const PER_CHUNK_RELATIONS: i64 = 30;
 const PER_CHUNK_ATTRIBUTES: i64 = 30;
 
-/// 按这一块的向量检索候选，排出这一块专用的三段清单。
+/// Retrieve candidates by this chunk's vector and lay out the three listings specific to it.
 ///
-/// 检索失败返回 `Ok(None)` 而不是错误：调用方会退回全量。提示词大是慢，
-/// 没有类可选是抽不出东西——两者之间选前者。
+/// A failed retrieval returns `Ok(None)` rather than an error: the caller falls back to the
+/// full listing. A big prompt is slow, having no class to pick means nothing gets extracted --
+/// between the two, take the former.
 async fn chunk_lists(
     state: &AppState,
     kb_id: Uuid,
@@ -1446,33 +1598,39 @@ async fn chunk_lists(
         )
         .await?,
     );
-    // **命中什么，就把它的祖先一起铺出去。**
+    // **Whatever gets hit, lay out its ancestors along with it.**
     //
-    // 向量检索天然偏爱字面出现在正文里的叶子类。实测一个讲 Sutskever 的分块，
-    // 976 个类按距离排：`researcher` 第 4、`corporation` 第 27，
-    // 而 `organization` 第 177、`person` 第 359——**前 40 名里一个泛化基类都没有**。
-    // 正文写的是 "a researcher at"、"the corporation"，从不写 "person"。
+    // Vector retrieval naturally favours the leaf classes that appear literally in the text.
+    // Measured on a chunk about Sutskever, ranking 976 classes by distance: `researcher` came
+    // 4th and `corporation` 27th, while `organization` came 177th and `person` 359th -- **not
+    // one generalising base class in the top 40**. The text writes "a researcher at" and "the
+    // corporation", it never writes "person".
     //
-    // 两个症状，同一个根因：
+    // Two symptoms, one and the same root cause:
     //
-    // - 实体判成 `researcher`（schema.org 里它是 `Audience` 的子类，不是人），
-    //   于是 `works_for (domain=person)` 全成了违规
-    // - `employee (organization → person)` 的签名**退化成 `(* → *)`**——`sig_of`
-    //   只认铺出去的类，一侧没铺就写 `*`。模型根本没见过那个方向约束
+    // - the entity is judged `researcher` (in schema.org that is a subclass of `Audience`, not
+    //   a person), so every `works_for (domain=person)` turns into a violation
+    // - the signature of `employee (organization → person)` **degrades to `(* → *)`** --
+    //   `sig_of` only accepts classes that were laid out and writes `*` when a side was not.
+    //   The model never saw that direction constraint at all
     //
-    // 从前这道地板由 `seed_classes`（`builtin` 的类）兜着，`build_lists` 的注释写着
-    // 「内置类恒在：检索漏掉的分块仍然要有地方落脚」。种子退场后（#128）判据就悬空了——
-    // 它当初碰巧等价，只因为种子类正好是那几个通用类。
+    // This floor used to be held up by `seed_classes` (the `builtin` classes), and the comment
+    // in `build_lists` read "builtin classes are always present: a chunk that retrieval misses
+    // still needs somewhere to land". Once the seeds retired (#128) the criterion was left
+    // dangling -- it had only happened to be equivalent because the seed classes were exactly
+    // those few generic ones.
     //
-    // 用祖先补这道地板，比维护一张"通用类"清单好：**继承链本来就是本体自己声明的
-    // 泛化关系**，谁是谁的上位不需要我们再判断一次。代价是每块多铺几层祖先。
+    // Filling that floor with ancestors beats maintaining a list of "generic classes": **the
+    // inheritance chain is the generalisation the ontology declares itself**, and which class
+    // sits above which needs no second judgement from us. The price is a few extra ancestor
+    // levels laid out per chunk.
     if !classes.is_empty() {
         let picked: Vec<Uuid> = classes.iter().copied().collect();
         classes.extend(utopia_store::ontology::ancestors_of(&state.pool, &picked).await?);
     }
     let mut rels: HashSet<Uuid> = HashSet::new();
-    // 关系与属性分开检索：两段在提示词里是分开的，混在一起取会让其中一段
-    // 被另一段挤空
+    // Relations and attributes are retrieved separately: the two sections are separate in the
+    // prompt, and fetching them together lets one section squeeze the other out to nothing
     rels.extend(
         utopia_store::ontology::nearest_relation_type_ids(
             &state.pool,
@@ -1493,22 +1651,29 @@ async fn chunk_lists(
         )
         .await?,
     );
-    // **一个关系被铺出去，它签名点名的类就得跟着铺。**
+    // **Once a relation is laid out, the classes its signature names have to be laid out too.**
     //
-    // 类与关系是各自独立检索的，而签名依赖两者的交集——`sig_of` 只认铺出去的类，
-    // 一侧没铺就写 `*`。于是常出现这种局面：`employee` 跟正文语义相近被捞了进来，
-    // 而它的 `organization`（第 795 名）与 `person`（第 630 名）离正文字面很远，
-    // 一个都没捞到，签名退化成 `(* → *)`——**方向约束整个消失**，模型按英语直觉
-    // 写 `Musk --employee--> Microsoft`，而 schema.org 声明的是 organization → person。
+    // Classes and relations are retrieved independently, while a signature depends on the
+    // intersection of the two -- `sig_of` only accepts classes that were laid out and writes
+    // `*` when a side was not. So this situation comes up often: `employee` is semantically
+    // close to the text and gets fished in, while its `organization` (ranked 795th) and
+    // `person` (630th) are literally far from the text and neither gets fished in at all, so
+    // the signature degrades to `(* → *)` -- **the direction constraint disappears entirely**,
+    // and the model writes `Musk --employee--> Microsoft` on English intuition while
+    // schema.org declares organization → person.
     //
-    // 上面那道祖先地板治不了这种块：它从"命中的叶子"往上长，而这里一个相关的
-    // 叶子都没命中，没有叶子也就没有祖先。
+    // The ancestor floor above cannot cure this kind of chunk: it grows upward from "the leaves
+    // that were hit", and here not one relevant leaf was hit, and with no leaf there is no
+    // ancestor either.
     //
-    // `sig_of` 的注释说「签名指向看不见的类只会误导」——顾虑是对的，但抹掉签名
-    // 是拿丢失方向来换。**把类拉进来**两头都保住：模型看得见那个类，签名也排得出。
-    // 顺带还对：这些类正是模型马上要用来判类型的那些，`employee` 在场就说明
-    // 这一块讲的是雇佣，`organization`/`person` 本来就该在候选里——
-    // 按字面相似度捞不到它们，但**本体的结构知道**。
+    // The comment on `sig_of` says "a signature pointing at classes that cannot be seen only
+    // misleads" -- the worry is right, but erasing the signature pays for it by losing the
+    // direction. **Pulling the classes in** saves both ends: the model can see the class, and
+    // the signature can still be laid out. It is incidentally right too: these classes are
+    // exactly the ones the model is about to use to judge types, `employee` being present means
+    // this chunk is about employment, and `organization`/`person` belonged in the candidates
+    // all along -- literal similarity cannot fish them out, but **the ontology's structure
+    // knows**.
     let sig_classes: HashSet<Uuid> = rtypes
         .iter()
         .filter(|r| rels.contains(&r.id))
@@ -1516,7 +1681,8 @@ async fn chunk_lists(
         .collect();
     classes.extend(sig_classes);
 
-    // 一个候选都没检索到 = 索引还没建好，退回全量而不是给一份空清单
+    // Not a single candidate retrieved = the index is not built yet, so fall back to the full
+    // listing rather than handing over an empty one
     if classes.len() <= seed_classes.len() && rels.is_empty() {
         return Ok(None);
     }
@@ -1532,7 +1698,8 @@ async fn chunk_lists(
 mod name_tests {
     use super::is_entity_name;
 
-    /// 样本全部取自实跑出来的库（ai-timeline-ends × schema.org），不是编的。
+    /// Every sample is taken from a kb that was really extracted (ai-timeline-ends ×
+    /// schema.org), not made up.
     #[test]
     fn a_clause_is_not_a_thing() {
         for s in [
@@ -1542,12 +1709,13 @@ mod name_tests {
             "a risk of developing cancer at four times the national average in 2013",
             "745 of OpenAI's 770 employees",
         ] {
-            assert!(!is_entity_name(s), "这是一句话，不该当成实体名：{s}");
+            assert!(!is_entity_name(s), "this is a sentence, not an entity name: {s}");
         }
     }
 
-    /// **真实体会长，但不带谓语。** 判据是词数 + 限定动词，不是字符数——
-    /// 下面第一个 57 字符，比上面那条 65 字符的从句还短不了多少
+    /// **Real entities get long, but carry no predicate.** The criterion is word count plus
+    /// finite verbs, not character count -- the first one below is 57 characters, barely
+    /// shorter than that 65-character clause above
     #[test]
     fn a_long_name_is_still_a_name() {
         for s in [
@@ -1558,18 +1726,22 @@ mod name_tests {
             "École Polytechnique",
             "GPT-4",
         ] {
-            assert!(is_entity_name(s), "这是真实体，不该被挡：{s}");
+            assert!(
+                is_entity_name(s),
+                "this is a real entity, it must not be blocked: {s}"
+            );
         }
     }
 
-    /// 分词在名词短语里完全正常，列进标志词会误伤。
+    /// Participles are perfectly normal inside a noun phrase; listing them as markers would
+    /// hit real entities.
     #[test]
     fn a_participle_is_not_a_predicate() {
         assert!(is_entity_name("equipment used by volunteers"));
         assert!(is_entity_name("Gas-Burning Turbines"));
     }
 
-    /// 短名字不做从句判断：`Is` 之类可能是专名的一部分。
+    /// Short names are not clause-checked: things like `Is` may be part of a proper name.
     #[test]
     fn a_short_name_is_never_a_clause() {
         assert!(is_entity_name("Was"));
@@ -1589,11 +1761,12 @@ mod tests {
 
     #[test]
     fn only_numbers_and_dates_count_as_literals() {
-        // 认：这些出现在宾语位上时是值，不是实体
+        // Yes: in the object position these are values, not entities
         for yes in ["2015", "2023-03", "2024-01-15", "1200", "62.5", "-3"] {
-            assert!(looks_literal(yes), "{yes} 该认成字面值");
+            assert!(looks_literal(yes), "{yes} should be taken as a literal");
         }
-        // 不认：判错的代价是把一个真实体降成一段文本，所以宁可漏
+        // No: the cost of getting it wrong is demoting a real entity to a piece of text,
+        // so prefer to miss
         for no in [
             "杭州",
             "首席技术官",
@@ -1602,39 +1775,56 @@ mod tests {
             "深蓝存储",
             "",
             "   ",
-            "２０１５", // 全角数字：不是我们要处理的形态，交给实体路径
+            "２０１５", // full-width digits: not the form we handle, left to the entity path
         ] {
-            assert!(!looks_literal(no), "{no} 不该认成字面值");
+            assert!(!looks_literal(no), "{no} must not be taken as a literal");
         }
     }
 
-    /// 这条判据存在的理由：一次网络抖动让六篇文档 60 块里只抽成 12 块，
-    /// 六篇**全部显示"抽取完成"**，八成的内容没进图，界面上没有任何东西说出来。
+    /// Why this criterion exists: one network hiccup left only 12 of 60 chunks across six
+    /// documents extracted, all six **showed "extraction complete"**, eighty percent of the
+    /// content never made it into the graph, and nothing in the UI said so.
     #[test]
     fn a_document_with_a_skipped_chunk_is_not_complete() {
-        assert_eq!(incomplete_reason(&[], 23), None, "全抽完才算完成");
-        let one = [(7, "调用失败：timeout".to_string())];
-        let msg = incomplete_reason(&one, 23).expect("有块没抽成就不该算完成");
-        assert!(msg.contains("23"), "分母要说出来：{msg}");
-        assert!(msg.contains("#7"), "得指得出是哪一块：{msg}");
+        assert_eq!(
+            incomplete_reason(&[], 23),
+            None,
+            "only every chunk done counts as complete"
+        );
+        let one = [(7, "call failed: timeout".to_string())];
+        let msg = incomplete_reason(&one, 23).expect("a failed chunk must not count as complete");
+        assert!(
+            msg.contains("23"),
+            "the denominator has to be said out loud: {msg}"
+        );
+        assert!(msg.contains("#7"), "it has to point out which chunk: {msg}");
     }
 
-    /// 原因往往是同一个（供应商不通就是所有块都不通），举三个够了，
-    /// 但**剩下多少必须说**——否则读的人会以为只坏了三块。
+    /// The reason is usually the same one (if the vendor is down then every chunk is down), so
+    /// three examples are enough, but **how many are left has to be said** -- otherwise the
+    /// reader thinks only three chunks broke.
     #[test]
     fn many_failures_are_summarised_without_hiding_the_count() {
-        let many: Vec<(i32, String)> = (1..=20).map(|i| (i, "调用失败".into())).collect();
+        let many: Vec<(i32, String)> = (1..=20).map(|i| (i, "call failed".into())).collect();
         let msg = incomplete_reason(&many, 60).unwrap();
-        assert!(msg.contains("20"), "总数要在：{msg}");
-        assert!(msg.contains("另有 17 个"), "省略掉的数量要说出来：{msg}");
-        assert_eq!(msg.matches("调用失败").count(), 3, "只举三个");
+        assert!(msg.contains("20"), "the total has to be in there: {msg}");
+        assert!(
+            msg.contains("17 more"),
+            "the omitted count has to be said out loud: {msg}"
+        );
+        assert_eq!(
+            msg.matches("call failed").count(),
+            3,
+            "only three are listed"
+        );
     }
 
-    /// 重试时 `chunks_for_extraction` 只取还没抽的块，所以分母是**本轮**的数，
-    /// 不是文档总块数。措辞里说清楚，别让人以为文档只有这么几块。
+    /// On a retry `chunks_for_extraction` only picks up the chunks not yet extracted, so the
+    /// denominator is **this round's** count, not the document's total. The wording says so
+    /// plainly, so nobody comes away thinking the document only has this many chunks.
     #[test]
     fn the_denominator_is_this_rounds_chunks_not_the_document() {
         let msg = incomplete_reason(&[(2, "x".into())], 3).unwrap();
-        assert!(msg.starts_with("本轮 3 个分块"), "{msg}");
+        assert!(msg.starts_with("1 of this round's 3 chunks"), "{msg}");
     }
 }

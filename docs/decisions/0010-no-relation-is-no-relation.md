@@ -20,7 +20,7 @@ ontology page beside `acquired` and `works_at`, as though someone had decided th
 between the two things is called "related". Nobody had.
 
 The cost was measured before deleting it: in one 348-chunk KB, 533 facts hung on it and
-every one displayed as 有关联, while every one also carried the source's wording in
+every one displayed as "related", while every one also carried the source's wording in
 `fact_evidence.proposed_predicate`. The meaning was in the database all along, covered by a
 fake vocabulary word.
 

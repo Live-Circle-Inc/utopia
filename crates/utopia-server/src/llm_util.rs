@@ -1,4 +1,4 @@
-//! 从工作区设置构造 LLM 客户端，以及按模型的并发闸门。
+//! Building LLM clients from the workspace settings, plus the per-model concurrency gates.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,9 +31,11 @@ pub fn embed_client(s: &LlmSettings) -> Option<LlmClient> {
     ))
 }
 
-/// 按模型的信号量注册表。限额变了就换一把新的——旧的在飞许可自然跑完，
-/// 换的瞬间可能短暂超出新限额，可接受；换来的是"改完即时生效"而不必做
-/// 缓存失效，也不必和 tokio Semaphore 不能缩容的限制搏斗。
+/// A registry of per-model semaphores. When the limit changes we swap in a fresh one -- the
+/// in-flight permits on the old one run themselves out, and for the instant of the swap we
+/// may briefly exceed the new limit, which is acceptable; what it buys us is "an edit takes
+/// effect immediately" with no cache invalidation to write, and no wrestling with the fact
+/// that a tokio Semaphore cannot be shrunk.
 #[derive(Default)]
 pub struct ModelGates {
     inner: std::sync::Mutex<HashMap<String, (usize, Arc<Semaphore>)>>,
@@ -53,14 +55,17 @@ impl ModelGates {
     }
 }
 
-/// 后台任务调模型前取一张许可，持有到调用结束。
+/// A background job takes one permit before calling a model and holds it until the call is
+/// done.
 ///
-/// **只给后台任务用**（抽取、裁决、摄入嵌入、本体建议）。用户的对话与检索
-/// 不走这里——让人打字等在十个后台抽取后面，产品就成了坏的；真正会打爆
-/// 供应商速率限制的也从来不是一个人在打字。
+/// **For background jobs only** (extraction, adjudication, ingest embedding, ontology
+/// suggestions). User chat and search do not come through here -- making someone who is
+/// typing wait behind ten background extractions is what makes a product bad; and the thing
+/// that actually blows through a provider's rate limit was never one person typing.
 ///
-/// 限额读不到（表还没建、库暂时不可达）时**放行**：并发限制是保护措施，
-/// 不该因为读不到配置而把整条流水线卡死。
+/// When the limit cannot be read (table not created yet, database briefly unreachable) we
+/// **let it through**: the concurrency limit is a safeguard, and it has no business wedging
+/// the entire pipeline just because its configuration could not be read.
 pub async fn acquire(
     state: &AppState,
     base_url: &str,
@@ -78,13 +83,14 @@ pub async fn acquire(
         .ok()
 }
 
-/// `acquire` 的便捷形式：直接从工作区设置取 chat 模型的身份。
+/// A convenience form of `acquire`: takes the chat model's identity straight from the
+/// workspace settings.
 pub async fn acquire_chat(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.chat_base_url.as_deref()?, s.chat_model.as_deref()?);
     acquire(state, base, model).await
 }
 
-/// `acquire` 的便捷形式：embedding 模型。
+/// A convenience form of `acquire`: the embedding model.
 pub async fn acquire_embed(state: &AppState, s: &LlmSettings) -> Option<OwnedSemaphorePermit> {
     let (base, model) = (s.embed_base_url.as_deref()?, s.embed_model.as_deref()?);
     acquire(state, base, model).await

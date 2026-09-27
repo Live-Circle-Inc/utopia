@@ -1,45 +1,52 @@
-//! Notion 来源：把 integration 能看见的页面同步进来。
+//! The Notion source: sync in the pages the integration can see.
 //!
-//! 按 [0013](../../docs/decisions/0013-a-source-should-hand-over-its-history.md)
-//! 的四条判据，它比对象存储强一档：
+//! Against the four criteria of
+//! [0013](../../docs/decisions/0013-a-source-should-hand-over-its-history.md) it is a tier
+//! above object storage:
 //!
-//! | 判据 | Notion |
+//! | Criterion | Notion |
 //! |---|---|
-//! | 真实时间戳 | `last_edited_time`，**是文档自己的编辑时刻**，不是我们抓它的时刻 |
-//! | 会不会自我推翻 | 页面被反复改写正是它的常态 |
-//! | 稳定身份 | 页面 UUID，改标题、挪位置都不变 |
-//! | 企业知识住不住在那儿 | 制度、会议纪要、决策记录——正是这套系统要的东西 |
+//! | Real timestamps | `last_edited_time`, **the doc's own edit moment**, not when we grabbed it |
+//! | Does it overturn itself | pages being rewritten over and over is precisely its normal state |
+//! | Stable identity | the page UUID; retitling and moving both leave it alone |
+//! | Does enterprise knowledge live there | policies, minutes, decision records -- just what this system wants |
 //!
-//! **但它只交出现状，不交出历史。** Notion 的版本历史不在公开 API 里，
-//! 所以跟工单系统不同：一次同步只能看见此刻，之前的编辑全靠一次次同步慢慢攒。
-//! 这跟 `url` / `rss` 是同一个形状，而工单那两个能一次把变更史拿全。
+//! **But it hands over only the present state, not the history.** Notion's version history is
+//! not in the public API, so unlike the issue trackers: one sync can only see this instant,
+//! and the edits before it are accumulated slowly, one sync at a time. This is the same shape
+//! as `url` / `rss`, whereas those two issue trackers can fetch the whole change history in
+//! one go.
 //!
-//! ## 两个容易踩的
+//! ## Two easy things to trip on
 //!
-//! **`Notion-Version` 头是必填的**，而且值是日期。少了它接口直接 400，
-//! 而错误信息只说 "missing version"，不会告诉你该填哪个。
+//! **The `Notion-Version` header is mandatory**, and its value is a date. Without it the
+//! endpoint just 400s, and the error message only says "missing version" -- it will not tell
+//! you which one to fill in.
 //!
-//! **限流是每秒三次**（官方说法是「平均三次」）。所以取页面内容时是顺序而不是
-//! 并发——并发上去只会换来一串 429，而我们的重试退避是为抽取那条路设计的，
-//! 不该被摄入路径借用。
+//! **The rate limit is three per second** (the official wording is "three on average"). So
+//! page contents are fetched sequentially rather than concurrently -- going concurrent only
+//! buys a string of 429s, and our retry backoff was designed for the extraction path; the
+//! ingest path should not borrow it.
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 
-/// 请求头里的 API 版本。**写死而不是留给配置**：响应的形状跟着它变，
-/// 让用户填一个我们没适配过的版本，换来的是解析静默失配。
+/// The API version in the request header. **Hard-coded rather than left to configuration**:
+/// the shape of the response changes along with it, and letting a user fill in a version we
+/// have never adapted to buys silently mismatched parsing.
 const NOTION_VERSION: &str = "2026-03-11";
 
-/// 一次同步最多取多少页。理由同别的来源：摄入不可逆，而一个 workspace
-/// 可以有几万页。
+/// How many pages one sync fetches at most. Same reason as the other sources: ingestion is
+/// irreversible, and a workspace can hold tens of thousands of pages.
 const MAX_PAGES_PER_SYNC: usize = 500;
 
-/// 每页最多取多少个 block。再深的页面截断，比让一次同步卡在一页上好。
+/// How many blocks are fetched per page at most. Truncating a page deeper than that beats
+/// letting one sync get stuck on a single page.
 const MAX_BLOCKS_PER_PAGE: usize = 500;
 
-/// 一个待摄入的页面。
+/// A page waiting to be ingested.
 pub struct NotionPage {
-    /// `notion://{page_id}`——页面 UUID 是它最稳的身份
+    /// `notion://{page_id}` -- the page UUID is its most stable identity
     pub external_key: String,
     pub filename: String,
     pub text: String,
@@ -59,10 +66,10 @@ fn client(token: &str) -> anyhow::Result<reqwest::Client> {
         .build()?)
 }
 
-/// 取 integration 能看见的所有页面。
+/// Fetch every page the integration can see.
 ///
-/// **只搜页面，不搜 data source。** 后者是表格的容器，它自己没有正文；
-/// 表格里的每一行是一个页面，会在同一次搜索里出现。
+/// **Search pages only, not data sources.** The latter are containers for tables and have no
+/// body of their own; every row in a table is a page and turns up in the same search.
 pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<NotionPage>, bool)> {
     let http = client(token)?;
     let mut out = Vec::new();
@@ -88,16 +95,16 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             .await
             .context("notion search")?;
         let status = resp.status();
-        let v: serde_json::Value = resp.json().await.context("notion search 响应")?;
+        let v: serde_json::Value = resp.json().await.context("notion search response")?;
         if !status.is_success() {
             anyhow::bail!(
-                "notion search 回了 {status}: {}",
+                "notion search returned {status}: {}",
                 v["message"].as_str().unwrap_or("unknown")
             );
         }
 
         for p in v["results"].as_array().unwrap_or(&vec![]).clone() {
-            // 回收站里的和归档的都不要——它们在界面上已经不算数了
+            // Skip the trashed and the archived -- they no longer count in the UI
             if p["in_trash"].as_bool() == Some(true) || p["is_archived"].as_bool() == Some(true) {
                 continue;
             }
@@ -108,7 +115,7 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             let Some(id) = p["id"].as_str() else { continue };
             let title = page_title(&p);
             let text = page_text(&http, id).await.unwrap_or_else(|e| {
-                tracing::warn!(%id, error = %e, "页面正文取不回来，只留标题");
+                tracing::warn!(%id, error = %e, "cannot fetch page body, keeping only the title");
                 String::new()
             });
 
@@ -134,11 +141,12 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
     Ok((out, truncated))
 }
 
-/// 页面标题。
+/// The page title.
 ///
-/// **标题藏在 `properties` 里那个 `type == "title"` 的属性下，而它的名字不固定**：
-/// 数据库里的页面可能叫 `Name`、`名称`、`任务`，普通页面叫 `title`。
-/// 按名字找会在别人的 workspace 上找不到，所以按类型找。
+/// **The title hides under whichever property in `properties` has `type == "title"`, and its
+/// name is not fixed**: a page in a database may call it `Name`, `名称` or `任务`, while an
+/// ordinary page calls it `title`. Looking it up by name finds nothing on somebody else's
+/// workspace, so look it up by type.
 fn page_title(page: &serde_json::Value) -> String {
     let props = page["properties"].as_object();
     let t = props.and_then(|m| {
@@ -160,7 +168,7 @@ fn page_title(page: &serde_json::Value) -> String {
     }
 }
 
-/// 取一页的正文，逐层展开 block。
+/// Fetch one page's body, expanding the blocks layer by layer.
 async fn page_text(http: &reqwest::Client, page_id: &str) -> anyhow::Result<String> {
     let mut out = String::new();
     let mut n = 0usize;
@@ -173,7 +181,7 @@ async fn page_text(http: &reqwest::Client, page_id: &str) -> anyhow::Result<Stri
         }
         let resp = http.get(&url).send().await?;
         if !resp.status().is_success() {
-            anyhow::bail!("blocks 回了 {}", resp.status());
+            anyhow::bail!("blocks returned {}", resp.status());
         }
         let v: serde_json::Value = resp.json().await?;
 
@@ -198,11 +206,12 @@ async fn page_text(http: &reqwest::Client, page_id: &str) -> anyhow::Result<Stri
     Ok(out)
 }
 
-/// 把一个 block 渲染成一行文本。
+/// Render one block into a line of text.
 ///
-/// **认不出的类型返回它的纯文本而不是丢掉。** Notion 的 block 类型一直在加，
-/// 硬编码一张白名单意味着新类型静默消失；而所有带文字的 block 都把文字放在
-/// `{type}.rich_text` 下，这个形状很稳。
+/// **An unrecognised type returns its plain text instead of being thrown away.** Notion keeps
+/// adding block types, and hard-coding a whitelist means new types silently disappear;
+/// meanwhile every block that carries text puts that text under `{type}.rich_text`, and that
+/// shape is very stable.
 fn render_block(b: &serde_json::Value) -> Option<String> {
     let t = b["type"].as_str()?;
     let inner = &b[t];
@@ -223,16 +232,16 @@ fn render_block(b: &serde_json::Value) -> Option<String> {
             let lang = inner["language"].as_str().unwrap_or("");
             format!("```{lang}\n{text}\n```")
         }
-        // 分割线与图片没有 rich_text，但它们在正文里也没有信息量
+        // Dividers and images have no rich_text, and carry no information in the body either
         "divider" | "image" | "video" | "file" => return None,
-        // child_page 的标题在 `title` 而不是 rich_text
+        // A child_page's title lives in `title` rather than rich_text
         "child_page" => format!("- {}", inner["title"].as_str().unwrap_or("")),
         _ if text.trim().is_empty() => return None,
         _ => text,
     })
 }
 
-/// rich_text 数组拼成纯文本。
+/// Join a rich_text array into plain text.
 fn rich_text(v: &serde_json::Value) -> String {
     v.as_array()
         .map(|arr| {
@@ -243,7 +252,7 @@ fn rich_text(v: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// 标题变成能当文件名的东西。
+/// Turn a title into something that works as a filename.
 fn slug(title: &str) -> String {
     let s: String = title
         .chars()
@@ -261,9 +270,10 @@ fn slug(title: &str) -> String {
 mod tests {
     use super::*;
 
-    /// **标题属性的名字是任意的。** 数据库里的页面可能把它叫 `Name`、`名称`、
-    /// `任务`；按名字找会在别人的 workspace 上返回 untitled，而那看起来
-    /// 像是「页面没有标题」而不是「我们找错了地方」。
+    /// **The name of the title property is arbitrary.** A page in a database may call it
+    /// `Name`, `名称` or `任务`; looking it up by name returns untitled on somebody else's
+    /// workspace, and that looks like "the page has no title" rather than "we looked in the
+    /// wrong place".
     #[test]
     fn a_title_is_found_by_type_not_by_name() {
         for key in ["title", "Name", "名称", "任务"] {
@@ -273,11 +283,16 @@ mod tests {
                     "Status": { "type": "select", "select": { "name": "Done" } }
                 }
             });
-            assert_eq!(page_title(&page), "季度复盘", "属性名 {key} 时找不到标题");
+            assert_eq!(
+                page_title(&page),
+                "季度复盘",
+                "no title found for property name {key}"
+            );
         }
     }
 
-    /// 富文本是分段的——加粗、链接都会把一句话切开。拼不全就会丢字。
+    /// Rich text comes in segments -- bold and links both cut a sentence apart. Fail to join
+    /// it all back and characters go missing.
     #[test]
     fn rich_text_segments_join_back_into_one_line() {
         let v = serde_json::json!([
@@ -288,9 +303,9 @@ mod tests {
         assert_eq!(rich_text(&v), "把总部搬到深圳了");
     }
 
-    /// **认不出的 block 类型不能丢。** Notion 一直在加类型，而带文字的
-    /// block 都把文字放在 `{type}.rich_text` 下——按白名单渲染会让新类型
-    /// 静默消失。
+    /// **An unrecognised block type must not be dropped.** Notion keeps adding types, and
+    /// every block that carries text puts the text under `{type}.rich_text` -- rendering by
+    /// whitelist makes new types silently disappear.
     #[test]
     fn an_unknown_block_keeps_its_text() {
         let b = serde_json::json!({
@@ -300,14 +315,14 @@ mod tests {
         assert_eq!(render_block(&b).as_deref(), Some("还是有内容的"));
     }
 
-    /// 没有文字的装饰性 block 该消失，否则正文里全是空行。
+    /// A decorative block with no text should vanish, or the body is nothing but blank lines.
     #[test]
     fn a_divider_renders_to_nothing() {
         let b = serde_json::json!({ "type": "divider", "divider": {} });
         assert!(render_block(&b).is_none());
     }
 
-    /// 文件名不能带路径分隔符或换行。
+    /// A filename must not carry path separators or newlines.
     #[test]
     fn a_slug_is_safe_as_a_filename() {
         assert_eq!(slug("2026 Q3 / 复盘"), "2026-Q3---复盘");
@@ -315,24 +330,25 @@ mod tests {
         assert!(slug(&"x".repeat(200)).chars().count() <= 60);
     }
 
-    /// 真连一个 Notion workspace。**没有模拟器**——Notion 是闭源 SaaS，
-    /// 开源的替代品（AppFlowy、AFFiNE）不说这套 API。所以这条只有在
-    /// 有人给出真 token 时才跑，CI 上永远跳过。
+    /// Really connect to a Notion workspace. **There is no emulator** -- Notion is
+    /// closed-source SaaS, and the open-source alternatives (AppFlowy, AFFiNE) do not speak
+    /// this API. So this one only runs when somebody hands over a real token; on CI it always
+    /// skips.
     ///
     /// ```text
-    /// # 设置 → 我的连接 → 新建内部集成，然后把一个页面分享给它
+    /// # Settings → My connections → new internal integration, then share a page with it
     /// UTOPIA_NOTION_TEST_TOKEN=ntn_xxx cargo test -p utopia-server notion
     /// ```
     #[tokio::test]
     async fn it_reads_from_a_real_workspace() -> anyhow::Result<()> {
         let Ok(token) = std::env::var("UTOPIA_NOTION_TEST_TOKEN") else {
-            eprintln!("跳过：未设 UTOPIA_NOTION_TEST_TOKEN");
+            eprintln!("skipped: UTOPIA_NOTION_TEST_TOKEN is not set");
             return Ok(());
         };
         let (pages, _) = fetch(&token, None).await?;
         assert!(
             !pages.is_empty(),
-            "一页都没有——integration 可能没有被分享任何页面"
+            "not a single page -- the integration may not have been shared any pages"
         );
         let p = &pages[0];
         assert!(
@@ -340,10 +356,13 @@ mod tests {
             "{}",
             p.external_key
         );
-        assert!(p.text.starts_with("# "), "正文该以标题开头");
+        assert!(
+            p.text.starts_with("# "),
+            "the body should start with the title"
+        );
         assert!(
             p.last_edited.is_some(),
-            "last_edited_time 是 doc_time 的来源"
+            "last_edited_time is where doc_time comes from"
         );
         Ok(())
     }

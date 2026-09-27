@@ -11,8 +11,9 @@ pub async fn get(pool: &PgPool, workspace_id: Uuid) -> AppResult<Option<LlmSetti
     Ok(row)
 }
 
-/// 任取一个配了对话模型的工作区设置。给端点探针用：端点地址是部署共用的，
-/// 从哪个工作区的配置读到的都是同一个地方，而探针没有"当前工作区"这个上下文。
+/// Any one workspace's settings that have a chat model configured. For the endpoint probe: the
+/// endpoint address is shared by the whole deployment, so whichever workspace's config it is read
+/// from, it is the same place -- and the probe has no "current workspace" context.
 pub async fn any_with_chat(pool: &PgPool) -> AppResult<Option<LlmSettings>> {
     let row = sqlx::query_as(
         "SELECT * FROM llm_settings
@@ -24,7 +25,7 @@ pub async fn any_with_chat(pool: &PgPool) -> AppResult<Option<LlmSettings>> {
     Ok(row)
 }
 
-/// upsert；api_key 传 None 表示保留旧值（前端不回传密钥）。
+/// upsert; passing None for api_key keeps the old value (the frontend does not send keys back).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert(
     pool: &PgPool,

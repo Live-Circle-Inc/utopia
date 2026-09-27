@@ -1,8 +1,10 @@
-// 方形节点的四层渲染 program —— 与圆形 createNodeBorderProgram 完全同构：
-// 状态环(0.1) → 钢灰描边(0.07) → 深色壳(0.3) → 微彩核心(fill)。
-// 圆形用欧氏距离 length()，方形改用切比雪夫距离 max(|x|,|y|)，
-// 几何沿用 @sigma/node-square：6 顶点四边形、角点 ±45°/±135°、sqrt8 缩放
-//（等效半边长与圆形半径一致，hover/selected 状态环两种形状表现对齐）。
+// Four-layer render program for square nodes -- exactly isomorphic to the circular
+// createNodeBorderProgram: state ring (0.1) → steel-grey border (0.07) → dark shell (0.3) →
+// faintly coloured core (fill).
+// Circles use the Euclidean distance length(), squares switch to the Chebyshev distance
+// max(|x|,|y|), and the geometry follows @sigma/node-square: a 6-vertex quad, corners at
+// ±45°/±135°, sqrt8 scaling (the effective half-edge equals the circle's radius, so the
+// hover/selected state ring lines up across the two shapes).
 
 import { NodeProgram } from "sigma/rendering";
 import type { ProgramInfo } from "sigma/rendering";
@@ -45,14 +47,15 @@ const float sqrt_2 = sqrt(2.0);
 
 void main() {
   float size = a_size * u_correctionRatio / u_sizeRatio * sqrt_8;
-  // 屏幕上保持轴对齐（跟随相机旋转），切比雪夫度量用未旋转的本地坐标
+  // Stay axis-aligned on screen (follow the camera rotation); the Chebyshev metric uses the
+  // unrotated local coordinates
   float angle = a_angle + u_cameraAngle;
   vec2 diffVector = size * vec2(cos(angle), sin(angle));
   vec2 position = a_position + diffVector;
   gl_Position = vec4((u_matrix * vec3(position, 1)).xy, 0, 1);
 
   v_diffVector = size * vec2(cos(a_angle), sin(a_angle));
-  v_radius = size / sqrt_2; // 半边长，与圆形程序的半径等值
+  v_radius = size / sqrt_2; // half-edge, equal in value to the circular program's radius
 
   #ifdef PICKING_MODE
   v_color = a_id;
@@ -97,7 +100,7 @@ void main(void) {
   }
   #else
   float aaBorder = 2.0 * u_correctionRatio;
-  // 层厚比例与圆形配置一致：0.1 / 0.07 / 0.3 / 剩余为核心
+  // Layer thickness ratios match the circle config: 0.1 / 0.07 / 0.3 / the rest is the core
   float r0 = v_radius;
   float r1 = r0 - v_radius * 0.1;
   float r2 = r1 - v_radius * 0.07;

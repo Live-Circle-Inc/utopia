@@ -14,11 +14,12 @@
 
 ## The problem
 
-The extractor reads "《星球大战：零号连队》可在 GeForce NOW 上玩", the ontology has no "playable on", and
-the fact lands as `related_to`, which says nothing. On real corpora 40.5% of edges were like that, and
-every new KB began with ten seed relations nobody had chosen. The extraction side (0001 P3b) removed
-the escape hatch and kept the original phrasing on `fact_evidence.proposed_predicate`. This record is
-the other half: turning kept phrasings back into relations, with a person somewhere in the loop.
+The extractor reads "Star Wars: Zero Company is playable on GeForce NOW", the ontology has no
+"playable on", and the fact lands as `related_to`, which says nothing. On real corpora 40.5% of edges
+were like that, and every new KB began with ten seed relations nobody had chosen. The extraction side
+(0001 P3b) removed the escape hatch and kept the original phrasing on
+`fact_evidence.proposed_predicate`. This record is the other half: turning kept phrasings back into
+relations, with a person somewhere in the loop.
 
 That world is gone: an unmapped fact now has a null predicate and shows its phrasing through
 `fact_surface_predicate()`, and a new KB has no relations until a pack is installed. 0012 measured

@@ -1,21 +1,26 @@
-//! MCP 服务端（Streamable HTTP）。
+//! MCP server (Streamable HTTP).
 //!
-//! 一条路由：`POST /api/v1/kbs/{kb_id}/mcp`，收 JSON-RPC 2.0。
+//! One route: `POST /api/v1/kbs/{kb_id}/mcp`, which takes JSON-RPC 2.0.
 //!
-//! **传输选 Streamable HTTP 不选 stdio**，理由在 `docs/decisions/0014`：Utopia
-//! 本来就是个服务端，stdio 要么起一个子进程反过来连它、要么再开一个连接池；
-//! 而这是多人部署，五个人各连各的应该由同一个部署统一服务。
+//! **Streamable HTTP as the transport, not stdio**; the reasoning is in
+//! `docs/decisions/0014`: Utopia is already a server, so stdio would mean either
+//! spawning a child process that connects back to it, or standing up a second
+//! connection pool; and this is a multi-person deployment -- five people each
+//! connecting on their own should be served by the one deployment.
 //!
-//! **每个 POST 都重新认证一次。** 规范允许把一次握手的结果沿用整条连接，
-//! 而 0014 那条纪律说得很清楚：
+//! **Every POST authenticates again.** The spec allows carrying the result of a
+//! single handshake across the whole connection, and the discipline in 0014 says
+//! it very plainly:
 //!
-//! > 校验 scope 要在每个工具入口，不在握手。`revoked_at` 中途被写上时必须
-//! > 立刻生效。
+//! > Scope is checked at every tool entry point, not at the handshake. When
+//! > `revoked_at` gets written mid-flight it must take effect immediately.
 //!
-//! 这里做成无状态之后，那条性质是白得的——没有「连接」这个东西可以被信任。
+//! Once this is stateless that property comes for free -- there is no such thing
+//! as a "connection" here that could be trusted.
 //!
-//! **响应用 `application/json` 而不是 SSE。** 规范允许两者，而这些工具是
-//! 一问一答，没有服务端主动推的东西；SSE 是给通知用的，这一版不需要。
+//! **Responses use `application/json` rather than SSE.** The spec allows both, and
+//! these tools are one question, one answer, with nothing the server pushes on its
+//! own; SSE is for notifications, which this version does not need.
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
@@ -28,15 +33,17 @@ use super::tools::{self, ToolCtx, ToolSink};
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// 实现的协议版本。客户端报别的版本时照样按这个答——
-/// 规范要求服务端回自己支持的版本，由客户端决定接不接受
+/// The protocol version we implement. When a client announces a different one we
+/// still answer with this -- the spec requires the server to reply with the version
+/// it supports and leaves it to the client to decide whether to accept it
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// 这一版放出去的工具。**只读五个**（0014）：
+/// The tools exposed in this version. **Five read-only ones** (0014):
 ///
-/// `query_data` 对生产库跑 SQL，`remember` 往账本里写，两者各自还有没答完的
-/// 问题——外部 agent 写进来的事实挂什么证据、跑 SQL 的审计怎么记。先把身份
-/// 这条路走通。
+/// `query_data` runs SQL against the production database and `remember` writes into
+/// the ledger; each still has unanswered questions -- what evidence a fact written
+/// by an external agent hangs off, and how a SQL run gets audited. Get the identity
+/// path working first.
 const EXPOSED: [&str; 5] = [
     "search_chunks",
     "get_document",
@@ -44,18 +51,20 @@ const EXPOSED: [&str; 5] = [
     "find_entities",
     "changes",
 ];
-/// `entity_facts` 也在内，单列是因为上面那个数组要定长
+/// `entity_facts` is in there too; it sits on its own only because the array above
+/// has to have a fixed length
 const EXPOSED_EXTRA: &str = "entity_facts";
 
 fn is_exposed(name: &str) -> bool {
     EXPOSED.contains(&name) || name == EXPOSED_EXTRA
 }
 
-/// 认证 + 授权。**两道，不是一道。**
+/// Authentication + authorization. **Two gates, not one.**
 ///
-/// 令牌说「这是谁、这枚钥匙够到哪几个库」；`require_kb` 说「这个人在这个库里
-/// 是什么角色」。前者只收窄，后者才是权限——一枚 scope 全开的令牌落在一个
-/// viewer 手上，仍旧只是 viewer。
+/// The token says "who this is, and which KBs this key can reach"; `require_kb`
+/// says "what role this person has in this KB". The former only narrows, the latter
+/// is the actual permission -- a token with every scope open, landing in the hands
+/// of a viewer, is still nothing more than a viewer.
 async fn authorize(
     state: &AppState,
     headers: &HeaderMap,
@@ -73,28 +82,30 @@ async fn authorize(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(utopia_core::AppError::Unauthorized)?;
     let auth = utopia_store::tokens::authenticate(&state.pool, raw.trim()).await?;
-    // 令牌的范围：限定过库的，够不着别的
+    // The token's reach: one that was pinned to certain KBs cannot get to the others
     if !auth.covers(kb_id) {
         return Err(utopia_core::AppError::Forbidden);
     }
-    // 人：停用立即生效（find_user_by_id 会挡住）
+    // The person: deactivation takes effect immediately (find_user_by_id blocks it)
     let user = utopia_store::accounts::find_user_by_id(&state.pool, auth.user_id)
         .await?
         .ok_or(utopia_core::AppError::Unauthorized)?;
-    // 角色：和网页端走同一个守卫，一行没改
+    // The role: the same guard the web side goes through, not a line changed
     utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
     Ok((user, auth))
 }
 
-/// OpenAI 形状 → MCP 形状。
+/// OpenAI shape → MCP shape.
 ///
-/// **共用 `chat.rs` 那一份定义**，而不是在这里另写一套。名字与参数 schema 是
-/// 与 `tools.rs` 执行侧的契约，抄成两份迟早分叉——那正是上一步把工具抽出来
-/// 要避免的事。
+/// **Shares the one definition in `chat.rs`** instead of writing a second set here.
+/// The names and the parameter schema are the contract with the execution side in
+/// `tools.rs`, and copied into two places they will drift sooner or later -- which
+/// is exactly what pulling the tools out in the previous step was meant to avoid.
 ///
-/// 已知的瑕疵：描述是给应用内助手写的，`search_chunks` 那句还提着「可以引用
-/// 成 [n]」，而 MCP 客户端拿不到引用编号。共用一份的好处大过这句话的代价，
-/// 真要分开时再说。
+/// A known blemish: the descriptions were written for the in-app assistant, and the
+/// `search_chunks` one still mentions "can be cited as [n]", while an MCP client
+/// never gets citation numbers. Sharing one copy is worth more than that sentence
+/// costs; we can revisit it when they genuinely have to be split.
 fn to_mcp_tools(openai: &Value) -> Vec<Value> {
     openai
         .as_array()
@@ -123,8 +134,8 @@ fn ok(id: Option<Value>, result: Value) -> Json<Value> {
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-/// JSON-RPC 的错误不是 HTTP 的错误：**传输成功了，方法失败了**。
-/// 回 200 带 error 体，客户端才解析得动。
+/// A JSON-RPC error is not an HTTP error: **the transport succeeded, the method
+/// failed**. Answer 200 with an error body, or the client cannot parse it.
 fn rpc_err(id: Option<Value>, code: i64, message: &str) -> Json<Value> {
     Json(json!({
         "jsonrpc": "2.0", "id": id,
@@ -152,8 +163,9 @@ pub async fn handle(
                 "serverInfo": { "name": "utopia", "version": env!("CARGO_PKG_VERSION") },
             }),
         ),
-        // 通知没有 id，按规范不该回响应体；但 HTTP 这一侧总得回点什么，
-        // 回 202 语义更准，这里为了保持处理器签名统一回一个空结果
+        // A notification has no id, and per the spec should get no response body;
+        // but the HTTP side has to return something. A 202 would be semantically more
+        // accurate -- we return an empty result here to keep one handler signature
         "notifications/initialized" | "notifications/cancelled" => ok(None, json!({})),
         "ping" => ok(id, json!({})),
         "tools/list" => ok(
@@ -164,8 +176,9 @@ pub async fn handle(
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             if !is_exposed(name) {
-                // 未暴露的工具（query_data / remember）要说清是「这一版没放出来」，
-                // 而不是「没有这个工具」——前者客户端不会反复重试
+                // For a tool we do not expose (query_data / remember), say clearly that
+                // it is "not shipped in this version" rather than "no such tool" -- with
+                // the former the client will not keep retrying
                 return Ok(rpc_err(
                     id,
                     -32601,
@@ -173,9 +186,10 @@ pub async fn handle(
                 ));
             }
             let kb = utopia_store::kbs::get(&state.pool, kb_id).await?;
-            // 这一版只放只读工具，所以 mounted_sources 空、can_write 假：
-            // **就算令牌 scope 是 write 也不放开**——scope 是上限不是授权，
-            // 而这一版的上限由 EXPOSED 定
+            // This version exposes read-only tools only, so mounted_sources is empty
+            // and can_write is false: **not opened up even if the token scope is write**
+            // -- scope is a ceiling, not a grant, and this version's ceiling is set by
+            // EXPOSED
             let ctx = ToolCtx {
                 state: &state,
                 kb_id,

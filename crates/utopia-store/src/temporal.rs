@@ -1,11 +1,17 @@
-//! 时态引擎（S3）：functional 状态关系的矛盾检测与自动闭合。
+//! Temporal engine (S3): contradiction detection and automatic closing for functional state
+//! relations.
 //!
-//! 原则：
-//! - 纯规则判定，零 LLM——模糊性已在上游（消解归并实体、本体标 functional）消化
-//! - 闭合走"作废 + 改写"而非原地改：旧断言 invalidated_at 记下"何时被修正"，
-//!   修正行闭合区间并以 supersedes 链回旧行——"以当时的认知回放当时"得以成立
-//! - 闭合点只用世界时间（新事实的 valid_from），绝不用摄取时刻顶替
-//! - 拿不准（缺时间/同时开始/低置信）绝不硬闭合，进 fact_conflicts 由人裁决
+//! Principles:
+//! - Pure rule-based judgement, zero LLM -- the ambiguity has already been digested upstream
+//!   (resolution merges the entities, the ontology marks the relation functional)
+//! - Closing goes through "invalidate + rewrite" rather than editing in place: the old assertion
+//!   records "when it was corrected" in invalidated_at, while the correction row closes the
+//!   interval and chains back to the old row through supersedes -- which is what makes "replay
+//!   the past with the knowledge we had at the time" hold up
+//! - The closing point only ever uses world time (the new fact's valid_from), never the ingest
+//!   moment as a stand-in
+//! - When it cannot be sure (no time / same start / low confidence) it never forces a close; the
+//!   case goes to fact_conflicts for a human to rule on
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -13,40 +19,47 @@ use utopia_core::models::ConflictView;
 use utopia_core::AppResult;
 use uuid::Uuid;
 
-/// 低于此置信度的新事实不允许自动改写历史（进审）。
+/// A new fact below this confidence is not allowed to rewrite history automatically (it goes to
+/// review).
 const AUTO_CLOSE_MIN_CONFIDENCE: f32 = 0.75;
 
-/// 命中的开放期事实（不变量下至多一条，引擎上线前的历史脏数据可能多条）。
+/// The open-interval fact that was hit (at most one under the invariant; dirty historical data
+/// from before the engine shipped may give several).
 #[derive(Debug, sqlx::FromRow)]
 struct OpenFact {
     id: Uuid,
     valid_from: Option<DateTime<Utc>>,
-    /// 闭合别人的区间时要用它当那个时刻的粒度
+    /// Used as the granularity of that moment when closing somebody else's interval
     valid_from_precision: Option<String>,
 }
 
-/// 唯一性方向：functional = 主语侧（张三同时只 reports_to 一人）；
-/// inverse functional = 宾语侧（一个项目同时只有一个 leads 它的人）。
+/// Direction of uniqueness: functional = the subject side (Zhang San only reports_to one person
+/// at a time); inverse functional = the object side (a project only has one person who leads it
+/// at a time).
 #[derive(Debug, Clone, Copy)]
 pub enum Uniqueness {
     SubjectSide,
     ObjectSide,
 }
 
-/// 对账结果：自动闭合产生的修正行 id（调用方按需记账，如合并回滚要撤销它们）
-/// 与进入人审的冲突数。
+/// Reconciliation result: the ids of the correction rows that auto-closing produced (the caller
+/// books them as needed -- a merge rollback, for one, has to undo them) and the number of
+/// conflicts that went to human review.
 #[derive(Debug, Default)]
 pub struct ReconcileReport {
     pub corrected: Vec<Uuid>,
     pub conflicts: u32,
 }
 
-/// 一条新 state 事实落库后、沿指定唯一性方向的对账。调用方负责判断关系确实
-/// 带该方向的唯一性且 temporal = state（本体元数据在抽取任务里已加载）。
+/// Reconciliation along the given direction of uniqueness, once a new state fact has landed in
+/// the database. The caller is responsible for deciding that the relation really does carry
+/// uniqueness in that direction and that temporal = state (the ontology metadata is already
+/// loaded in the extraction job).
 ///
-/// 宾语可以是实体（object_id）或字面值（object_value，属性事实）——
-/// "宾语不同"的判定是 (object_id, object_value) 组合比较：工资从 3 万变 3.5 万
-/// 与"从张三换成李四"走同一条闭合路径。
+/// The object may be an entity (object_id) or a literal value (object_value, an attribute fact)
+/// -- the "the object differs" test compares the (object_id, object_value) pair as a whole: a
+/// salary going from 30k to 35k takes the same closing path as "switching from Zhang San to Li
+/// Si".
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_new_fact(
     pool: &PgPool,
@@ -60,16 +73,20 @@ pub async fn reconcile_new_fact(
     new_validity: crate::graph::Validity<'_>,
     new_confidence: f32,
 ) -> AppResult<ReconcileReport> {
-    // 已闭区间的新事实是历史陈述，不威胁"开放期唯一"不变量——不触发任何改写
-    // （闭区间之间的重叠矛盾是更细的区间代数，暂不自动裁，留给 Review 的人眼）
+    // A new fact whose interval is already closed is a historical statement and does not
+    // threaten the "unique during the open interval" invariant -- it triggers no rewrite at all
+    // (overlap contradictions between closed intervals are finer-grained interval algebra, not
+    // adjudicated automatically for now, left to human eyes in Review)
     if new_validity.has_ended() {
         return Ok(ReconcileReport::default());
     }
-    // 宾语侧唯一性只对实体宾语有意义（字面值不"被占用"）
+    // Object-side uniqueness only makes sense for entity objects (a literal value does not get
+    // "occupied")
     if matches!(direction, Uniqueness::ObjectSide) && object_id.is_none() {
         return Ok(ReconcileReport::default());
     }
-    // 不变量点查：主语侧 = 同 (kb, S, P) 宾语不同；宾语侧 = 同 (kb, P, O) 主语不同
+    // The invariant point lookup: subject side = same (kb, S, P) with a different object;
+    // object side = same (kb, P, O) with a different subject
     let sql = match direction {
         Uniqueness::SubjectSide => {
             "SELECT id, valid_from, valid_from_precision FROM facts
@@ -104,17 +121,19 @@ pub async fn reconcile_new_fact(
     let mut report = ReconcileReport::default();
     for old in open {
         match (old.valid_from, new_validity.from) {
-            // 新事实没有世界时间：闭合点无从谈起 → 人裁
+            // The new fact has no world time: there is no closing point to speak of → human
+            // ruling
             (_, None) => {
                 record_conflict(pool, kb_id, old.id, new_fact_id, "no_time").await?;
                 report.conflicts += 1;
             }
-            // 同一时刻开始：谁接替谁说不清 → 人裁
+            // Both start at the same moment: who succeeds whom cannot be told → human ruling
             (Some(of), Some(nf)) if of == nf => {
                 record_conflict(pool, kb_id, old.id, new_fact_id, "simultaneous").await?;
                 report.conflicts += 1;
             }
-            // 新事实开始得更早：它是历史前任，闭合在旧事实的开始
+            // The new fact starts earlier: it is the historical predecessor, closed at the
+            // start of the old fact
             (Some(of), Some(nf)) if nf < of => {
                 if new_confidence < AUTO_CLOSE_MIN_CONFIDENCE {
                     record_conflict(pool, kb_id, old.id, new_fact_id, "low_confidence").await?;
@@ -131,7 +150,8 @@ pub async fn reconcile_new_fact(
                     );
                 }
             }
-            // 常规接替：旧事实闭合在新事实的开始（旧事实无起点也适用——起点未知但已结束）
+            // The regular succession: the old fact closes at the new fact's start (this also
+            // applies when the old fact has no start -- start unknown but it has ended)
             (_, Some(nf)) => {
                 if new_confidence < AUTO_CLOSE_MIN_CONFIDENCE {
                     record_conflict(pool, kb_id, old.id, new_fact_id, "low_confidence").await?;
@@ -153,13 +173,16 @@ pub async fn reconcile_new_fact(
     Ok(report)
 }
 
-/// 实体合并搬移事实后的对账：换了主/宾的事实等价于"新落库的观察"——
-/// 两个对象折成一个之后，唯一性不变量才第一次看得到它们相撞。
-/// 按 recorded_at 顺序逐条重跑插入时对账；非唯一性关系、已闭合区间、
-/// 已被前一条改写作废的事实自动跳过。
-/// 返回的修正行 id 由调用方记入合并账本——这些修正的唯一成因是合并本身，
-/// 回滚合并时必须随之撤销（修正行作废、被取代的原行恢复），否则修正行会
-/// 错挂在 target 上而其依据已随回滚离开。
+/// Reconciliation after an entity merge has moved facts around: a fact whose subject/object was
+/// swapped is equivalent to "a newly recorded observation" -- only once two objects are folded
+/// into one does the uniqueness invariant get to see them collide for the first time.
+/// Re-runs the insert-time reconciliation fact by fact in recorded_at order; non-unique
+/// relations, already-closed intervals, and facts already invalidated by an earlier rewrite are
+/// skipped automatically.
+/// The caller books the returned correction row ids into the merge ledger -- the merge itself is
+/// the sole cause of these corrections, so rolling the merge back must undo them along with it
+/// (invalidate the correction rows, restore the original rows they replaced), or a correction row
+/// ends up wrongly hanging off target while the grounds for it left with the rollback.
 pub async fn reconcile_moved_facts(
     pool: &PgPool,
     kb_id: Uuid,
@@ -198,11 +221,13 @@ pub async fn reconcile_moved_facts(
 
     let mut report = ReconcileReport::default();
     for f in rows {
-        // 字面值事实（属性）合并后同样对账：两个"张三"折成一个，工资撞车也要闭合
+        // Literal-value facts (attributes) get reconciled after a merge too: fold two "Zhang
+        // San"s into one and a salary collision has to be closed as well
         if f.object_id.is_none() && f.object_value.is_none() {
             continue;
         }
-        // 前面的闭合可能已把本条改写作废——逐条复核存活性再当"新事实"用
+        // An earlier close may already have rewritten and invalidated this one -- re-check that
+        // each one is alive before using it as a "new fact"
         let (alive,): (bool,) = sqlx::query_as(
             "SELECT EXISTS (SELECT 1 FROM facts
                             WHERE id = $1 AND invalidated_at IS NULL AND valid_to IS NULL)",
@@ -241,8 +266,9 @@ pub async fn reconcile_moved_facts(
     Ok(report)
 }
 
-/// 作废 + 改写：旧行记 invalidated_at（认知轴），插入闭合区间的修正行
-/// （世界轴），证据引用随行复制。返回修正行 id。
+/// Invalidate + rewrite: the old row records invalidated_at (the record-time axis), a correction
+/// row with a closed interval is inserted (the world axis), and the evidence references are
+/// copied along with it. Returns the id of the correction row.
 pub async fn close_superseded(
     pool: &PgPool,
     fact_id: Uuid,
@@ -266,7 +292,7 @@ pub async fn close_superseded(
     .bind(valid_to_precision)
     .fetch_optional(&mut *tx)
     .await?;
-    // 已被并发修正过：不重复动手
+    // Already corrected concurrently: do not do it a second time
     if inserted.is_none() {
         tx.rollback().await?;
         return Ok(fact_id);
@@ -276,7 +302,8 @@ pub async fn close_superseded(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        // 表层谓词随证据一起搬：纠正的是时间区间，不是原文说了什么
+        // The surface predicate moves along with the evidence: what is being corrected is the
+        // time interval, not what the source said
         "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
          SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
          FROM fact_evidence WHERE fact_id = $2
@@ -312,9 +339,11 @@ async fn record_conflict(
     Ok(())
 }
 
-/// Review 页的冲突列表（双方事实带名字与区间）。
-/// 惰性清理：任一方已被作废（被驳回/被别的闭合改写）的冲突已无意义，
-/// 自动出队标 stale——防止在僵尸冲突上误裁（如把 Eve 闭合在已驳回的 Ivan 上）。
+/// The conflict list for the Review page (both facts with their names and intervals).
+/// Lazy cleanup: a conflict where either side has been invalidated (rejected, or rewritten by
+/// some other close) is meaningless, so it is dequeued automatically and marked stale -- which
+/// stops anyone mis-ruling on a zombie conflict (such as closing Eve against an already-rejected
+/// Ivan).
 pub async fn list_conflicts(
     pool: &PgPool,
     kb_id: Uuid,
@@ -359,8 +388,9 @@ pub async fn list_conflicts(
     Ok(rows)
 }
 
-/// 人工裁决：close（旧事实闭合于 close_at 或新事实起点）/ keep（并存不矛盾）/
-/// reject_new（新事实是抽取错误，作废）。
+/// Human ruling: close (the old fact closes at close_at or at the new fact's start) / keep (they
+/// coexist without contradiction) / reject_new (the new fact is an extraction error, invalidate
+/// it).
 pub async fn resolve_conflict(
     pool: &PgPool,
     kb_id: Uuid,
@@ -398,7 +428,8 @@ pub async fn resolve_conflict(
                 .bind(new_fact_id)
                 .execute(pool)
                 .await?;
-            // 波及：同一新事实撞出的其他 open 冲突一并出队（新事实已死，无从裁起）
+            // Knock-on effect: the other open conflicts this same new fact collided into are
+            // dequeued along with it (the new fact is dead, so there is nothing left to rule on)
             sqlx::query(
                 "UPDATE fact_conflicts
                  SET status = 'resolved', resolution = 'rejected_new', resolved_at = now()

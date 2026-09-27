@@ -1,5 +1,5 @@
-//! 摄入管道：parse → chunk → 全文索引 → embedding（可选）→ ready。
-//! 每步幂等：重跑会先清掉旧分块与旧索引条目。
+//! Ingest pipeline: parse → chunk → full-text index → embedding (optional) → ready.
+//! Every step is idempotent: a re-run clears out the old chunks and old index entries first.
 
 use crate::llm_util;
 use crate::state::AppState;
@@ -24,7 +24,7 @@ pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Re
 async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     let doc = utopia_store::documents::get(&state.pool, document_id).await?;
 
-    // 1. 解析（CPU 密集，放 blocking 线程）
+    // 1. Parse (CPU-heavy, so it goes on a blocking thread)
     utopia_store::documents::set_status(&state.pool, document_id, "parsing").await?;
     state.emit_document(doc.kb_id, document_id);
     let bytes = state.blob.get(&doc.sha256).await?;
@@ -33,14 +33,14 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
         tokio::task::spawn_blocking(move || utopia_ingest::parse(&filename, &bytes)).await??;
     let text_len = parsed.text.chars().count() as i32;
 
-    // 2. 分块 + 入库
+    // 2. Chunk + persist
     let pieces = utopia_ingest::chunk_text(&parsed.text);
     let chunk_pairs =
         utopia_store::documents::replace_chunks(&state.pool, doc.kb_id, document_id, &pieces)
             .await?;
     let chunk_count = chunk_pairs.len() as i32;
 
-    // 3. 全文索引（Tantivy）
+    // 3. Full-text index (Tantivy)
     utopia_store::documents::set_status(&state.pool, document_id, "indexing").await?;
     state.emit_document(doc.kb_id, document_id);
     let search = state.search.clone();
@@ -48,7 +48,8 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     let did = document_id.to_string();
     tokio::task::spawn_blocking(move || search.reindex_document(&kb, &did, &chunk_pairs)).await??;
 
-    // 4. embedding（工作区配置了 embedding 模型才做；没配也算 ready，先享受 BM25 搜索）
+    // 4. embedding (only done if the workspace has an embedding model configured; with none
+    //    configured it still counts as ready, so you get BM25 search in the meantime)
     let kb_row = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
     let settings = utopia_store::settings::get(&state.pool, kb_row.workspace_id).await?;
     if let Some(client) = settings.as_ref().and_then(llm_util::embed_client) {
@@ -64,7 +65,7 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
             };
             let embeddings = client.embed(&texts).await?;
             if embeddings.len() != batch.len() {
-                anyhow::bail!("Embedding 返回数量不匹配");
+                anyhow::bail!("Embedding returned a mismatched number of vectors");
             }
             let items: Vec<(Uuid, Vec<f32>)> =
                 batch.iter().map(|(id, _)| *id).zip(embeddings).collect();
@@ -74,7 +75,8 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
 
     utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
 
-    // 两段式：索引就绪后，若配置了对话模型则排队图谱抽取（不阻塞可搜可问）
+    // Two-phase: once the index is ready, queue graph extraction if a chat model is
+    // configured (it does not block being searchable and askable)
     if settings.as_ref().is_some_and(|s| s.chat_ready()) {
         utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
         utopia_store::jobs::enqueue(
@@ -86,15 +88,17 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     }
     state.emit_document(doc.kb_id, document_id);
 
-    tracing::info!(%document_id, chunks = chunk_count, "文档处理完成");
+    tracing::info!(%document_id, chunks = chunk_count, "document processing complete");
     Ok(())
 }
 
-/// 记忆摄入（episodes 快速路径的后半程）：新 episode chunk 补 embedding、
-/// 重建全文索引、触发增量抽取（extracted_at 为空的新 chunk 才会被抽）。
-/// 免解析免分块——episode 落库时已是 chunk。
+/// Memory ingest (the back half of the episodes fast path): fill in embeddings for the new
+/// episode chunks, rebuild the full-text index, and trigger incremental extraction (only new
+/// chunks whose extracted_at is null get extracted).
+/// No parsing, no chunking -- an episode is already a chunk by the time it is persisted.
 ///
-/// `proposed_by`：说这句话的人。一路传到抽取，落在 `pending_facts.proposed_by`（0015）
+/// `proposed_by`: the person who said the sentence. Carried all the way to extraction, where
+/// it lands in `pending_facts.proposed_by` (0015)
 pub async fn memory_ingest(
     state: &AppState,
     document_id: Uuid,
@@ -115,7 +119,7 @@ pub async fn memory_ingest(
             };
             let embeddings = client.embed(&texts).await?;
             if embeddings.len() != batch.len() {
-                anyhow::bail!("Embedding 返回数量不匹配");
+                anyhow::bail!("Embedding returned a mismatched number of vectors");
             }
             let items: Vec<(Uuid, Vec<f32>)> =
                 batch.iter().map(|(id, _)| *id).zip(embeddings).collect();

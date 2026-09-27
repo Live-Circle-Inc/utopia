@@ -12,7 +12,8 @@ pub async fn list(pool: &PgPool, workspace_id: Uuid) -> AppResult<Vec<KnowledgeB
     Ok(rows)
 }
 
-/// 用户可见的 KB：系统管理员全见；其余 = open 库 + 自己在矩阵里的 restricted 库。
+/// The KBs a user can see: a system admin sees all of them; for everyone else = the open KBs +
+/// the restricted KBs where they themselves appear in the matrix.
 pub async fn list_visible(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -43,10 +44,13 @@ pub async fn create(
     kind: &str,
     description: Option<&str>,
 ) -> AppResult<KnowledgeBase> {
-    // 部署的第一个库自动成为默认库：公共空间,永远 open、不可删（API 强制 + DB CHECK）
+    // The first KB in a deployment automatically becomes the default one: the common space,
+    // always open, undeletable (enforced by the API + a DB CHECK)
     //
-    // ontology_lang 取部署默认值：中文部署不该每建一个库就手动选一次。
-    // 之后按库可改——同一个部署里完全可能一个库读中文合同、另一个读英文论文
+    // ontology_lang takes the deployment default: a Chinese deployment should not have to pick
+    // it by hand every time a KB is created. It can be changed per KB afterwards -- within one
+    // deployment it is perfectly possible for one KB to read Chinese contracts and another to
+    // read English papers
     let kb = sqlx::query_as(
         "INSERT INTO knowledge_bases
              (id, workspace_id, name, kind, description, is_default, ontology_lang)
@@ -85,8 +89,10 @@ pub async fn update(
     materialize_inferences: Option<bool>,
     inference_interval_minutes: Option<i32>,
 ) -> AppResult<KnowledgeBase> {
-    // 改语言不回头重写已有的类——它们已经是这个库的数据，可能有人手工调过。
-    // 这一列往后管的是**新**描述（自动扩本体、AI 建议）写成什么语言
+    // Changing the language does not go back and rewrite the existing classes -- by now they
+    // are this KB's data, and someone may have hand-tuned them. From here on this column
+    // governs which language **new** descriptions (auto-extended ontology, AI suggestions) are
+    // written in
     if let Some(l) = ontology_lang {
         if !matches!(l, "en" | "zh") {
             return Err(AppError::invalid("bad_lang", "language must be en or zh"));
@@ -98,7 +104,8 @@ pub async fn update(
                 "visibility must be open or restricted".into(),
             ));
         }
-        // 默认库永远 open：公共空间语义可依赖（改名/改描述不受限）
+        // The default KB is always open: the common-space semantics can be relied on (renaming
+        // and re-describing are not restricted)
         if v == "restricted" {
             let current = get(pool, id).await?;
             if current.is_default {

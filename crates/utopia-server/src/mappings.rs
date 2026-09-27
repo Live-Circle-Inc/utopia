@@ -1,13 +1,17 @@
-//! 问数语义映射的 Agentic 探索：读挂载源的 schema + KB 既有概念，让 LLM 提议
-//! "业务概念（Metric/Dimension 实体）→ 数据资产定义" 的映射。
+//! Agentic exploration of the semantic mappings behind ask-your-data: read the schema of the
+//! mounted sources plus the KB's existing concepts, and let the LLM propose mappings of
+//! "business concept (Metric/Dimension entity) -> data asset definition".
 //!
-//! 提议写进 `concept_mappings`（status = proposed）→ Review 页自成一档，
-//! Confirm / Reject 之后 status 变 confirmed，问数只读确认过的那些。
+//! Proposals are written to `concept_mappings` (status = proposed) -> they form their own queue
+//! on the Review page, and after Confirm / Reject the status becomes confirmed; ask-your-data
+//! reads only the confirmed ones.
 //!
-//! **从前它是一条 0.6 置信的 `mapped_to` 事实**,借「低置信事实」那一档露面。
-//! 搬出来的理由见 0011:它不是关于世界的断言,是配置——而「确认」这个动作
-//! 当时是 `UPDATE facts SET confidence = 1.0`,原地改一张不许原地改的表。
-//! agent 只提议，口径生效权在人——与消解"宁分勿合"同一哲学。
+//! **It used to be a `mapped_to` fact with confidence 0.6**, showing up in the "low-confidence
+//! facts" queue. The reasoning for moving it out is in 0011: it is not an assertion about the
+//! world, it is configuration -- and back then "confirming" it meant
+//! `UPDATE facts SET confidence = 1.0`, an in-place edit of a table that must not be edited in
+//! place. The agent only proposes; the power to put a definition into effect stays with a human
+//! -- the same philosophy as resolution's "rather split than merge".
 
 use crate::llm_util;
 use crate::state::AppState;
@@ -15,10 +19,13 @@ use uuid::Uuid;
 
 const MAX_SCHEMA_CHARS: usize = 12_000;
 
-/// 探索把 schema 里的量与维度落成 Metric / Dimension 实体，而这两个类不在任何
-/// 内置本体包里——0009 之后建库不再自带类。没有它们，下面的 `type_id` 查不到，
-/// 每条提议都被 `continue` 吞掉，页面只说"已排队"就再无下文（#223）。
-/// 所以探索前把两个类补上：builtin，描述给抽取提示词，本体页可以改
+/// Exploration turns the quantities and dimensions in a schema into Metric / Dimension
+/// entities, and neither of those classes is in any built-in ontology pack -- since 0009 a new
+/// KB no longer ships with classes. Without them the `type_id` lookup below finds nothing,
+/// every proposal gets swallowed by `continue`, and the page says "queued" and then goes silent
+/// forever (#223).
+/// So the two classes are created before exploring: builtin, with descriptions for the
+/// extraction prompt, and editable on the ontology page
 async fn ensure_concept_types(pool: &sqlx::PgPool, kb_id: Uuid) -> anyhow::Result<()> {
     for (key, label, description) in [
         (
@@ -62,7 +69,8 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
     }
     ensure_concept_types(&state.pool, kb_id).await?;
 
-    // 各源 schema（引擎直读，保证新鲜；限量防 prompt 爆炸）
+    // Each source's schema (read straight from the engine so it is fresh; capped so the prompt
+    // cannot explode)
     let mut schema_txt = String::new();
     for ds in &sources {
         let (engine, conn) = utopia_store::datasources::engine_and_conn(&state.pool, ds.id).await?;
@@ -90,7 +98,7 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
         }
     }
 
-    // 既有概念（供归并复用，避免重复起名）
+    // Existing concepts (offered for reuse, so the same thing does not get a second name)
     let existing: Vec<(String,)> = sqlx::query_as(
         "SELECT e.canonical_name FROM entities e
          JOIN entity_types t ON t.id = e.type_id
@@ -160,7 +168,8 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
                 .await?;
         let Some((type_id,)) = type_id else { continue };
 
-        // 概念实体：走消解（同名归并；无向量上下文按 v1 兼容归并）
+        // Concept entities go through resolution (same name merges; with no vector context it
+        // merges the v1-compatible way)
         let resolved = utopia_store::resolution::resolve_mention(
             &state.pool,
             kb_id,
@@ -170,10 +179,11 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
         )
         .await?;
 
-        // 定义拆成列写进 concept_mappings（0011）。从前它是一份塞进
-        // `object_value` 的 JSON，宾语挂在一条叫 mapped_to 的关系上——
-        // 而那条关系是本体里的一行，跟 works_at 并列。**它不是关于世界的
-        // 断言，是配置**，所以搬去自己的表
+        // The definition is split into columns in `concept_mappings` (0011). It used to be a
+        // blob of JSON stuffed into `object_value`, with the object hanging off a relation
+        // called mapped_to -- and that relation was a row in the ontology, sitting next to
+        // works_at. **It is not an assertion about the world, it is configuration**, so it
+        // moved to a table of its own
         let def = &p["definition"];
         if !def.is_object() {
             continue;
@@ -193,7 +203,8 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
             s("expr").as_deref(),
             s("sql").as_deref(),
             s("unit").as_deref(),
-            // summary 是给人看的那句：Review 列表与问数 prompt 都靠它
+            // summary is the one line a human reads: both the Review list and the
+            // ask-your-data prompt lean on it
             p["summary"].as_str().or(def["summary"].as_str()),
             def["derived"].as_bool().unwrap_or(false),
         )
@@ -201,9 +212,10 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
         accepted += 1;
     }
 
-    tracing::info!(%kb_id, proposals = accepted, "映射探索完成，提议已入审核队列");
-    // 一条都没提出来时页面上什么都不会变——Pending 还是 0，而"已排队"那句
-    // 早就翻篇了。走告警中心说一声，人才知道该去刷新结构或给列加注释
+    tracing::info!(%kb_id, proposals = accepted, "mapping exploration complete, proposals queued for review");
+    // When not a single proposal comes out, nothing on the page changes -- Pending is still 0,
+    // and the "queued" message scrolled away long ago. Saying so through the alert centre is
+    // what tells a person to go refresh the schema or add comments to the columns
     if accepted == 0 {
         if let Err(e) = utopia_store::alerts::raise(
             &state.pool,
@@ -219,7 +231,7 @@ pub async fn explore_mappings(state: &AppState, kb_id: Uuid) -> anyhow::Result<(
         )
         .await
         {
-            tracing::warn!(%kb_id, error = %e, "映射探索空结果的告警没写进去");
+            tracing::warn!(%kb_id, error = %e, "failed to raise the empty-result alert for mapping exploration");
         }
         state.emit_alert();
     }

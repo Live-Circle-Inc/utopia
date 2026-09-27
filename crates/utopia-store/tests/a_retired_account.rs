@@ -1,11 +1,14 @@
-//! 停用账号的四条硬性质——打在真库上（见 `users.deactivated_at`）。
+//! Four hard properties of a deactivated account -- run against a real database (see
+//! `users.deactivated_at`).
 //!
-//! 软删除的风险全在「漏过滤一处」：只要有一条读 `users` 的路径忘了带
-//! `deactivated_at IS NULL`，停用就成了摆设，而且**不会有任何报错**。
-//! 所以这几条守的不是函数，是**路径**。
+//! All the risk of a soft delete is in "missing one filter": the moment a single path that
+//! reads `users` forgets to carry `deactivated_at IS NULL`, deactivation becomes a decoration,
+//! and **there will not be any error at all**. So what these pin down is not functions, it is
+//! **paths**.
 //!
-//! 反过来，归因那几处必须**照旧查得到**：审计事件、合并日志、改类账本的
-//! `actor_id` 指着这个人，而那些是审计材料——人走了不等于那件事没发生。
+//! The other way round, the attribution sites must **still be able to find it**: the
+//! `actor_id` of audit events, merge logs and the retype ledger points at this person, and
+//! those are audit material -- a person leaving does not mean the thing never happened.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -47,33 +50,37 @@ async fn a_retired_account_cannot_get_back_in() -> anyhow::Result<()> {
             utopia_store::accounts::find_user_by_email(&pool, &email)
                 .await?
                 .is_some(),
-            "停用前该找得到"
+            "it should be findable before deactivation"
         );
 
         utopia_store::accounts::deactivate_user(&pool, b, a).await?;
 
-        // 登录这条路
+        // The login path
         assert!(
             utopia_store::accounts::find_user_by_email(&pool, &email)
                 .await?
                 .is_none(),
-            "停用的账号还能按 email 找到——登录挡不住"
+            "a deactivated account is still findable by email -- login cannot be stopped"
         );
-        // **已经签发出去的 token 那条路**。会话校验走 find_user_by_id，
-        // 所以停用立即生效，不必等 token 过期
+        // **The path of the tokens already issued.** Session validation goes through
+        // find_user_by_id, so deactivation takes effect immediately, with no need to wait for
+        // the token to expire
         assert!(
             utopia_store::accounts::find_user_by_id(&pool, b)
                 .await?
                 .is_none(),
-            "停用的账号还能按 id 找到——已签发的 token 仍然有效"
+            "a deactivated account is still findable by id -- issued tokens still work"
         );
 
-        // 归因照旧：那一行还在，只是打了时间戳
+        // Attribution as before: the row is still there, it just got a timestamp
         let still_there: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE id = $1")
             .bind(b)
             .fetch_one(&pool)
             .await?;
-        assert_eq!(still_there, 1, "软删除不该把行删掉——审计要靠它");
+        assert_eq!(
+            still_there, 1,
+            "a soft delete must not drop the row -- audit needs it"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -98,7 +105,7 @@ async fn the_last_admin_and_oneself_are_protected() -> anyhow::Result<()> {
             utopia_store::accounts::deactivate_user(&pool, a, a)
                 .await
                 .is_err(),
-            "不能停用自己——这个系统没有超级管理员那一层，停完就没人能放回来"
+            "cannot deactivate yourself -- this system has no super-admin layer above it, so once you are out nobody can put you back"
         );
 
         utopia_store::accounts::deactivate_user(&pool, b, a).await?;
@@ -106,19 +113,19 @@ async fn the_last_admin_and_oneself_are_protected() -> anyhow::Result<()> {
             utopia_store::accounts::deactivate_user(&pool, a, b)
                 .await
                 .is_err(),
-            "最后一个管理员不能停用，否则组织从此没人能管成员"
+            "the last admin cannot be deactivated, or from then on the org has nobody who can manage members"
         );
 
-        // 幂等：重复停用不是错误
+        // Idempotent: deactivating again is not an error
         utopia_store::accounts::deactivate_user(&pool, b, a).await?;
 
-        // 恢复之后一切照旧
+        // After reactivation everything is as before
         utopia_store::accounts::reactivate_user(&pool, b).await?;
         assert!(
             utopia_store::accounts::find_user_by_id(&pool, b)
                 .await?
                 .is_some(),
-            "恢复之后该能登录了"
+            "it should be possible to log in again after reactivation"
         );
         Ok::<_, anyhow::Error>(())
     }

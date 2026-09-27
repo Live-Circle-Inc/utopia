@@ -1,10 +1,12 @@
-//! OWL 导入：原文保真 → 投影 → 预览 → 落库。
+//! OWL import: faithful original → projection → preview → persist.
 //!
-//! **预览与落库走同一个计划**。两条独立的代码路径迟早分叉，而分叉的后果是
-//! 用户点确认之后发生的事与他刚看过的不一样——那比没有预览更糟。
+//! **Preview and persist run the same plan**. Two independent code paths diverge sooner or later,
+//! and the consequence of diverging is that what happens after the user clicks confirm is not what
+//! they had just looked at -- which is worse than having no preview at all.
 //!
-//! 匹配按 **IRI** 不按 key：上游改一次 `rdfs:label`，派生出的 key 就变了，
-//! 按 key 匹配会把同一个类当新类建出来，实体全留在孤儿上（见 0001 P2）。
+//! Matching goes by **IRI**, not by key: one `rdfs:label` change upstream and the derived key
+//! changes with it, so matching by key would build the same class over again as a new class and
+//! leave all the entities on the orphan (see 0001 P2).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -14,45 +16,58 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-/// 一个类/属性在这次导入里的去向。
+/// Where a class/property ends up in this import.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
-    /// 本体里没有这个 IRI → 新建
+    /// The ontology does not have this IRI → create
     Create,
-    /// IRI 已在 → 更新标签与描述（key 不动：它可能已被引用）
+    /// The IRI is already there → update label and description (key does not move: it may already
+    /// be referenced)
     Update,
-    /// key 被另一个 IRI 占着 → 跳过并报告，不悄悄改名也不覆盖
+    /// The key is taken by another IRI → skip and report; no quiet rename and no overwrite
     KeyTaken,
-    /// key 被另一个 IRI 占着，但对齐表说那两个是**同一个东西** → 跳过且不算冲突。
-    /// 与 KeyTaken 分开，是因为它不需要人裁：少建一个重复的类正是想要的结果
+    /// The key is taken by another IRI, but the alignment table says the two are **the same thing**
+    /// → skip, and it does not count as a conflict.
+    /// Kept apart from KeyTaken because it needs no human ruling: one duplicate class fewer is
+    /// exactly the result we wanted
     Aligned,
 }
 
-/// 一个属性在这次导入里会不会被建出来，以及为什么。
+/// Whether a property gets created in this import, and why.
 ///
-/// **预览必须说得出为什么**。上一版只报了"解析到 54 个属性"，读者无从判断
-/// 那是"都会建"还是"一个都不建"——而实际上是后者。
+/// **The preview has to be able to say why**. The previous version only reported "parsed 54
+/// properties", from which the reader had no way to tell whether that meant "all of them will be
+/// created" or "none of them will" -- and in fact it was the latter.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome", content = "detail")]
 pub enum AttrNote {
-    /// 会建，用这个 datatype
+    /// Will be created, with this datatype
     Datatype(&'static str),
-    /// 会建成 text：没写 range，词汇表没做声明，text 是诚实的超集
+    /// Will be created as text: no range was written, the vocabulary made no declaration, and text
+    /// is the honest superset
     NoRange,
-    /// 会建成 text：range 是可读字面量但我们表达不了它的类型（`xsd:time` 等）。
-    /// 报出原 IRI，人可以改成更合适的类型；但值先落下来，不能因为类型糙就丢知识
+    /// Will be created as text: the range is a readable literal whose type we cannot express
+    /// (`xsd:time` and the like).
+    /// We report the original IRI so a human can change it to a more suitable type; but the values
+    /// land first -- we do not throw knowledge away over a coarse type
     DegradedToText(String),
-    /// 不建：抽取器不可能从散文里读出这种值（二进制、XML 片段、XML 内部标识）。
-    /// 建了也永远填不上，只会给每个文本块的提示词多一行死噪音
+    /// Not created: the extractor could never read this kind of value out of prose (binary, XML
+    /// fragments, XML-internal identifiers).
+    /// Created, it would never be filled in, and would only add one more line of dead noise to
+    /// every text chunk's prompt
     UnusableRange(String),
-    /// 不建：没写 domain。属性必须挂在一个类上，这是 store 层的硬约束
+    /// Not created: no domain was written. An attribute has to hang off a class -- a hard
+    /// constraint in the store layer
     NoDomain,
 
-    /// 不建：domain 指向的类**在这个文件里，但被跳过了**（多半是 key 撞车）。
-    /// 与 UnknownDomain 分开报，因为处置不同：这个能通过给现有的类改名解开
+    /// Not created: the class the domain points at is **in this file, but was skipped** (most
+    /// likely a key collision).
+    /// Reported apart from UnknownDomain because the remedy differs: this one can be unblocked by
+    /// renaming the existing class
     DomainSkipped(String),
-    /// 不建：domain 指向一个这个文件里压根没有的类（外部词汇表）
+    /// Not created: the domain points at a class that is not in this file at all (an external
+    /// vocabulary)
     UnknownDomain(String),
 }
 
@@ -63,17 +78,17 @@ pub struct PlannedItem {
     pub label: String,
     pub has_description: bool,
     pub disposition: Disposition,
-    /// 关系专用：导入声明它是函数性的 —— 预览必须把这些单独列出来
+    /// Relations only: the import declares it functional -- the preview must list these separately
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub functional: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conflict_with: Option<String>,
-    /// 属性专用：会以什么 datatype 建，或为什么建不了
+    /// Attributes only: what datatype it will be created with, or why it cannot be created
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attr: Option<AttrNote>,
 }
 
-/// 一次导入的完整计划。预览返回它，落库也执行它。
+/// The complete plan for one import. The preview returns it, and the persist step executes it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImportPlan {
     pub format: String,
@@ -81,18 +96,21 @@ pub struct ImportPlan {
     pub classes: Vec<PlannedItem>,
     pub relations: Vec<PlannedItem>,
     pub attributes: Vec<PlannedItem>,
-    /// 出现过但今天不消费的公理 → 次数。**不是"已跳过"，是"暂未投影"**
+    /// Axioms that showed up but that we do not consume today → how many times. **Not "skipped",
+    /// but "not projected yet"**
     pub unprojected: Vec<(String, usize)>,
-    /// 没有 `rdfs:comment` 的类数。它们在抽取里质量会明显偏低——
-    /// description 逐字进提示词，是模型判断"什么算这个类"的唯一依据
+    /// How many classes have no `rdfs:comment`. Their quality in extraction is noticeably worse --
+    /// the description goes into the prompt verbatim and is the model's only basis for deciding
+    /// "what counts as this class"
     pub classes_without_description: usize,
-    /// 声明为函数性的关系数。**这是 part_of 那个坑的企业版**：本体声明唯一，
-    /// 数据不遵守，导完就是一队假冲突
+    /// How many relations are declared functional. **This is the enterprise edition of the part_of
+    /// trap**: the ontology declares uniqueness, the data does not obey, and the moment the import
+    /// is done you have a queue of false conflicts
     pub functional_relations: usize,
 }
 
-/// 属性的去向。**domain 先判**：没有 domain 的属性根本建不出来，
-/// 这时它的 range 是什么已经不重要了。
+/// Where a property ends up. **domain is judged first**: an attribute with no domain cannot be
+/// created at all, and at that point what its range is no longer matters.
 fn attr_note(
     p: &ontology_rdf::OwlProperty,
     vocab: &ontology_rdf::VocabDatatypes,
@@ -102,9 +120,9 @@ fn attr_note(
     if p.domains.is_empty() {
         return AttrNote::NoDomain;
     }
-    // **一个都解析不出来才算失败**：多个 domain 里有一部分被跳过时，
-    // 属性仍然建，只是少挂几个类——比整条丢掉强，而被跳过的那些类
-    // 在计划里各自报告过 key 撞车
+    // **It only counts as a failure if not a single one resolves**: when some of several domains
+    // are skipped, the attribute is still created, just attached to fewer classes -- better than
+    // losing the whole thing, and the skipped classes each reported their key collision in the plan
     if !p.domains.iter().any(|d| resolvable.contains(d.as_str())) {
         let first = &p.domains[0];
         return if in_file.contains(first.as_str()) {
@@ -121,21 +139,23 @@ fn attr_note(
     }
 }
 
-/// 属性会不会被建出来，以及用什么 datatype。落库与统计共用它，
-/// 免得"预览说会建"和"实际建了"两处各判一次而分叉。
+/// Whether a property gets created, and with what datatype. The persist step and the statistics
+/// share it, so that "the preview said it would be created" and "it actually was created" are not
+/// judged separately in two places and left to diverge.
 fn attr_datatype(note: &AttrNote) -> Option<&'static str> {
     match note {
         AttrNote::Datatype(dt) => Some(dt),
-        // 没写 range，或写了但类型表达不了：值仍是字面量，
-        // text 是拦不住任何东西的诚实超集
+        // No range written, or written but with a type we cannot express: the value is still a
+        // literal, and text is the honest superset that stops nothing
         AttrNote::NoRange | AttrNote::DegradedToText(_) => Some("text"),
         _ => None,
     }
 }
 
 impl ImportPlan {
-    /// 建不出来的属性，按原因分组计数。**预览里报总数是不够的**——
-    /// "54 个属性"读不出那是都会建还是一个都不建，而实际上取决于原因。
+    /// Properties that cannot be created, counted by reason. **Reporting a total in the preview is
+    /// not enough** -- "54 properties" does not tell you whether all of them or none of them will
+    /// be created, and it actually depends on the reason.
     pub fn attr_skips(&self) -> BTreeMap<&str, usize> {
         let mut out: BTreeMap<&str, usize> = BTreeMap::new();
         for a in &self.attributes {
@@ -159,7 +179,7 @@ impl ImportPlan {
     }
 }
 
-/// 解析文件并对着现有本体算出计划。不写任何东西。
+/// Parse the file and compute the plan against the existing ontology. Writes nothing.
 pub async fn plan(
     state: &AppState,
     kb_id: Uuid,
@@ -175,7 +195,8 @@ pub async fn plan(
         )
     })?;
 
-    // 现有本体：按 IRI 与按 key 各建一份索引，两种冲突分别判
+    // The existing ontology: one index by IRI and one by key, so the two kinds of conflict are
+    // judged separately
     let etypes = utopia_store::graph::entity_types(&state.pool, kb_id).await?;
     let rtypes = utopia_store::graph::relation_types(&state.pool, kb_id).await?;
     let e_by_iri: HashMap<&str, &_> = etypes
@@ -189,24 +210,29 @@ pub async fn plan(
         .collect();
     let r_by_key: HashMap<&str, &_> = rtypes.iter().map(|t| (t.key.as_str(), t)).collect();
 
-    // 这次结束后能解析出 id 的类 IRI：文件里新建或更新的，加上库里已有同 IRI 的。
-    // key 撞车被跳过的**不在其列**——它不会被建出来，挂在它上面的属性也就无处可挂
-    // 本次导入内部也会撞 key：不同 IRI 派生出同一个短标签
-    //（FOAF 的 familyName 与 family_name 都成了 family_name）。
-    // 只对着库里查是不够的——那样第二个在预览里显示"会新建"，
-    // 落库时被 ON CONFLICT 悄悄丢掉，预览就说了假话
+    // Class IRIs whose id will be resolvable once this run is over: the ones created or updated in
+    // this file, plus the ones already in the database with the same IRI.
+    // Ones skipped over a key collision are **not among them** -- they will not be created, so the
+    // attributes hanging off them have nowhere to hang either
+    // Keys collide inside this one import too: different IRIs deriving the same short label
+    // (FOAF's familyName and family_name both became family_name).
+    // Checking against the database alone is not enough -- that way the second one shows "will be
+    // created" in the preview, gets quietly dropped by ON CONFLICT on persist, and the preview has
+    // told a lie
     //
-    // **两个命名空间，不是一个**：类进 entity_types、关系与属性进 relation_types，
-    // 各有各的 (kb_id, key) 唯一约束。合成一张表就是凭空多出一条约束——
-    // 而且代价具体：schema.org 的 location / address 是属性，却先被
-    // OMG Commons 的 Location / Address 两个**类**占了名字（类先处理），
-    // 于是抽取时模型点名要 location，库里偏偏没有
+    // **Two namespaces, not one**: classes go into entity_types, relations and attributes into
+    // relation_types, each with its own (kb_id, key) unique constraint. Merging them into one table
+    // would invent an extra constraint out of nothing -- and the cost is concrete: schema.org's
+    // location / address are properties, but the names had already been taken by OMG Commons'
+    // Location / Address, two **classes** (classes are processed first), so at extraction time the
+    // model asks for location by name and the database happens not to have it
     let mut claimed_class: HashMap<&str, &str> = HashMap::new();
     let mut claimed_prop: HashMap<&str, &str> = HashMap::new();
 
     let mut classes = Vec::new();
     for c in &proj.classes {
-        // 对齐表判为"同名不同义"时，用它声明的 key 顶替派生出来的那个
+        // When the alignment table rules "same name, different meaning", use the key it declares in
+        // place of the derived one
         let mut renamed_key: Option<&'static str> = None;
         let (disposition, conflict_with) = if let Some(prev) = claimed_class.get(c.key.as_str()) {
             (Disposition::KeyTaken, Some((*prev).to_string()))
@@ -214,37 +240,41 @@ pub async fn plan(
             (Disposition::Update, None)
         } else if let Some(existing) = e_by_key.get(c.key.as_str()) {
             match existing.iri.as_deref() {
-                // **占位者没有 IRI：认领它。**
+                // **The squatter has no IRI: adopt it.**
                 //
-                // 没有 IRI 意味着这个类是本地起的名字（种子本体、或者手工建的），
-                // 不是另一个词汇表的同名词。导入说的是"这个 IRI 就是那个类"，
-                // 而这一步不做，整棵树就是断的：schema.org 的 Organization
-                // 撞上内置的 organization 被跳过，于是 Corporation 的父类指向
-                // 一个没建出来的东西——内置那几个基类一个子类都挂不上，
-                // 类型精化无从谈起。
+                // No IRI means this class was named locally (the seed ontology, or hand-built) and
+                // is not a same-named term from another vocabulary. The import is saying "this IRI
+                // is that class", and without this step the whole tree is broken: schema.org's
+                // Organization collides with the built-in organization and gets skipped, so
+                // Corporation's parent points at something that was never created -- the built-in
+                // base classes end up with not a single subclass attached, and type refinement is
+                // out of the question.
                 None => (Disposition::Update, None),
-                // 已经有一个**不同的** IRI：两个词汇表争同一个短标签。
-                // 先查预制包的对齐表——那是**声明**的处置，重导入结果一样，
-                // 所以下面那条"不自动加后缀"的理由对它不适用
+                // There is already a **different** IRI: two vocabularies fighting over the same
+                // short label. Check the prebuilt pack's alignment table first -- that is a
+                // **declared** disposition and a re-import gives the same result, so the "no
+                // automatic suffix" reasoning below does not apply to it
                 Some(other) => match crate::pack_alignment::lookup(&c.iri, other) {
-                    // 同义：已有的那个就是它，少建一个重复的类正是想要的
+                    // Same meaning: the existing one is it, and one duplicate class fewer is
+                    // exactly what we wanted
                     Some(crate::pack_alignment::Alignment::SameAs) => {
                         (Disposition::Aligned, existing.iri.clone())
                     }
-                    // 同名不同义：换一个声明好的 key 建出来
+                    // Same name, different meaning: create it under a different, declared key
                     Some(crate::pack_alignment::Alignment::Rename(k)) => {
                         renamed_key = Some(k);
                         (Disposition::Create, None)
                     }
-                    // 表里没有：这是真冲突。不自动加后缀——那会让重导入
-                    // 认不出自己上次建的是哪个
+                    // Not in the table: this is a real conflict. No automatic suffix -- that would
+                    // leave a re-import unable to recognise which one it created last time
                     None => (Disposition::KeyTaken, existing.iri.clone()),
                 },
             }
         } else {
             (Disposition::Create, None)
         };
-        // 改名与原名都是借用（前者 'static，后者借自 proj），统一成一个引用用完再落地
+        // The renamed key and the original are both borrows (the former 'static, the latter from
+        // proj), so unify them into one reference and materialise it at the end
         let key: &str = renamed_key.unwrap_or(c.key.as_str());
         if !matches!(disposition, Disposition::KeyTaken | Disposition::Aligned) {
             claimed_class.insert(key, c.iri.as_str());
@@ -261,7 +291,8 @@ pub async fn plan(
         });
     }
 
-    // 文件里出现过的类（含被跳过的）——用来区分它被跳过了与它压根不在这个文件里
+    // Classes that appeared in the file (including the skipped ones) -- used to tell "it was
+    // skipped" apart from "it is not in this file at all"
     let in_file: HashSet<&str> = proj.classes.iter().map(|c| c.iri.as_str()).collect();
     let resolvable: HashSet<&str> = classes
         .iter()
@@ -323,16 +354,20 @@ pub async fn plan(
     Ok((plan, proj, format))
 }
 
-/// 装完一组包之后再过一遍：把 domain / range 指向**别的包里的类**的那些关系接上。
+/// A second pass once a set of packs has been installed: hook up the relations whose domain / range
+/// point at **classes in another pack**.
 ///
-/// 单次导入认本文件里的类和库里已有的类（见 [`apply`] 里的 resolve），但包是挨个
-/// 装的：装 W3C Org 时 FOAF 还没来，`headOf` 的 `rdfs:domain foaf:Agent` 就落了空；
-/// 等 FOAF 装好，没人回头补。没有 domain 的谓词 `judge_direction` 不判方向，
-/// 反向的 `Project Aurora head_of Li Ting` 就原样进图（#222）。
+/// A single import knows the classes in its own file and the classes already in the database (see
+/// the resolve closure in [`apply`]), but packs are installed one at a time: when W3C Org is
+/// installed FOAF has not arrived yet, so `headOf`'s `rdfs:domain foaf:Agent` came up empty; and
+/// once FOAF is installed, nobody goes back to fill it in. `judge_direction` does not judge the
+/// direction of a predicate with no domain, so a reversed `Project Aurora head_of Li Ting` goes
+/// into the graph as-is (#222).
 ///
-/// 只补不删，关联表 ON CONFLICT DO NOTHING，重复跑无害。属性不在这里：属性的
-/// 去向在计划阶段就定了（没有 domain 的根本建不出来），事后补 domain 改不了它
-/// 已经是不是一列的事实
+/// It only adds, never deletes; the association tables are ON CONFLICT DO NOTHING, so running it
+/// again is harmless. Attributes are not in here: an attribute's fate was settled during the
+/// planning phase (one with no domain cannot be created at all), and filling in a domain afterwards
+/// cannot change the fact that it either is or is not already a column
 pub async fn relink_domains_ranges(
     state: &AppState,
     kb_id: Uuid,
@@ -381,8 +416,9 @@ pub async fn relink_domains_ranges(
     Ok((link_d.len(), link_r.len()))
 }
 
-/// 执行计划。属性在类之后落库——它们要挂在 domain 上，而 domain 要等
-/// 类先建好并解析 IRI → id（就是下面那个 `id_of`）。
+/// Execute the plan. Attributes are persisted after the classes -- they have to hang off a domain,
+/// and the domain has to wait for the classes to be built first and the IRI → id resolution done
+/// (that is the `id_of` below).
 pub async fn apply(
     state: &AppState,
     kb_id: Uuid,
@@ -392,8 +428,9 @@ pub async fn apply(
 ) -> AppResult<(Uuid, ImportPlan)> {
     let (plan, proj, format) = plan(state, kb_id, filename, bytes).await?;
 
-    // 第一层：原文按内容寻址进 blob。**先存原文再改本体**——投影失败可以重来，
-    // 原文丢了就永远回不去
+    // Layer one: the original goes into the blob store content-addressed. **Store the original
+    // before touching the ontology** -- a failed projection can be redone, but a lost original is
+    // gone forever
     let sha = sha256_hex(bytes);
     state
         .blob
@@ -402,7 +439,8 @@ pub async fn apply(
         .map_err(utopia_core::AppError::Other)?;
 
     let by_iri: HashMap<&str, &_> = proj.classes.iter().map(|c| (c.iri.as_str(), c)).collect();
-    // 已在库里的类：IRI → id。Aligned 要靠它把"同义的那个"接上父类引用
+    // Classes already in the database: IRI → id. Aligned relies on it to hook "the synonymous one"
+    // up to the parent-class references
     let existing_by_iri: HashMap<String, Uuid> =
         utopia_store::graph::entity_types(&state.pool, kb_id)
             .await?
@@ -411,21 +449,23 @@ pub async fn apply(
             .collect();
     let mut created_classes = 0usize;
     let mut updated_classes = 0usize;
-    // IRI → 本体里的 id，父类解析要用
+    // IRI → id in the ontology, needed for resolving parents
     let mut id_of: HashMap<String, Uuid> = HashMap::new();
 
-    // **新建的类一次插完，不逐条来。**
+    // **Newly created classes are inserted in one go, not row by row.**
     //
-    // 逐条 `execute(pool)` 每条各自提交，schema.org 那种量级（968 个类加约
-    // 1500 个属性）是五千次 fsync——实测导入 45 秒。同样的行数放进一条
-    // UNNEST 语句是 536 毫秒。Update 与 Aligned 留在下面逐条走：它们在
-    // 空库上是个位数，而且各自要读一次现状，批不起来。
+    // Row-by-row `execute(pool)` commits each row on its own, and at schema.org's scale (968
+    // classes plus about 1500 properties) that is five thousand fsyncs -- 45 seconds for the
+    // import, measured. The same rows in a single UNNEST statement are 536 milliseconds. Update and
+    // Aligned stay row by row below: on an empty database they are single digits, and each of them
+    // has to read the current state, so they cannot be batched.
     let new_classes: Vec<(String, String, String, String)> = plan
         .classes
         .iter()
         .filter(|i| i.disposition == Disposition::Create)
         .filter_map(|i| by_iri.get(i.iri.as_str()).map(|c| (i, *c)))
-        // key 用 item 的：对齐表判为同名不同义时它是改过的那个
+        // Use the item's key: when the alignment table rules same-name-different-meaning, that is
+        // the renamed one
         .map(|(i, c)| {
             (
                 i.key.clone(),
@@ -450,11 +490,11 @@ pub async fn apply(
             continue;
         };
         match item.disposition {
-            // 上面已经批量建好了
+            // Already created in bulk above
             Disposition::Create => {}
             Disposition::Update => {
-                // 两种 Update：这个 IRI 上次导过（按 IRI 找得到），
-                // 或者它要认领一个同名的本地类（按 key 找，且那一行还没有 IRI）
+                // Two kinds of Update: this IRI was imported last time (findable by IRI), or it is
+                // adopting a same-named local class (found by key, with that row having no IRI yet)
                 let updated = utopia_store::ontology::update_type_from_import(
                     &state.pool,
                     kb_id,
@@ -480,9 +520,10 @@ pub async fn apply(
                     updated_classes += 1;
                 }
             }
-            // key 被占：报告过了，不动
-            // 同义：不建。但要把 IRI 指向已有那个类的 id，否则以它为父类的
-            // 子类会解析不到，整棵树在这里断掉
+            // Key taken: already reported, leave it alone
+            // Same meaning: do not create it. But the IRI has to point at the existing class's id,
+            // otherwise subclasses that have it as a parent will not resolve and the whole tree
+            // breaks right here
             Disposition::Aligned => {
                 if let Some(target) = item.conflict_with.as_deref() {
                     if let Some(id) = existing_by_iri.get(target) {
@@ -494,16 +535,17 @@ pub async fn apply(
         }
     }
 
-    // 父类第二遍解析：第一遍时父类可能还没建出来
-    // (子, 父) 边先攒着，一次插完
+    // Second pass for resolving parents: on the first pass the parent may not have been created yet
+    // Collect the (child, parent) edges first, then insert them in one go
     let mut parent_edges: Vec<(Uuid, Uuid)> = Vec::new();
     for c in &proj.classes {
         let Some(&child) = id_of.get(&c.iri) else {
             continue;
         };
-        // **全部父类**，不再只取第一个。FOAF 的 Person 同时是 Agent 与
-        // SpatialThing，丢掉后一支就让 domain 在那支上的属性判定不过。
-        // 指向没被建出来的类的那些父自然落选——少一支比整条不挂强
+        // **All the parents**, not just the first one any more. FOAF's Person is both an Agent and
+        // a SpatialThing, and dropping the latter branch makes properties whose domain is on that
+        // branch fail the check. Parents pointing at classes that were not created drop out on
+        // their own -- one branch short beats not being attached at all
         let parents: Vec<Uuid> = c
             .parents
             .iter()
@@ -511,16 +553,19 @@ pub async fn apply(
             .collect();
         parent_edges.extend(parents.into_iter().map(|p| (child, p)));
     }
-    // 一次插完。单条版每次都跑一个递归 CTE 查环，schema.org 有 975 条父类边，
-    // 就是 975 次递归查询加 975 次提交。
+    // Inserted in one go. The single-row version runs a recursive CTE for cycle detection every
+    // time, and schema.org has 975 parent edges -- that is 975 recursive queries plus 975 commits.
     //
-    // **批量版不查环。** 单条版对成环的处置本来也只是跳过那一条（`let _ =`），
-    // 不中断导入；而导入完之后本体页仍然能发现并让人处理。用九百多次递归查询
-    // 换一个"发现得早一点"，不划算
+    // **The bulk version does not check for cycles.** The single-row version only ever handled a
+    // cycle by skipping that one edge (`let _ =`) anyway, without aborting the import; and once the
+    // import is done the ontology page can still find it and let someone deal with it. Trading nine
+    // hundred-odd recursive queries for "finding out a bit sooner" is not worth it
     utopia_store::ontology::set_parents_bulk(&state.pool, &parent_edges).await?;
 
-    // 类互斥同理攒一批（见 `relation_types` 的公理列）。指向没被建出来的类的那些自然落选——
-    // 一条互斥声明的两端都得在这个库里,才谈得上拿它判矛盾
+    // Class disjointness is collected into a batch the same way (see the axiom columns on
+    // `relation_types`). Ones pointing at classes that were not created drop out on their own --
+    // both ends of a disjointness declaration have to be in this KB before it can be used to judge
+    // a contradiction
     let mut disjoint_edges: Vec<(Uuid, Uuid)> = Vec::new();
     for c in &proj.classes {
         let Some(&a) = id_of.get(&c.iri) else {
@@ -539,16 +584,20 @@ pub async fn apply(
         .iter()
         .map(|p| (p.iri.as_str(), p))
         .collect();
-    // 关系。此前 apply 完全跳过它们——预览却在关系那行写着"N new"，
-    // 承诺了不会发生的事。这与今天修掉的 key 撞车缺陷是同一种。
+    // Relations. apply used to skip them entirely -- while the preview wrote "N new" on the
+    // relations line, promising something that was never going to happen. The same kind of defect
+    // as the key collision fixed today.
     //
-    // **functional / inverse_functional 照词汇表的声明写下去**：它们是时态引擎
-    // 自动闭合事实的依据，猜错会成批造假冲突（part_of 那次 59 条）。所以不猜——
-    // 词汇表说是就是，预览已经把它们单独列出来让人过目。
+    // **functional / inverse_functional are written exactly as the vocabulary declares them**: they
+    // are what the temporal engine uses to close facts automatically, and guessing wrong
+    // manufactures false conflicts in bulk (59 of them, that time with part_of). So we do not guess
+    // -- if the vocabulary says so, it is so, and the preview already lists them separately for a
+    // human to look over.
     let mut created_rels = 0usize;
     let mut updated_rels = 0usize;
     let mut new_rels: Vec<utopia_store::ontology::BulkRelation> = Vec::new();
-    // (key, domains, ranges)：关系 id 要等批量插完才有，先按 key 记着
+    // (key, domains, ranges): relation ids only exist once the bulk insert is done, so keep track
+    // by key for now
     let mut pending_links: Vec<(String, Vec<Uuid>, Vec<Uuid>)> = Vec::new();
     for item in &plan.relations {
         if item.disposition == Disposition::KeyTaken {
@@ -557,12 +606,14 @@ pub async fn apply(
         let Some(p) = by_prop_iri.get(item.iri.as_str()) else {
             continue;
         };
-        // domain/range 指向没被建出来的类时只丢那一个，不丢整条关系：
-        // 关系不像属性那样必须挂在类上，没有 domain 就是"不限主语类型"。
+        // When a domain/range points at a class that was not created, only that one is dropped, not
+        // the whole relation: unlike an attribute, a relation does not have to hang off a class,
+        // and no domain simply means "no restriction on the subject's type".
         //
-        // **库里已有的类也算数。** 从前只认本文件里的类，于是 W3C Org 的
-        // `headOf rdfs:domain foaf:Agent` 在 FOAF 已经装好的库里照样丢 domain，
-        // 而没有 domain 的谓词 `judge_direction` 根本不判方向（#222）
+        // **Classes already in the database count too.** This used to recognise only the classes in
+        // the file at hand, so W3C Org's `headOf rdfs:domain foaf:Agent` lost its domain even in a
+        // database where FOAF was already installed -- and `judge_direction` does not judge the
+        // direction of a predicate with no domain at all (#222)
         let resolve = |iris: &[String]| -> Vec<Uuid> {
             iris.iter()
                 .filter_map(|i| {
@@ -592,7 +643,7 @@ pub async fn apply(
             }
             continue;
         }
-        // 新建的攒起来一次插——理由同上面的类
+        // Collect the new ones and insert them in one go -- same reasoning as the classes above
         new_rels.push(utopia_store::ontology::BulkRelation {
             key: p.key.clone(),
             label: p.label.clone(),
@@ -613,10 +664,12 @@ pub async fn apply(
         utopia_store::ontology::create_relation_types_bulk(&state.pool, kb_id, &new_rels).await?;
     created_rels += rel_ids.len();
 
-    // 逆与父属性指的是**另一个关系类型**，id 要等全部插完才有——所以是第二遍。
-    // 一遍过只能处理「父属性恰好排在前面」的文件，而 RDF 三元组没有顺序。
+    // Inverse and super-property point at **another relation type**, and the ids only exist once
+    // everything has been inserted -- hence the second pass. A single pass can only handle files
+    // where "the super-property happens to come first", and RDF triples have no order.
     //
-    // 新建的与已存在的都收：一份本体重导时，这两条声明可能是这次才加上的
+    // Both the new and the already existing ones are collected: when an ontology is re-imported,
+    // these two declarations may only have been added this time round
     let mut inv_pairs: Vec<(String, String)> = Vec::new();
     let mut sub_pairs: Vec<(String, String)> = Vec::new();
     for item in &plan.relations {
@@ -637,8 +690,9 @@ pub async fn apply(
         &sub_pairs,
     )
     .await?;
-    // 关联行也摊平：单条版对每条关系跑 4 句（两张表各一次 DELETE 一次 INSERT），
-    // 一千五百条关系就是六千次提交
+    // The association rows are flattened too: the single-row version runs 4 statements per relation
+    // (a DELETE and an INSERT on each of the two tables), so fifteen hundred relations is six
+    // thousand commits
     let mut link_d: Vec<(Uuid, Uuid)> = Vec::new();
     let mut link_r: Vec<(Uuid, Uuid)> = Vec::new();
     for (key, domains, ranges) in &pending_links {
@@ -650,9 +704,10 @@ pub async fn apply(
     }
     utopia_store::ontology::link_domains_ranges_bulk(&state.pool, &link_d, &link_r).await?;
 
-    // 属性：类建完、id_of 填好之后才轮到它们。计划里已经算出了每个属性的去向，
-    // **这里只执行，不重新判断**——两处各判一次就会分叉，而分叉意味着
-    // 预览说的和实际做的不是一回事
+    // Attributes: their turn comes only after the classes are created and id_of is filled in. The
+    // plan has already worked out where each property ends up, and **this only executes, it does
+    // not judge again** -- judging once in each of two places is how they diverge, and diverging
+    // means what the preview says and what actually happens are not the same thing
     let mut created_attrs = 0usize;
     let mut new_attrs: Vec<utopia_store::ontology::BulkRelation> = Vec::new();
     let mut pending_attr_domains: Vec<(String, Vec<Uuid>)> = Vec::new();
@@ -666,8 +721,9 @@ pub async fn apply(
         let Some(dt) = attr_datatype(note) else {
             continue;
         };
-        // 计划阶段判为可解析、落库时却没有 id 的（类被跳过或更新失败）自然落选；
-        // 全落选就不建，而不是造一个挂空的属性
+        // Ones judged resolvable during planning but with no id at persist time (the class was
+        // skipped, or the update failed) drop out on their own; if all of them drop out we do not
+        // create it, rather than manufacturing an attribute that hangs off nothing
         let domain_ids: Vec<Uuid> = p
             .domains
             .iter()
@@ -683,8 +739,9 @@ pub async fn apply(
             iri: p.iri.clone(),
             kind: "attribute",
             datatype: Some(dt.to_string()),
-            // 属性不参与时态闭合，也不参与一致性检查：那几类判定都是关于
-            // **实体之间**的边,而属性的宾语是字面值
+            // Attributes take part in neither temporal closing nor the consistency check: those
+            // judgements are all about the edges **between entities**, whereas an attribute's
+            // object is a literal value
             functional: false,
             inverse_functional: false,
             transitive: false,
@@ -711,8 +768,9 @@ pub async fn apply(
         "classes_updated": updated_classes,
         "classes_key_taken": plan.classes.iter().filter(|c| c.disposition == Disposition::KeyTaken).count(),
         "relations_seen": plan.relations.len(),
-        // 连上了几条逆 / 父属性。**报出来**——目标 IRI 不在这个库里时会静默跳过
-        // （引用外部词汇表是常态），不给数就没人知道少连了多少
+        // How many inverse / super-property links were made. **Report it** -- when the target IRI
+        // is not in this KB it is skipped silently (referencing external vocabularies is the norm),
+        // and without a number nobody knows how many links are missing
         "inverse_linked": linked_inv,
         "sub_property_linked": linked_sub,
         "relations_created": created_rels,
@@ -747,9 +805,11 @@ pub async fn apply(
         summary,
     )
     .await;
-    // 本体刚变过，向量都是陈的。**排任务而不是就地跑**：这一趟要嵌几千行，
-    // 放在导入请求里，用户点完确认要多等六到八分钟。排不上也不要紧——
-    // 索引是自愈的，下一个用到检索的人会补上
+    // The ontology just changed, so all the vectors are stale. **Enqueue a job rather than running
+    // it inline**: this pass has to embed a few thousand rows, and doing it inside the import
+    // request would make the user wait another six to eight minutes after clicking confirm. It not
+    // getting picked up does not matter either -- the index is self-healing, and the next person
+    // who uses retrieval will fill it in
     let _ = utopia_store::jobs::enqueue(
         &state.pool,
         "embed_ontology",

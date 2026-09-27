@@ -1,12 +1,14 @@
 /**
- * 来源的种类——**前端这一份清单只在这里写一次**。
+ * The kinds of source -- **on the frontend this list is written exactly once, right here**.
  *
- * 后端的那一份是 `crates/utopia-core` 里的 `SourceKind` 枚举，创建时的校验与同步时的
- * 分派都从它出；`utopia-store` 的测试会读这个文件，把两边对一遍——任何一边多一种
- * 少一种，`cargo test` 就红。此前两边各自手写，五种连接器加了同步分支、进了界面，
- * 却没进创建的白名单：选得到、建不出来（#247）。
+ * The backend's copy is the `SourceKind` enum in `crates/utopia-core`; both the validation at
+ * creation time and the dispatch at sync time come out of it. `utopia-store`'s tests read this
+ * file and check the two sides against each other -- one kind too many or too few on either
+ * side and `cargo test` goes red. Before that the two sides were each written by hand, and five
+ * connectors got their sync branch and made it into the UI but never made it into the creation
+ * allowlist: selectable, not creatable (#247).
  *
- * 顺序就是建来源对话框里的顺序。
+ * The order here is the order in the create-source dialog.
  */
 export const CREATABLE_SOURCE_KINDS = [
   "folder",
@@ -25,5 +27,5 @@ export const CREATABLE_SOURCE_KINDS = [
 
 export type CreatableSourceKind = (typeof CREATABLE_SOURCE_KINDS)[number];
 
-/** 库里还会有两种人建不出来的：每个库自带的 `memory`，与老数据的 `upload` */
+/** A KB holds two more kinds nobody can create: its own `memory`, and `upload` from old data */
 export type SourceKind = CreatableSourceKind | "memory" | "upload";

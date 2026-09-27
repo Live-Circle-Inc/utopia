@@ -1,5 +1,6 @@
-//! 审计日志：谁在何时对什么做了什么。纯审计——只记录与展示，不承载回滚等衍生功能。
-//! 记录失败绝不影响业务操作（调用方一律 `let _ =`）。
+//! Audit log: who did what to which thing and when. Pure audit -- it only records and
+//! displays, and carries no derived features such as rollback.
+//! A failed record must never affect the business operation (callers always use `let _ =`).
 
 use sqlx::PgPool;
 use utopia_core::models::AuditEventView;
@@ -27,11 +28,12 @@ pub async fn record(
     .await
 }
 
-/// 请求的来源信息。由 HTTP 层在每个请求外层 scope 进 [`CLIENT`]，`record_opt`
-/// 自行读取——否则 25 个调用点每一个都要多带两个与业务无关的参数。
+/// Where the request came from. The HTTP layer scopes it into [`CLIENT`] around every request
+/// and `record_opt` reads it itself -- otherwise all 25 call sites would have to carry two more
+/// parameters that have nothing to do with their business.
 ///
-/// 后台任务（攒批裁决、定时同步）不在任何请求之内，读到的是 None，本就该如此：
-/// 那些动作确实没有客户端。
+/// Background jobs (batched adjudication, scheduled sync) are inside no request at all, so they
+/// read None, exactly as they should: those actions really do have no client.
 #[derive(Debug, Clone, Default)]
 pub struct ClientContext {
     pub ip: Option<String>,
@@ -42,12 +44,13 @@ tokio::task_local! {
     pub static CLIENT: ClientContext;
 }
 
-/// 取当前请求的来源；不在请求上下文中（后台任务）时返回全空。
+/// The current request's origin; all empty when outside a request context (background jobs).
 fn client_context() -> ClientContext {
     CLIENT.try_with(|c| c.clone()).unwrap_or_default()
 }
 
-/// 无人类操作者的系统事件（如 AI 裁决自动合并）走这里：actor 为 NULL。
+/// System events with no human actor (an AI adjudication auto-merge, say) go through here:
+/// actor is NULL.
 pub async fn record_opt(
     pool: &PgPool,
     kb_id: Option<Uuid>,
@@ -58,8 +61,9 @@ pub async fn record_opt(
     detail: serde_json::Value,
 ) -> AppResult<()> {
     let ctx = client_context();
-    // 身份快照：用户日后被删除时（0025 之后行会留下），台账仍认得出是谁，而不是
-    // 只剩一串 UUID。此刻查是可靠的——操作正在发生，人还在。
+    // Identity snapshot: when the user is deleted later (after 0025 the row survives), the
+    // ledger can still tell who it was instead of being left with a bare UUID. Looking it up
+    // right now is reliable -- the action is happening, the person is still there.
     let actor_label: Option<String> = match actor_id {
         Some(id) => sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
             .bind(id)
@@ -90,7 +94,8 @@ pub async fn record_opt(
     Ok(())
 }
 
-/// 审核决策台账：只取 review 域的动作（review./fact./conflict./merge.），服务端分页。
+/// Ledger of review decisions: only actions in the review domain
+/// (review./fact./conflict./merge.), paginated on the server.
 pub async fn review_history(
     pool: &PgPool,
     kb_id: Uuid,
@@ -118,19 +123,20 @@ pub async fn review_history(
     Ok((rows, total))
 }
 
-/// 一个知识库的审计台账，**带分页与筛选**。
+/// A knowledge base's audit ledger, **with pagination and filters**.
 ///
-/// 从前是固定最近 100 条、无分页无筛选——而台账是合规材料，「只看得到最近
-/// 一百条」等于查不了历史。三个筛选是按真实的查法挑的：
+/// It used to be a fixed most-recent 100 rows, no pagination and no filters -- and a ledger is
+/// compliance material, where "you can only see the last hundred" amounts to not being able to
+/// query history at all. The three filters were picked from how it actually gets queried:
 ///
-/// - `action`：查一类动作（「谁改过类型」「有哪些拒绝」）。前缀匹配而不是
-///   全等，因为动作名本身分层（`entity.retyped` / `entity.renamed`），
-///   传 `entity.` 就能把一族捞出来
-/// - `actor`：查一个人做过什么。合规审计最常见的问题
-/// - `since` / `until`：查一段时间。事故复盘要的就是这个
+/// - `action`: look up one class of action ("who has retyped things", "which rejections were
+///   there"). Prefix match rather than equality, because action names are themselves layered
+///   (`entity.retyped` / `entity.renamed`), so passing `entity.` scoops up the whole family
+/// - `actor`: look up what one person did. The most common question in a compliance audit
+/// - `since` / `until`: look up a stretch of time. Exactly what an incident review needs
 ///
-/// 一并回总数，否则分页器不知道有几页——而「不知道有几页」正是这一档
-/// 从前那个 100 的翻版。
+/// The total count comes back with it, otherwise the pager does not know how many pages there
+/// are -- and "not knowing how many pages there are" is just the old 100 in another guise.
 #[allow(clippy::too_many_arguments)]
 pub async fn list_for_kb(
     pool: &PgPool,
@@ -142,8 +148,9 @@ pub async fn list_for_kb(
     limit: i64,
     offset: i64,
 ) -> AppResult<(Vec<AuditEventView>, i64)> {
-    // 四个筛选都写成「参数为空就不生效」，这样一条 SQL 覆盖全部组合——
-    // 拼字符串会在这里长出十六个分支，而每个分支都是一次注入面
+    // All four filters are written as "an empty parameter means no effect", so one SQL
+    // statement covers every combination -- string concatenation would grow sixteen branches
+    // here, and every branch is one more injection surface
     const WHERE: &str = "WHERE e.kb_id = $1
            AND ($2::text IS NULL OR e.action LIKE $2 || '%')
            AND ($3::uuid IS NULL OR e.actor_id = $3)
@@ -178,8 +185,9 @@ pub async fn list_for_kb(
     Ok((rows, total))
 }
 
-/// 这个库的台账里出现过哪些动作。**筛选下拉要按实际有的填**——列一个
-/// 全部动作的硬编码清单，用户会看到一堆这个库从来没发生过的选项。
+/// Which actions have actually appeared in this KB's ledger. **The filter dropdown has to be
+/// populated from what is really there** -- a hard-coded list of every action would show the
+/// user a pile of options that never happened in this KB.
 pub async fn actions_for_kb(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<String>> {
     Ok(
         sqlx::query_scalar("SELECT DISTINCT action FROM audit_events WHERE kb_id = $1 ORDER BY 1")

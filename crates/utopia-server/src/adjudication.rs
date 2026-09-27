@@ -1,7 +1,10 @@
-//! 实体消解攒批裁决任务：消费审核队列中 stage=adjudicating 的灰区对。
-//! 先查裁决缓存，缓存未命中的攒成一批（一次 LLM 调用裁多对）；
-//! 高置信 same → 自动合并（可回滚），高置信 different → 自动保持分开，
-//! 其余转人工。未配模型时全部转人工——本任务失败或缺席都不影响抽取与查询。
+//! Batched adjudication job for entity resolution: consumes the grey-area pairs in the
+//! review queue whose stage=adjudicating.
+//! The verdict cache is checked first, and the cache misses are gathered into one batch (a
+//! single LLM call judges many pairs);
+//! high-confidence same → auto-merge (revertible), high-confidence different → automatically
+//! kept apart, everything else goes to a human. With no model configured everything goes to
+//! a human -- this job failing or being absent affects neither extraction nor queries.
 
 use crate::llm_util;
 use crate::state::AppState;
@@ -15,13 +18,14 @@ const BATCH_SIZE: i64 = 12;
 const AUTO_CONF: f32 = 0.8;
 const MAX_ROUNDS: usize = 20;
 
-/// 缓存键：类型 + 双方名字 + 事实摘要（与实体 id 无关——重传文档不重复付费）。
+/// Cache key: type + both sides' names + a digest of the facts (nothing to do with entity
+/// ids -- re-uploading a document does not mean paying twice).
 fn pair_key(item: &ReviewItem) -> String {
     let side = |s: &utopia_core::models::ReviewSide| {
         format!(
             "{}|{}|{}",
             s.name.to_lowercase(),
-            // 没判出类型的一侧照样要能缓存（0009）
+            // A side whose type could not be determined still has to be cacheable (0009)
             s.type_label.as_deref().unwrap_or("untyped"),
             s.top_facts.join(";")
         )
@@ -42,7 +46,8 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
         .unwrap_or_default();
 
     let Some(client) = client else {
-        // 无模型可用：全部转人工，任务本身成功结束
+        // No model available: send everything to a human; the job itself finishes
+        // successfully
         let items =
             utopia_store::resolution::pending_adjudications(&state.pool, kb_id, 500).await?;
         for item in items {
@@ -60,7 +65,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
             break;
         }
 
-        // 第一层：裁决缓存
+        // First layer: the verdict cache
         let mut to_ask: Vec<(ReviewItem, String)> = Vec::new();
         for item in items {
             let key = pair_key(&item);
@@ -75,7 +80,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
             continue;
         }
 
-        // 第二层：攒批 LLM 裁决
+        // Second layer: batched LLM adjudication
         let pairs: Vec<utopia_extract::AdjudicationPair> = to_ask
             .iter()
             .map(|(item, _)| utopia_extract::AdjudicationPair {
@@ -100,7 +105,8 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
             })
             .collect();
         let messages = utopia_extract::build_adjudication_messages(&pairs);
-        // 调用/解析失败 → 任务按退避重试；重试耗尽后行停留在队列里，人工仍可定夺
+        // A failed call or a failed parse → the job retries with backoff; once the retries
+        // are used up the row just stays in the queue, and a human can still settle it
         let _permit = settings.as_ref().map(|s| llm_util::acquire_chat(state, s));
         let _permit = match _permit {
             Some(f) => f.await,
@@ -141,7 +147,8 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
                 }
             }
         }
-        // 本轮裁决落库完毕，推给前端刷新审核队列
+        // This round's verdicts are persisted; push to the frontend so the review queue
+        // refreshes
         state.emit_review(kb_id);
     }
     Ok(())
@@ -179,7 +186,7 @@ async fn apply_verdict(
                         &reason,
                     )
                     .await?;
-                    // 决策台账：AI 自动合并（actor 为空 = 系统）
+                    // Decision ledger: an AI auto-merge (empty actor = the system)
                     let _ = utopia_store::audit::record_opt(
                         &state.pool,
                         Some(kb_id),
@@ -194,7 +201,8 @@ async fn apply_verdict(
                     )
                     .await;
                 }
-                // 同批次连锁合并可能已吞掉其中一方：转人工而不是让任务失败
+                // A chained merge in the same batch may already have swallowed one of the
+                // sides: escalate to a human rather than failing the job
                 Err(AppError::Conflict(_)) | Err(AppError::NotFound) => {
                     utopia_store::resolution::escalate_review(
                         &state.pool,

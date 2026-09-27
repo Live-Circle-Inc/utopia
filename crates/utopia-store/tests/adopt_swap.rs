@@ -1,11 +1,13 @@
-//! 采纳时的主宾对调，打在真库上。
+//! Subject/object swapping on adoption, run against a real database.
 //!
-//! `X produced_by Y` 与 `Y produces X` 是同一条边。采纳被动形时不对调，
-//! 图上就会多出一条反着的箭头，而且它跟正向那些永远合不到一起。
+//! `X produced_by Y` and `Y produces X` are the same edge. Fail to swap when adopting the passive
+//! wording and the graph grows an extra arrow pointing the other way -- one that will never join
+//! up with the forward ones.
 //!
-//! 这条只能真跑：对调发生在 `adopt` 的 INSERT 里，`cargo check` 看不见 SQL。
-//! 实测中它确实漏过——`demo-b3` 那个库里 `produced_by` 与 `produces`
-//! 各成一个关系，因为采纳路径压根没走匹配器。
+//! This one can only be tested for real: the swap happens inside `adopt`'s INSERT, and
+//! `cargo check` cannot see SQL. It really did slip through in practice -- in the `demo-b3` base,
+//! `produced_by` and `produces` each became a relation of their own, because the adoption path
+//! never went through the matcher at all.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -73,8 +75,8 @@ async fn adopting_a_passive_wording_flips_subject_and_object() -> anyhow::Result
         .bind(doc)
         .execute(&pool)
         .await?;
-    // 原文说的是 "ChatGPT produced_by OpenAI"，本体里没有这个关系，
-    // 于是这条事实**没有谓词**——兜底谓词已经不存在了
+    // the source text says "ChatGPT produced_by OpenAI", the ontology has no such relation, and
+    // so this fact has **no predicate** -- the fallback predicate no longer exists
     sqlx::query(
         "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id)
          VALUES ($1, $2, $3, NULL, $4)",
@@ -106,7 +108,7 @@ async fn adopting_a_passive_wording_flips_subject_and_object() -> anyhow::Result
         .await?
         .moved;
         assert_eq!(moved, 1);
-        // 改写后应该是 OpenAI -[produces]-> ChatGPT，**方向反过来**
+        // after the rewrite it should read OpenAI -[produces]-> ChatGPT, **direction flipped**
         let (s, o): (Uuid, Option<Uuid>) = sqlx::query_as(
             "SELECT subject_id, object_id FROM facts
              WHERE kb_id = $1 AND predicate_id = $2 AND invalidated_at IS NULL",
@@ -115,8 +117,15 @@ async fn adopting_a_passive_wording_flips_subject_and_object() -> anyhow::Result
         .bind(produces)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(s, openai, "主语该是 OpenAI（原来是宾语）");
-        assert_eq!(o, Some(chatgpt), "宾语该是 ChatGPT（原来是主语）");
+        assert_eq!(
+            s, openai,
+            "the subject should be OpenAI (it used to be the object)"
+        );
+        assert_eq!(
+            o,
+            Some(chatgpt),
+            "the object should be ChatGPT (it used to be the subject)"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;

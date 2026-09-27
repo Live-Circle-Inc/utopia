@@ -3,10 +3,12 @@ use utopia_core::models::{Role, User, Workspace};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// 注册（单租户模型）：
-/// - 部署内还没有组织 → 首个用户：创建组织 + 默认工作区，成为 owner + 系统管理员；
-/// - 已有组织 → 加入该组织，并以 viewer 进入默认（最早的）工作区；
-///   `open_registration = false` 时拒绝（仅引导首用户例外）。
+/// Registration (single-tenant model):
+/// - no organization in the deployment yet → the first user: create the organization + a
+///   default workspace, and become owner + system admin;
+/// - an organization already exists → join it and enter the default (earliest) workspace
+///   as viewer; refused when `open_registration = false` (bootstrapping the first user is
+///   the only exception).
 pub async fn register(
     pool: &PgPool,
     email: &str,
@@ -24,7 +26,7 @@ pub async fn register(
 
     let result = match existing_org {
         None => {
-            // 首个用户：引导整个部署
+            // The first user: bootstraps the whole deployment
             let org_id = Uuid::now_v7();
             sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, $2)")
                 .bind(org_id)
@@ -58,7 +60,8 @@ pub async fn register(
             let user =
                 insert_user(&mut tx, org_id, email, password_hash, display_name, false).await?;
 
-            // 加入默认（最早的）工作区；异常情况下组织没有工作区则补建一个
+            // Join the default (earliest) workspace; in the abnormal case where the
+            // organization has no workspace, create one
             let default_ws: Option<Workspace> = sqlx::query_as(
                 "SELECT * FROM workspaces WHERE org_id = $1 ORDER BY created_at LIMIT 1",
             )
@@ -134,13 +137,15 @@ async fn insert_membership(
     Ok(())
 }
 
-/// 部署的公共空间。首个用户注册即建，与组织和工作区同一个事务——不然新部署的
-/// 第一屏是个空壳：Graph 停在 Loading，切换器里无库可选，而"建第一个库"这件事
-/// 从没有人告诉过用户。
+/// The deployment's shared space. Created the moment the first user registers, in the
+/// same transaction as the organization and the workspace -- otherwise the first screen
+/// of a new deployment is an empty shell: Graph stuck on Loading, no KB to choose in the
+/// switcher, and nobody ever told the user about "create your first KB".
 ///
-/// 名字是 General 而非 Public：可见性由 visibility 字段表达，名字再说一遍既冗余，
-/// 又会让自部署用户误读成"公开到互联网"。is_default 让它永远 open、不可删
-/// （0012 的 CHECK 是 DB 级双保险）。
+/// The name is General and not Public: visibility is expressed by the visibility field,
+/// so saying it again in the name is both redundant and liable to be misread by
+/// self-hosting users as "public to the internet". is_default keeps it forever open and
+/// undeletable (the CHECK in 0012 is the DB-level belt and braces).
 async fn insert_general_kb(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workspace_id: Uuid,
@@ -157,8 +162,10 @@ async fn insert_general_kb(
     .bind("Shared space for the whole deployment. Everyone can read it.")
     .execute(&mut **tx)
     .await?;
-    // 建库者记为本库 admin，与手动建库路径一致。首个用户本就是系统管理员、
-    // 无需此行也进得来，但系统管理员身份日后可以撤销，本库权限不该随之蒸发。
+    // The creator is recorded as admin of this KB, same as the manual KB creation path.
+    // The first user is a system admin anyway and would get in without this row, but the
+    // system admin status can be revoked later on, and this KB's permission should not
+    // evaporate along with it.
     sqlx::query(
         "INSERT INTO kb_members (kb_id, user_id, role, added_by)
          VALUES ($1, $2, 'admin', $2)",
@@ -170,7 +177,8 @@ async fn insert_general_kb(
     Ok(())
 }
 
-/// 管理员代开账号：加入既有组织 + 默认工作区，部署角色由管理员指定。
+/// An admin opening an account for someone: joins the existing organization + the default
+/// workspace, with the deployment role specified by the admin.
 pub async fn admin_create_user(
     pool: &PgPool,
     email: &str,
@@ -197,11 +205,12 @@ pub async fn admin_create_user(
     Ok(user)
 }
 
-/// 按 email 找账号——**只找在职的**。
+/// Find an account by email -- **only the active ones**.
 ///
-/// 这一句 `deactivated_at IS NULL` 同时管两件事：停用的人登不进来，以及
-/// 「一个 email 在停用账号里可能重复」时不会随机返回其中一条（唯一索引
-/// 现在是部分的，只约束在职账号，见 `users.deactivated_at`）。
+/// That one `deactivated_at IS NULL` handles two things at once: deactivated people
+/// cannot log in, and when "one email may repeat across deactivated accounts" it will not
+/// return one of them at random (the unique index is partial now, constraining active
+/// accounts only, see `users.deactivated_at`).
 pub async fn find_user_by_email(pool: &PgPool, email: &str) -> AppResult<Option<User>> {
     let user = sqlx::query_as("SELECT * FROM users WHERE email = $1 AND deactivated_at IS NULL")
         .bind(email)
@@ -210,12 +219,13 @@ pub async fn find_user_by_email(pool: &PgPool, email: &str) -> AppResult<Option<
     Ok(user)
 }
 
-/// 按 id 找账号——**只找在职的**。
+/// Find an account by id -- **only the active ones**.
 ///
-/// 会话校验走这里，所以停用**立即生效**，不必等 token 过期：已经签发出去的
-/// token 下一次请求就查不到人。这是软删除唯一必须挡住的路径，其余读 users 的
-/// 地方（审计、合并日志、改类账本）**要照旧查得到**——事情是他做的，人停用了
-/// 不等于那件事没发生。
+/// Session validation goes through here, so deactivation **takes effect immediately**
+/// without waiting for a token to expire: an already-issued token finds no person on its
+/// very next request. This is the one path soft deletion has to block; every other place
+/// that reads users (audit, merge log, retype ledger) **must still find them as before**
+/// -- they did the thing, and deactivating the person does not mean it never happened.
 pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<User>> {
     let user = sqlx::query_as("SELECT * FROM users WHERE id = $1 AND deactivated_at IS NULL")
         .bind(id)
@@ -224,7 +234,7 @@ pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> AppResult<Option<User>>
     Ok(user)
 }
 
-/// 改显示名（个人资料页）。
+/// Change the display name (the profile page).
 pub async fn update_display_name(pool: &PgPool, id: Uuid, display_name: &str) -> AppResult<User> {
     sqlx::query_as("UPDATE users SET display_name = $2 WHERE id = $1 RETURNING *")
         .bind(id)
@@ -234,7 +244,8 @@ pub async fn update_display_name(pool: &PgPool, id: Uuid, display_name: &str) ->
         .ok_or(AppError::NotFound)
 }
 
-/// 改密码（server 层已验旧密并完成哈希）。
+/// Change the password (the server layer has already verified the old one and done the
+/// hashing).
 pub async fn update_password(pool: &PgPool, id: Uuid, password_hash: &str) -> AppResult<()> {
     sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
         .bind(id)
@@ -244,19 +255,23 @@ pub async fn update_password(pool: &PgPool, id: Uuid, password_hash: &str) -> Ap
     Ok(())
 }
 
-/// 停用一个账号（软删除，见 `users.deactivated_at`）。
+/// Deactivate an account (soft delete, see `users.deactivated_at`).
 ///
-/// **不删行。** 审计事件、合并日志、改类账本、口径确认的 `actor_id` 都指着这个人，
-/// 而那些是审计材料——人走了仍然要能回答「当时是谁做的」。停用只断访问。
+/// **The row is not deleted.** The `actor_id` of audit events, the merge log, the retype
+/// ledger and mapping confirmations all point at this person, and those are audit
+/// material -- once the person is gone it must still be possible to answer "who did it at
+/// the time". Deactivation only cuts off access.
 ///
-/// **不能停用自己**：管理员把自己停掉之后就没人能把他放回来了（这个系统没有
-/// 「超级管理员」这一层）。挡在这里而不是只挡在界面上——界面挡得住误点，
-/// 挡不住直接调接口。
+/// **You cannot deactivate yourself**: once an admin has switched themselves off, nobody
+/// can put them back (this system has no "super admin" tier above it). Blocked here and
+/// not only in the interface -- the interface can stop a misclick, it cannot stop someone
+/// calling the endpoint directly.
 ///
-/// **最后一个管理员不能停用**：否则这个组织从此没人能管成员。同样的理由。
+/// **The last admin cannot be deactivated**: otherwise nobody in this organization can
+/// manage members from then on. Same reasoning.
 pub async fn deactivate_user(pool: &PgPool, target: Uuid, actor: Uuid) -> AppResult<()> {
     if target == actor {
-        return Err(AppError::Validation("不能停用自己的账号".into()));
+        return Err(AppError::Validation("cannot deactivate yourself".into()));
     }
     let mut tx = pool.begin().await?;
     let victim: Option<(bool, Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
@@ -269,7 +284,8 @@ pub async fn deactivate_user(pool: &PgPool, target: Uuid, actor: Uuid) -> AppRes
         return Err(AppError::NotFound);
     };
     if already.is_some() {
-        // 幂等：重复停用不是错误，也不该把 deactivated_by 改成第二个人
+        // Idempotent: deactivating twice is not an error, and must not rewrite
+        // deactivated_by to the second person
         tx.rollback().await?;
         return Ok(());
     }
@@ -285,7 +301,7 @@ pub async fn deactivate_user(pool: &PgPool, target: Uuid, actor: Uuid) -> AppRes
         if others == 0 {
             tx.rollback().await?;
             return Err(AppError::Validation(
-                "这是组织里最后一个管理员，停用之后没人能管成员".into(),
+                "this is the last admin in the organization; deactivate them and nobody can manage members".into(),
             ));
         }
     }
@@ -298,11 +314,12 @@ pub async fn deactivate_user(pool: &PgPool, target: Uuid, actor: Uuid) -> AppRes
     Ok(())
 }
 
-/// 把停用的账号放回来。
+/// Put a deactivated account back.
 ///
-/// **可能失败,而且失败得有道理**：停用期间有人用同一个 email 建了新账号，
-/// 那个部分唯一索引会挡住这次恢复。这时该做的是让管理员看见冲突，而不是
-/// 悄悄让两个在职账号共用一个 email。
+/// **It can fail, and failing is right**: if someone created a new account with the same
+/// email while this one was deactivated, that partial unique index blocks the restore.
+/// What to do then is to let the admin see the conflict, not to quietly let two active
+/// accounts share one email.
 pub async fn reactivate_user(pool: &PgPool, target: Uuid) -> AppResult<()> {
     let res = sqlx::query(
         "UPDATE users SET deactivated_at = NULL, deactivated_by = NULL

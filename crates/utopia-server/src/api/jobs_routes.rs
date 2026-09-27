@@ -1,9 +1,12 @@
-//! 失败任务回队列（#216）。
+//! Putting failed jobs back on the queue (#216).
 //!
-//! 一个失败任务原本只能通过它属的对象再跑：文档能重抽、来源能重同步；`bootstrap_ontology`、
-//! `adjudicate_entities` 这些没有对象可点。余额耗尽（#201 让它第一次就 failed）一批文档
-//! 全停，充值之后要逐个点。这里给两个入口：库内（Editor）与全局（管理员），范围可按
-//! 种类与失败时间收窄——告警上的「再跑一遍」传的就是那次故障的时间窗。
+//! A failed job used to be re-runnable only through the object it belongs to: a document can be
+//! re-extracted, a source can be re-synced; the likes of `bootstrap_ontology` and
+//! `adjudicate_entities` have no object to click on. When the credit runs out (#201 makes them
+//! fail on the very first attempt) a whole batch of documents stops, and after topping up you
+//! have to click them one by one. This gives two entry points: per-KB (Editor) and global
+//! (admin), with the scope narrowable by kind and by failure time -- the "run it again" on an
+//! alert passes exactly the time window of that incident.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -22,7 +25,7 @@ use crate::state::AppState;
 pub struct RequeueBody {
     #[serde(default)]
     pub kind: Option<String>,
-    /// 只排这个时刻之后失败的
+    /// Only requeue the ones that failed after this instant
     #[serde(default)]
     pub failed_since: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -66,7 +69,8 @@ pub async fn requeue_in_kb(
     Ok(Json(json!({ "requeued": requeued })))
 }
 
-/// 全局重排：系统级告警（没有库的）从这里走。只给管理员——它碰的是所有库的任务
+/// Global requeue: system-level alerts (the ones with no KB) come through here. Admins only --
+/// it touches the jobs of every KB
 pub async fn requeue_all(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

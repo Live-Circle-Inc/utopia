@@ -5,9 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# **显式只读。** 没有这一块时它继承仓库级默认，而那个默认要为
-# star-history 改成读写——CI 是每次推送、每个 PR 都跑的那个 workflow，
-# 不该因为别处的需要顺带拿到写权限。写在这里，仓库默认怎么变都与它无关
+# **Explicitly read-only.** Without this block it inherits the repository-level default, and that
+# default has to be switched to read-write for star-history -- CI is the workflow that runs on
+# every push and every PR, and it should not pick up write permission on the side because
+# something elsewhere needs it. Written down here, it is unaffected by whatever the repository
+# default becomes
 permissions:
   contents: read
 
@@ -32,9 +34,10 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
-  # 迁移得真的在库上跑一遍。此前 CI 只有 fmt/clippy/test/build，于是两个 PR
-  # 各带一个 0025、各自通过，合进 main 之后服务直接起不来——sqlx 按版本号索引，
-  # 而**合并后的状态从来没有被任何一次 CI 跑过**。
+  # Migrations have to be run against a real database. CI used to be only fmt/clippy/test/build,
+  # so two PRs each carrying a 0025 passed on their own, and once merged into main the service
+  # simply would not start -- sqlx indexes by version number, and **the merged state had never
+  # been run by any CI job at all**.
   migrations:
     runs-on: ubuntu-latest
     services:
@@ -50,38 +53,41 @@ jobs:
           --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      # 撞号在文件层面不是冲突，git 合得干干净净——只能显式查
-      - name: 版本号不得重复
+      # A duplicate number is not a conflict at the file level, git merges it perfectly cleanly
+      # -- so the only way is to check for it explicitly
+      - name: Migration versions must not repeat
         run: |
           dupes=$(ls migrations/ | cut -d_ -f1 | sort | uniq -d)
           if [ -n "$dupes" ]; then
-            echo "::error::迁移版本号重复：$dupes"
+            echo "::error::duplicate migration version numbers: $dupes"
             ls migrations/
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: 装 sqlx-cli
+      - name: Install sqlx-cli
         run: cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
-      - name: 全新库上跑一遍
+      - name: Run once against a fresh database
         run: sqlx migrate run --database-url postgres://utopia:utopia@localhost:5432/utopia
-      # 第二遍必须也过：迁移改号后要能在已经跑过旧号的库上安全重放
-      - name: 再跑一遍
+      # The second pass has to pass too: after a migration is renumbered it must replay safely
+      # on a database that already ran the old number
+      - name: Run it again
         run: sqlx migrate run --database-url postgres://utopia:utopia@localhost:5432/utopia
-      # 连库的测试只有这个 job 跑得动——rust job 没有数据库，那些测试在那边
-      # 会跳过并显示绿色。不在这里跑一遍，等于写了测试却永远没执行过，
-      # 比没写更糟：它会让人以为 SQL 有覆盖
-      # 整套 store 集成测试都在这里跑，而且**没有库就失败**（UTOPIA_TEST_REQUIRE_DB）：
-      # 从前只跑 graph_changes，其余二十几个在没有库的 backend job 里静默跳过，
-      # 绿色是假的（#248）
-      - name: 连库测试
+      # This is the only job that can run the tests that need a database -- the rust job has no
+      # database, so over there those tests skip and show green. Not running them here means
+      # tests that were written but never once executed, which is worse than not writing them:
+      # it makes people believe the SQL is covered
+      # The whole store integration suite runs here, and **fails when there is no database**
+      # (UTOPIA_TEST_REQUIRE_DB): only graph_changes used to run, while the other twenty-odd
+      # skipped silently in the database-less backend job, and the green was a lie (#248)
+      - name: Tests against a database
         run: |
           set -o pipefail
           cargo test -p utopia-store 2>&1 | tee store-tests.log
         env:
           UTOPIA_DATABASE_URL: postgres://utopia:utopia@localhost:5432/utopia
           UTOPIA_TEST_REQUIRE_DB: "1"
-      - name: 摘要
+      - name: Summary
         if: always()
         run: |
           passed=$(grep -o '[0-9]* passed' store-tests.log | awk '{s+=$1} END {print s+0}')
@@ -95,10 +101,12 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
-      # 版本来自 web/package.json 的 packageManager 字段——这里再写一次
-      # 就成了第二个事实来源，两边迟早分叉（镜像构建就是这么炸的）。
-      # package_json_file 必须显式给：上面的 working-directory 只管 run 步骤，
-      # 这个 action 默认在仓库根找 package.json，而根目录是 Cargo workspace。
+      # The version comes from the packageManager field of web/package.json -- writing it out
+      # again here would make a second source of truth, and the two would diverge sooner or
+      # later (that is exactly how the image build blew up).
+      # package_json_file has to be given explicitly: the working-directory above only governs
+      # run steps, and this action looks for package.json in the repository root by default,
+      # while the root is the Cargo workspace.
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: web/package.json
@@ -109,5 +117,5 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Install
         run: pnpm install --frozen-lockfile
-      - name: Build (含类型检查)
+      - name: Build (includes type checking)
         run: pnpm build

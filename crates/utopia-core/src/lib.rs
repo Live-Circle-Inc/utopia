@@ -1,4 +1,4 @@
-//! utopia-core: 领域模型、错误类型与配置。
+//! utopia-core: the domain model, error types, and configuration.
 
 pub mod config;
 pub mod error;
