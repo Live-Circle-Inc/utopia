@@ -1,56 +1,60 @@
--- 公理违规：一致性检查（0002 R0）查出来的矛盾。
+-- Axiom violations: the contradictions the consistency check (0002 R0) turns up.
 --
--- **不复用 `fact_conflicts`**，尽管两者都是「两条事实打架，等人裁决」。理由是
--- 裁决动作根本不同：
+-- **Deliberately not reusing `fact_conflicts`**, even though both are "two facts fighting,
+-- waiting for a human to rule". The reason is that the ruling itself is a different act:
 --
---   fact_conflicts    时态冲突，问的是「哪条对」
---                     → closed / kept_both / rejected_new，三个答案都在改事实
---   axiom_violations  公理违规，问的是「错在数据还是错在定义」
---                     → 撤事实，或者去改本体那条公理
+--   fact_conflicts    temporal conflict, asking "which one is right"
+--                     → closed / kept_both / rejected_new, all three answers change facts
+--   axiom_violations  axiom violation, asking "is the data wrong or the definition"
+--                     → retract the fact, or go change that axiom in the ontology
 --
--- 后者那条出路是本质的。用户导一份 FOAF 进来，里面某个属性声明成反对称，而他
--- 自己的语料里那关系其实双向——这时该改的是本体，不是二十条事实。硬塞进一张表，
--- `resolution` 那一列就要同时表达两套语义，而读它的代码得先看 `reason` 才知道
--- 该怎么解释 `resolution`。
+-- That second way out is essential. A user imports a FOAF file in which some property is
+-- declared asymmetric, while in their own corpus that relation really is bidirectional -- what
+-- should change then is the ontology, not twenty facts. Force both into one table and the
+-- `resolution` column has to express two sets of semantics at once, while the code reading it
+-- has to look at `reason` first to know how to interpret `resolution`.
 --
--- 形状也对不上：`fact_conflicts` 假设冲突总是「新的顶掉旧的」（old/new 两列），
--- 而自反违规只有**一条**事实（它自己跟自己矛盾），环是**一串**。
+-- The shape does not match either: `fact_conflicts` assumes a conflict is always "the new one
+-- displaces the old" (an old/new column pair), while a reflexivity violation has only **one**
+-- fact (it contradicts itself), and a cycle is a **chain**.
 
 CREATE TABLE axiom_violations (
     id         UUID PRIMARY KEY,
     kb_id      UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    -- self_loop  自反：一条事实的主宾相同，而谓词声明了 Irreflexive
-    -- asymmetry  反对称：A→B 与 B→A 并存
-    -- cycle      传递环：A→B→C→A，谓词同时是 Transitive 与 Asymmetric
-    -- functional 基数：该唯一的主语侧（或宾语侧）出现了两个值
+    -- self_loop  reflexive: subject and object are the same, predicate declares Irreflexive
+    -- asymmetry  asymmetric: A→B and B→A coexist
+    -- cycle      transitive cycle: A→B→C→A, predicate is both Transitive and Asymmetric
+    -- functional cardinality: two values on a side (subject or object) that must be unique
     kind       TEXT NOT NULL
                CHECK (kind IN ('self_loop', 'asymmetry', 'cycle', 'functional')),
-    -- 涉及的两条事实。**自反那类两列相同**——一条事实跟自己矛盾，不需要第二条；
-    -- 环取首尾，中间的在 path 里
+    -- The two facts involved. **Both columns are identical for the reflexive kind** -- a fact
+    -- contradicts itself, no second fact needed; a cycle takes head and tail, the rest in path
     left_fact  UUID NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
     right_fact UUID NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
-    -- 环的完整路径，按事实排列；其余三类为空。
-    -- 留着是因为「A→B→C→A」比「A 与 C 矛盾」有用得多——人要顺着看一遍才知道
-    -- 该撤哪一条。
+    -- The full path of the cycle, ordered by fact; empty for the other three kinds.
+    -- Kept because "A→B→C→A" is far more useful than "A contradicts C" -- a human has to walk
+    -- it once to know which one to retract.
     --
-    -- 裸 UUID 数组而不是关联表：它是一条**证据**（当时那个环长这样），不是一组
-    -- 需要被查询的关系。没有「哪些环经过这条事实」这种查法
+    -- A bare UUID array rather than a join table: it is a piece of **evidence** (that cycle
+    -- looked like this at the time), not a set of relations that needs querying. There is no
+    -- "which cycles pass through this fact" kind of query
     path       UUID[] NOT NULL DEFAULT '{}',
     status     TEXT NOT NULL DEFAULT 'open'
                CHECK (status IN ('open', 'resolved')),
-    -- fact_retracted 判数据错，撤了事实
-    -- axiom_relaxed  判定义错，去本体里改了那条公理
-    -- accepted       两边都对，人认可这种并存（下一轮不再报）
+    -- fact_retracted the data was judged wrong, the fact was retracted
+    -- axiom_relaxed  the definition was judged wrong, that axiom was changed in the ontology
+    -- accepted       both sides are right, a human accepts the coexistence (not reported again)
     resolution TEXT CHECK (resolution IN ('fact_retracted', 'axiom_relaxed', 'accepted')),
     decided_by UUID REFERENCES users(id),
     decided_at TIMESTAMPTZ,
     detected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    -- 同一处矛盾重跑不重复入库。检查是确定性的（环按事实 id 排序去重），
-    -- 所以同一个环每次算出来的首尾都是同一对
+    -- Re-running does not insert the same contradiction twice. The check is deterministic
+    -- (cycles are deduplicated by sorting on fact id), so the same cycle yields the same
+    -- head/tail pair every time
     UNIQUE (kb_id, kind, left_fact, right_fact)
 );
 
--- Review 页只捞待表态的
+-- The Review page only fetches the ones awaiting a verdict
 CREATE INDEX axiom_violations_open_idx ON axiom_violations (kb_id, detected_at DESC)
     WHERE status = 'open';

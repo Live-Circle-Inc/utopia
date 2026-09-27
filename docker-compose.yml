@@ -1,25 +1,32 @@
 services:
   db:
-    # 拉不动 Docker Hub 时可用 UTOPIA_DB_IMAGE 覆盖为任何带 pgvector 的 PG16+ 镜像
+    # When Docker Hub will not pull, UTOPIA_DB_IMAGE can override this with any PG16+ image
+    # that has pgvector
     image: ${UTOPIA_DB_IMAGE:-pgvector/pgvector:pg16}
     environment:
       POSTGRES_USER: utopia
       POSTGRES_PASSWORD: ${UTOPIA_DB_PASSWORD:-utopia}
       POSTGRES_DB: utopia
-      # 应用运行时用的受限角色口令。设了才建角色，不设则应用仍以 owner 身份跑。
+      # Password of the restricted role the application runs as. The role is only created if
+      # this is set; if it is not, the application still runs as the owner.
       UTOPIA_APP_DB_PASSWORD: ${UTOPIA_APP_DB_PASSWORD:-}
     ports:
-      # 宿主机侧避开 5432：开发机上常有本地装的 PG 占着那个端口，撞上就是
-      # 起不来。而且撞端口的人恰恰用不了自己那个 PG——它多半没有 pgvector。
-      # 容器内仍是 5432（PG 标准，app 走 compose 网络连的就是它）。
+      # Avoid 5432 on the host side: a dev machine often has a locally installed PG holding
+      # that port, and a clash simply means it will not start. And the person who hits the clash
+      # is exactly the one who cannot use their own PG -- it most likely has no pgvector.
+      # Inside the container it is still 5432 (the PG standard, and what app connects to over
+      # the compose network).
       #
-      # 只绑回环：这个映射纯粹是给本地开发用的（cargo run 时从宿主机连），
-      # 绑 0.0.0.0 等于把一个默认口令的数据库挂到公网。
+      # Loopback only: this mapping is purely for local development (connecting from the host
+      # during cargo run), and binding 0.0.0.0 amounts to hanging a database with a default
+      # password onto the public internet.
       - "${UTOPIA_DB_BIND:-127.0.0.1:1517}:5432"
     volumes:
       - dbdata:/var/lib/postgresql/data
-      # 首次初始化时建受限角色；数据目录已存在的部署不会执行，需手动建一次
-      # （见 README 的升级说明）。权限由迁移 0031 授予，不在这里给。
+      # Creates the restricted role on first initialization; for a deployment whose data
+      # directory already exists this does not run, and the role has to be created by hand once
+      # (see the upgrade notes in the README). Privileges are granted by migration 0031, not
+      # here.
       - ./docker/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U utopia -d utopia"]
@@ -53,25 +60,31 @@ services:
     pull_policy: build
     profiles: ["app"]
     environment:
-      # 默认以 owner 身份运行。要启用受限角色（业务表随便读写、台账只增不改），
-      # 在 .env 里同时给出这两条——见 .env.example。分开写而不做条件拼接，
-      # 是因为那种嵌套替换没人读得懂，出错了也查不出来。
+      # Runs as the owner by default. To enable the restricted role (business tables read and
+      # written freely, the ledger append-only), give both of these in .env -- see .env.example.
+      # They are written out separately rather than spliced together conditionally, because
+      # nobody can read that kind of nested substitution and you cannot track down what went
+      # wrong when it breaks.
       UTOPIA_DATABASE_URL: ${UTOPIA_DATABASE_URL:-postgres://utopia:${UTOPIA_DB_PASSWORD:-utopia}@db:5432/utopia}
       UTOPIA_MIGRATION_URL: ${UTOPIA_MIGRATION_URL:-}
       UTOPIA_BIND_ADDR: 0.0.0.0:1516
-      # 留空：首次启动自动生成一条存进 deployment_settings。这里若给缺省值，
-      # 自动生成就永远走不到，所有部署又会共用同一个人人皆知的密钥。
+      # Leave it empty: the first startup generates one automatically and stores it in
+      # deployment_settings. If a default were given here, the automatic generation would never
+      # be reached, and every deployment would again share one key that everybody knows.
       UTOPIA_JWT_SECRET: ${UTOPIA_JWT_SECRET:-}
       UTOPIA_WEB_DIST: /app/web-dist
       UTOPIA_DATA_DIR: /app/data
-      # 连接池上限。缺省 32，与 worker 并发的缺省对齐；池子小于并发时症状是
-      # 请求变慢而不是报错说池子不够，所以调并发时别忘了它。
-      # 上调前先确认 Postgres 的 max_connections（默认 100）容得下。
+      # Upper bound of the connection pool. Defaults to 32, aligned with the default worker
+      # concurrency; when the pool is smaller than the concurrency the symptom is requests
+      # getting slower rather than an error saying the pool is too small, so do not forget it
+      # when you change the concurrency.
+      # Before raising it, check that Postgres's max_connections (100 by default) can take it.
       UTOPIA_DB_MAX_CONNECTIONS: ${UTOPIA_DB_MAX_CONNECTIONS:-32}
     volumes:
-      # 原始文件（files/）与全文索引（index/）。不挂出来的话，容器一重建
-      # 它们就没了，而库里的 documents 记录还在——引用全断且不报错。
-      # 备份 = 这个目录 + 数据库。
+      # The original files (files/) and the full-text index (index/). Without mounting them
+      # out, they are gone the moment the container is rebuilt, while the documents rows in the
+      # database are still there -- every reference broken, and no error reported.
+      # Backup = this directory + the database.
       - ./data:/app/data
     ports:
       - "1516:1516"

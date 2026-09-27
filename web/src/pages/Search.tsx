@@ -12,14 +12,16 @@ export function Search() {
   const kbId = useKbId();
   const { kb } = useKb();
   const navigate = useNavigate();
-  /* 已提交的查询词以 URL 为唯一事实来源（同 review 的 queue、doc 的 chunk）：
-     刷新、返回、分享链接都从地址栏重建，结果由 useQuery 自动重取 */
+  /* The URL is the single source of truth for the submitted query term (same as review's queue
+     and doc's chunk): refresh, back and a shared link all rebuild from the address bar, and
+     useQuery refetches the results automatically */
   const { q: query } = useSearch({ from: "/app/kb/$kbId/search" });
-  // 打字是本地事，不打扰地址栏；前进/后退到别的 q 时输入框跟着走
+  // Typing is a local matter and does not disturb the address bar; on forward/back to a different
+  // q the input box follows along
   const [input, setInput] = useState(query ?? "");
   useEffect(() => setInput(query ?? ""), [query]);
   const [page, setPage] = useState(0);
-  // 新查询换一批结果，从第一页看起
+  // A new query means a new batch of results, so start from the first page
   useEffect(() => setPage(0), [query]);
 
   const results = useQuery({
@@ -28,8 +30,9 @@ export function Search() {
     enabled: !!kb && !!query,
   });
 
-  /* 提交 = 换地址，不是换 state：地址栏才是已提交查询词的唯一事实源。
-     打字不写 URL，提交才写；空提交不动 */
+  /* Submitting = changing the address, not changing state: the address bar is what holds the one
+     truth about the submitted query term. Typing does not write the URL, only submitting does; an
+     empty submit does nothing */
   const submit = () => {
     const q = input.trim();
     if (!q) return;

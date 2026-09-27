@@ -1,7 +1,8 @@
-/* 实体的认知变更历史（记录时间轴）。
-   与同面板的 Timeline 视图正交：那条轴问"这件事在现实里何时成立"，这条轴问
-   "我们何时这么认为、又何时改了主意"。数据来自 append-only 账本里那些被
-   entity_detail 用 invalidated_at IS NULL 滤掉的行。 */
+/* The history of what we believed about an entity (the record timeline).
+   Orthogonal to the Timeline view in the same panel: that axis asks "when was this true in
+   the real world", this one asks "when did we come to think so, and when did we change our
+   mind". The data comes from the rows in the append-only ledger that entity_detail filters
+   out with invalidated_at IS NULL. */
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
@@ -13,14 +14,15 @@ import { Pager } from "../ui";
 
 const PER = 20;
 
-/** 事件类型 → 图标与色调（语义色只给"被推翻"，其余保持中性） */
+/** Event kind → icon and tone (semantic colour is reserved for "overturned", the rest stay
+ *  neutral) */
 const KIND_ICON = {
   asserted: FileText,
   corrected: PencilLine,
   rejected: Undo2,
-  // 并入不是撤回：内容一字未少地进了另一条断言
+  // A merge is not a retraction: the content went into another assertion without losing a word
   merged: Merge,
-  // 改类不是事实变更：图上的节点换了个类，事实一条没动
+  // A retype is not a change of fact: the node on the graph changed class, not one fact moved
   retyped: Tag,
   retype_reverted: Undo2,
 } as const;
@@ -34,16 +36,19 @@ const KIND_TONE: Record<string, string> = {
   retype_reverted: "text-[var(--u-warn)]",
 };
 
-/* 这两个函数**故意不一样**，别"统一一下"——它们渲染的是两种时间。
+/* These two functions are **deliberately different**, do not "unify" them -- they render two
+   different kinds of time.
 
-   `ymd` 给的是**记录时刻**（我们何时这么认为）：那是一个真实时刻，
-   该按看的人所在的时区显示。从前这里也是切 ISO 字符串，等于按 UTC 显示——
-   UTC+8 的人在早上八点前做的修订，历史里会显示成前一天。
+   `ymd` gives the **record instant** (when we came to think so): that is a real instant, and
+   it should be displayed in the timezone of whoever is looking. This used to slice the ISO
+   string here too, which amounts to displaying in UTC -- a revision made by someone at UTC+8
+   before eight in the morning would show up in the history as the previous day.
 
-   `ym` 给的是**世界时间**（这件事何时成立）：它来自文档里的陈述
-   （"2019 年 5 月就任"），是**日历日期不是时刻**，本来就没有时区。
-   切 ISO 字符串正是按 UTC 读回存进去的那一天；转成本地反而会让
-   UTC-5 的读者看到前一个月。 */
+   `ym` gives **world time** (when this was true): it comes from a statement in a document
+   ("took office in May 2019"), it is a **calendar date, not an instant**, and it never had a
+   timezone to begin with. Slicing the ISO string is exactly reading back, in UTC, the day
+   that was stored; converting to local time would instead make a reader at UTC-5 see the
+   previous month. */
 const ymd = (iso: string) => {
   const d = new Date(iso);
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -52,7 +57,8 @@ const ymd = (iso: string) => {
 };
 const ym = (iso: string | null) => (iso ? iso.slice(0, 7) : null);
 
-/** 宾语：实体名优先，其次字面值（属性事实）的摘要/值 */
+/** The object: entity name first, otherwise the summary/value of the literal (an attribute
+ *  fact) */
 function objectText(e: EntityHistoryEvent): string {
   if (e.other_name) return e.other_name;
   const v = e.object_value as { summary?: unknown; value?: unknown } | null;
@@ -60,7 +66,8 @@ function objectText(e: EntityHistoryEvent): string {
   return raw === undefined || raw === null ? "—" : String(raw);
 }
 
-/** 这次变更对有效区间做了什么（记录轴上的事件，改的是有效轴上的边界） */
+/** What this change did to the validity interval (an event on the record-time axis, changing a
+ *  boundary on the validity axis) */
 function intervalNote(e: EntityHistoryEvent): string | null {
   if (e.kind === "corrected") {
     return e.valid_to ? S.graph.historyClosedAt(ym(e.valid_to)!) : null;
@@ -86,8 +93,9 @@ function EventRow({ e }: { e: EntityHistoryEvent }) {
           </span>
           {note && <span className="u-num text-[11px] text-neutral-500">{note}</span>}
         </div>
-        {/* 改类事件没有谓词也没有宾语，正文换成类的两端。
-            起点为空 = 从「未分类」改过来，0009 之后最常见的一种 */}
+        {/* A retype event has neither predicate nor object, so the body becomes the two ends
+            of the class change. An empty start = retyped from "untyped", the most common
+            kind after 0009 */}
         {e.kind === "retyped" || e.kind === "retype_reverted" ? (
           <div className="mt-0.5 text-[12.5px] text-neutral-400 truncate">
             <span className="text-neutral-500">
@@ -110,7 +118,8 @@ function EventRow({ e }: { e: EntityHistoryEvent }) {
         <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-neutral-600">
           <span className="u-num">{ymd(e.at)}</span>
           <span>·</span>
-          {/* 归因：人名，或引擎（抽取写入 / 时态对账自动闭合） */}
+          {/* Attribution: a person's name, or the engine (written by extraction / closed
+              automatically by temporal reconciliation) */}
           <span>{e.actor_name ?? S.graph.historyEngine}</span>
           {e.filename && e.document_id && (
             <>
@@ -142,15 +151,16 @@ export function EntityHistory({ kbId, entityId }: { kbId: string; entityId: stri
 
   const total = q.data?.total ?? 0;
   if (q.isPending) return <p className="p-2 text-sm text-neutral-500">{S.nav.loading}</p>;
-  // 只有"一条都没有"才是空。记录轴上首次断言本身就是一次事件——
-  // "我们何时、从哪份文档得知这件事"是这条轴要回答的问题的一半
+  // Only "not a single one" counts as empty. On the record-time axis the first assertion is itself
+  // an event -- "when, and from which document, did we learn this" is half of what this axis
+  // is there to answer
   if (total === 0) return <p className="p-2 text-xs text-neutral-500">{S.graph.historyEmpty}</p>;
 
   return (
     <div>
       <p className="px-2 pb-1.5 text-[11px] text-neutral-600">{S.graph.historyHint}</p>
       <div className="divide-y divide-white/[0.06]">
-        {/* key 里用 fact_id ?? at：改类事件没有 fact_id */}
+        {/* fact_id ?? at in the key: a retype event has no fact_id */}
         {(q.data?.events ?? []).map((e) => (
           <EventRow key={`${e.fact_id ?? e.at}-${e.kind}`} e={e} />
         ))}

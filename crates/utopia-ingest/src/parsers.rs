@@ -1,11 +1,13 @@
-//! 各格式解析器。全部输出纯文本（结构用 markdown 风格标题保留）。
+//! The per-format parsers. All of them output plain text (structure is kept as markdown-style
+//! headings).
 
 use anyhow::Context;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::io::{Cursor, Read};
 
-/// 文本解码：chardetng 探测编码（覆盖 GBK/GB18030/BIG5 等中文常见编码）。
+/// Text decoding: chardetng detects the encoding (covering GBK/GB18030/BIG5 and the other
+/// encodings common for Chinese).
 pub fn plain_text(bytes: &[u8]) -> String {
     use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
@@ -19,13 +21,13 @@ pub fn pdf(bytes: &[u8]) -> anyhow::Result<String> {
     pdf_extract::extract_text_from_mem(bytes).context("PDF text-layer extraction failed")
 }
 
-/// docx: 解压 word/document.xml，取 w:t 文本、w:p 分段。
+/// docx: unzip word/document.xml, take the w:t text and split paragraphs on w:p.
 pub fn docx(bytes: &[u8]) -> anyhow::Result<String> {
     let xml = read_zip_entry(bytes, "word/document.xml").context("Malformed docx structure")?;
     extract_xml_text(&xml, "w:t", "w:p")
 }
 
-/// pptx: 按页码顺序解析 ppt/slides/slideN.xml，取 a:t 文本。
+/// pptx: parse ppt/slides/slideN.xml in slide-number order, take the a:t text.
 pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes.to_vec())).context("Failed to unzip pptx")?;
@@ -49,13 +51,14 @@ pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
         entry.read_to_string(&mut xml)?;
         let text = extract_xml_text(&xml, "a:t", "a:p")?;
         if !text.trim().is_empty() {
-            out.push_str(&format!("\n## 第 {num} 页\n{text}\n"));
+            out.push_str(&format!("\n## Page {num}\n{text}\n"));
         }
     }
     Ok(out)
 }
 
-/// xlsx / xls / ods: calamine 全格式读取，每 sheet 输出制表符表格（限前 2000 行）。
+/// xlsx / xls / ods: read every one of those formats through calamine, emitting a
+/// tab-separated table per sheet (first 2000 rows only).
 pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
     use calamine::{Data, Reader as _};
     let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
@@ -68,7 +71,7 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
         if range.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n# 工作表: {sheet_name}\n"));
+        out.push_str(&format!("\n# Sheet: {sheet_name}\n"));
         for row in range.rows().take(2000) {
             let line: Vec<String> = row
                 .iter()
@@ -86,15 +89,18 @@ pub fn spreadsheet(bytes: &[u8]) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// HTML: 取正文文本。
+/// HTML: take the body text.
 ///
-/// 真实网页的 chrome 往往比正文还多——整站导航、语言列表、页脚法务、编辑工具。
-/// 全量遍历会把它们一并喂给抽取器：既浪费每个分块一次 LLM 调用，又会把
-/// "Main page""Privacy policy"之类抽成实体污染图谱（实测一篇维基条目 647KB
-/// 产出 60 个分块，首块整块是侧栏菜单、末块整块是版权声明）。
+/// On a real web page the chrome is often bigger than the body -- site-wide navigation,
+/// language lists, footer legalese, editing tools. Walking all of it feeds every bit of that to
+/// the extractor: it both wastes one LLM call per chunk and pulls things like "Main page" and
+/// "Privacy policy" out as entities that pollute the graph (measured: one 647KB Wikipedia
+/// article produced 60 chunks, the first of which was entirely the sidebar menu and the last
+/// entirely the copyright notice).
 ///
-/// 因此先认正文容器（main / role=main / article），只有都找不到才退回整篇；
-/// 容器内仍可能嵌着导航与表单，交给 walk_html 的 SKIP 名单。
+/// So recognise the body container first (main / role=main / article), and only fall back to
+/// the whole page when none of them is found; navigation and forms can still be nested inside
+/// the container, which is what walk_html's SKIP list is for.
 pub fn html(bytes: &[u8]) -> String {
     let raw = plain_text(bytes);
     let doc = scraper::Html::parse_document(&raw);
@@ -121,7 +127,8 @@ pub fn html(bytes: &[u8]) -> String {
 }
 
 fn walk_html(el: scraper::ElementRef, out: &mut String) {
-    // 导航/页眉页脚/边栏/表单控件即便落在正文容器内也是 chrome，一律跳过
+    // Navigation, header/footer, sidebars and form controls are chrome even when they sit
+    // inside the body container -- always skip them
     const SKIP: &[&str] = &[
         "script", "style", "noscript", "head", "svg", "template", "nav", "header", "footer",
         "aside", "form", "button", "select", "iframe", "dialog",
@@ -167,7 +174,7 @@ pub fn csv_text(bytes: &[u8], tsv: bool) -> anyhow::Result<String> {
     Ok(out)
 }
 
-// ---- 工具 ----
+// ---- Helpers ----
 
 fn read_zip_entry(bytes: &[u8], name: &str) -> anyhow::Result<String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes.to_vec()))?;
@@ -177,7 +184,8 @@ fn read_zip_entry(bytes: &[u8], name: &str) -> anyhow::Result<String> {
     Ok(content)
 }
 
-/// 从 OOXML 里抽取 `text_tag`（如 w:t）内的文本，遇 `para_tag`（如 w:p）结束换行。
+/// Extract the text inside `text_tag` (w:t, say) out of OOXML, breaking a line when
+/// `para_tag` (w:p, say) ends.
 fn extract_xml_text(xml: &str, text_tag: &str, para_tag: &str) -> anyhow::Result<String> {
     let mut reader = Reader::from_str(xml);
     let mut out = String::new();

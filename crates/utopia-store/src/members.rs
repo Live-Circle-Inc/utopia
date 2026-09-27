@@ -7,8 +7,9 @@ pub async fn list(pool: &PgPool, workspace_id: Uuid) -> AppResult<Vec<MemberView
     let rows = sqlx::query_as(
         "SELECT m.user_id, u.email, u.display_name, m.role, u.is_admin
          FROM memberships m JOIN users u ON u.id = m.user_id
-         -- 停用的人不再出现在成员列表里（见 `users.deactivated_at`）。成员关系那一行留着——
-         -- 恢复账号时不必重新加回每一个工作区
+         -- A deactivated person no longer appears in the member list (see
+         -- `users.deactivated_at`). The membership row itself stays -- restoring an account
+         -- should not mean adding them back to every single workspace
          WHERE m.workspace_id = $1 AND u.deactivated_at IS NULL
          ORDER BY m.created_at",
     )
@@ -18,7 +19,7 @@ pub async fn list(pool: &PgPool, workspace_id: Uuid) -> AppResult<Vec<MemberView
     Ok(rows)
 }
 
-/// 部署内全部用户（添加成员的选人器）。
+/// Every user in the deployment (the people picker for adding a member).
 pub async fn org_users(pool: &PgPool, org_id: Uuid) -> AppResult<Vec<OrgUser>> {
     let rows = sqlx::query_as(
         "SELECT id, email, display_name, is_admin FROM users
@@ -48,16 +49,17 @@ pub async fn current_role(
     crate::workspaces::role_of(pool, user_id, workspace_id).await
 }
 
-/// 设置/添加成员角色（upsert）。防呆逻辑在 API 层。
+/// Set/add a member's role (upsert). The foolproofing logic lives in the API layer.
 pub async fn set_role(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
     role: Role,
 ) -> AppResult<()> {
-    // 目标用户必须存在于本组织,**而且在职**——否则能把一个已停用的账号
-    // 加进工作区,它在成员列表里又看不见（那条查询过滤了停用的）,
-    // 于是成了一条谁也发现不了的授权
+    // The target user must exist in this org, **and must still be active** -- otherwise a
+    // deactivated account could be added to a workspace while staying invisible in the
+    // member list (that query filters the deactivated ones out), which makes it a grant that
+    // nobody will ever find
     let exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE id = $1 AND deactivated_at IS NULL")
             .bind(user_id)
@@ -90,12 +92,14 @@ pub async fn remove(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> AppResu
     Ok(())
 }
 
-/// 已停用的账号。**没有这一条，恢复就够不着**——停用的人从所有列表里消失，
-/// 管理员拿不到他的 id，而恢复接口要的正是那个 id。
+/// Deactivated accounts. **Without this one, restore is out of reach** -- a deactivated
+/// person disappears from every list, so an admin can never get hold of their id, and that
+/// id is exactly what the restore endpoint wants.
 ///
-/// 与 [`org_users`] 分成两个查询而不是加一个「含停用」的开关：读的人不一样
-/// （那个喂选人器，这个喂管理页的一小块），而一个布尔参数会让两处的调用点
-/// 都得先想一下自己要哪一种。
+/// Kept as a query separate from [`org_users`] rather than adding an "include deactivated"
+/// flag: the readers are different (that one feeds the people picker, this one feeds a small
+/// corner of the admin page), and a boolean parameter would make the call sites in both
+/// places stop and think about which of the two they want.
 pub async fn deactivated_users(pool: &PgPool, org_id: Uuid) -> AppResult<Vec<OrgUser>> {
     Ok(sqlx::query_as(
         "SELECT id, email, display_name, is_admin FROM users

@@ -1,6 +1,7 @@
--- Chat 会话持久化——对话、消息、行动轨迹与引用随消息落库。
--- 上下文由服务端从这里拼装（前端只传 conversation_id + 新消息）；
--- steps/sources 与实时 SSE 事件同构，历史回放与流式渲染共用一套组件。
+-- Chat session persistence -- conversations, messages, action traces and citations all land in
+-- the database alongside the message. The server assembles the context from here (the frontend
+-- only sends conversation_id + the new message); steps/sources are isomorphic to the live SSE
+-- events, so history replay and streaming rendering share one set of components.
 
 CREATE TABLE conversations (
     id         UUID PRIMARY KEY,
@@ -17,14 +18,17 @@ CREATE TABLE conversation_messages (
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content         TEXT NOT NULL,
-    -- 行动轨迹（工具调用步骤）与引用清单（历史回放；与 SSE step/sources 同构）
+    -- Action trace (tool-call steps) and citation list (history replay; isomorphic to the
+    -- SSE step/sources)
     steps           JSONB NOT NULL DEFAULT '[]',
     sources         JSONB NOT NULL DEFAULT '[]',
-    -- 这一轮认下了哪些实体（id、名字、类型），下一轮回放它。
-    -- **不回放整段工具结果**：那里面是 chunk 正文，每轮重复堆进上下文，几轮就
-    -- 把窗口吃光。要回放的是身份——有了 id，下一轮直接调 entity_facts，不必从
-    -- 名字重查；顺带治掉一个更隐蔽的毛病：同名歧义时两轮可能查到不同的实体，
-    -- 于是前后两个答案讲的不是同一个节点
+    -- Which entities this turn resolved (id, name, type), to be replayed on the next turn.
+    -- **Do not replay the whole tool result**: that is chunk body text, and piling it into the
+    -- context again every turn eats the window in a handful of turns. What gets replayed is
+    -- identity -- with the id in hand the next turn calls entity_facts directly instead of
+    -- looking it up by name again; that also cures a subtler defect: when a name is ambiguous
+    -- two turns can resolve to different entities, so the two answers are not talking about the
+    -- same node
     resolved        JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

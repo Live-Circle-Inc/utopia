@@ -1,39 +1,44 @@
 #!/usr/bin/env node
-// 把 schema.org 的 TTL 切成前 N 个类的子集，给退化曲线用。
+// Cut the schema.org TTL down to a subset of the first N classes, for the degradation curve.
 //
-// 曲线要回答的是：**内联多少词汇量之后抽取开始掉东西**。那条曲线定
-// `ONTOLOGY_PROMPT_BUDGET` 与每块检索多少个候选，不测就是拍脑袋。
+// What the curve has to answer is: **how much vocabulary can be inlined before extraction
+// starts dropping things**. That curve sets `ONTOLOGY_PROMPT_BUDGET` and how many candidates
+// are retrieved per chunk; without measuring it, those numbers are pulled out of thin air.
 //
-// 为什么不用"导入全量再限制内联数"：那样量到的是"检索选得准不准"，
-// 混进了检索的质量。切子集 + 全量内联，量的才是纯粹的规模效应。
+// Why not "import the whole thing and then cap the inlined count": that measures "how well
+// retrieval picks", mixing in the quality of retrieval. A subset plus full inlining is what
+// measures the pure scale effect.
 //
-// 用法：node scripts/bench/subset.mjs /tmp/schemaorg.ttl 100 > /tmp/schemaorg-100.ttl
+// Usage: node scripts/bench/subset.mjs /tmp/schemaorg.ttl 100 > /tmp/schemaorg-100.ttl
 
 import fs from "node:fs";
 
 const [, , src, nRaw] = process.argv;
 const N = Number(nRaw);
 if (!src || !Number.isFinite(N)) {
-  console.error("用法: subset.mjs <schemaorg.ttl> <类数>");
+  console.error("usage: subset.mjs <schemaorg.ttl> <class-count>");
   process.exit(2);
 }
 
 const text = fs.readFileSync(src, "utf8");
 const lines = text.split("\n");
 
-// 前缀块原样保留：切掉它文件就解析不了
+// The prefix block is kept verbatim: cut it off and the file will not parse
 const prefixEnd = lines.findIndex((l) => l.startsWith("@prefix") === false && l.trim() && !l.startsWith("#"));
 const prefixes = lines.slice(0, prefixEnd).join("\n");
 
-// 按空行分块，但**必须知道自己在不在三引号字符串里**。
+// Split into blocks on blank lines, but **you have to know whether you are inside a
+// triple-quoted string**.
 //
-// 前两版都栽在这上面。按 `/\.\s*$/` 收尾不行：schema.org 的 rdfs:comment 里
-// 有以句点结尾的行，块从描述中间被劈开（导入报 `Accountancy is not a valid
-// subject`）。改按空行也不行：`"""…"""` 里也有真正的空行，同样劈开
-//（`A is not a valid subject`，"A" 是 BreadcrumbList 那段描述的第一个词）。
+// The first two versions both came to grief on this. Ending a block on `/\.\s*$/` does not
+// work: the rdfs:comment of schema.org has lines that end in a period, so blocks get split
+// apart in the middle of a description (the import reports `Accountancy is not a valid
+// subject`). Switching to blank lines does not work either: there are genuine blank lines
+// inside `"""…"""` as well, which splits it just the same (`A is not a valid subject`, where
+// "A" is the first word of the BreadcrumbList description).
 //
-// TTL 里没有词法上下文就切不动这个文件——数一下 `"""` 出现过几次，
-// 偶数才算在字符串外面。
+// Without lexical context there is no cutting this TTL file up -- count how many times
+// `"""` has appeared, and only an even number counts as being outside a string.
 const blocks = [];
 {
   let cur = [];
@@ -55,13 +60,14 @@ const subjectOf = (b) => (b.match(/^\s*(\S+)\s+a\s/m) || [])[1] || "";
 const isClass = (b) => /\ba\s+rdfs:Class\b/.test(b);
 const isProp = (b) => /\ba\s+rdf:Property\b/.test(b);
 
-// 取前 N 个类。**保序而不是随机取**：同一个 N 每次得到同一份子集，
-// 两次跑出的差别才归因得到别处
+// Take the first N classes. **Order-preserving rather than a random draw**: the same N gives
+// the same subset every time, so a difference between two runs can be attributed elsewhere
 const classes = blocks.filter(isClass);
 const keep = new Set(classes.slice(0, N).map(subjectOf).filter(Boolean));
 
-// 属性：domainIncludes 落在保留的类里就留。留下指向被切掉的类的属性没有意义
-//——那些 domain 解析不出来，导入时本来就会被跳过
+// Properties: keep the ones whose domainIncludes lands in a kept class. Keeping properties
+// that point at a class which was cut is pointless -- their domain does not resolve, so the
+// import would skip them anyway
 const props = blocks.filter(isProp).filter((b) => {
   const m = b.match(/schema:domainIncludes([^;.]*)/);
   if (!m) return false;
@@ -73,4 +79,4 @@ const props = blocks.filter(isProp).filter((b) => {
 
 const kept = blocks.filter((b) => isClass(b) && keep.has(subjectOf(b)));
 process.stdout.write(prefixes + "\n\n" + kept.concat(props).join("\n\n") + "\n");
-process.stderr.write(`保留 ${kept.length} 个类、${props.length} 个属性\n`);
+process.stderr.write(`kept ${kept.length} classes and ${props.length} properties\n`);

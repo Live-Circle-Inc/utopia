@@ -104,9 +104,11 @@ export function Members({ workspaceId }: { workspaceId: string }) {
                 >
                   {S.members.remove}
                 </button>
-                {/* 停用账号跟「移出工作区」是两件事：前者断掉整个系统的访问，
-                    后者只是这个工作区不再有他。所以分开两个按钮，而且停用
-                    只给管理员看——它的影响面大得多 */}
+                {/* Deactivating an account and "removing from the workspace" are two
+                    different things: the former cuts off access to the entire system, the
+                    latter only means this workspace no longer has them. So two separate
+                    buttons, and deactivate is shown to admins only -- its blast radius is
+                    far larger */}
                 {me.data?.is_admin && me.data.id !== m.user_id && (
                   <button
                     onClick={() => {
@@ -133,8 +135,9 @@ export function Members({ workspaceId }: { workspaceId: string }) {
         />
       </div>
 
-      {/* picker 常驻。理由同 KbSettings 里那段：控件消失读作"坏了"，
-          而不是"没人可加"；空列表 SearchSelect 自己会说 */}
+      {/* The picker is always there. Same reasoning as the passage in KbSettings: a control
+          that vanishes reads as "broken", not as "nobody left to add"; when the list is empty
+          SearchSelect says so itself */}
       <div className="flex gap-2 items-center">
           <SearchSelect
             className="flex-1"
@@ -169,12 +172,14 @@ export function Members({ workspaceId }: { workspaceId: string }) {
 }
 
 
-/** 已停用的账号，以及恢复它们。
+/** Deactivated accounts, and reviving them.
  *
- * **这一块存在的理由是「否则恢复够不着」**：停用之后那个人从成员表、选人器、
- * 每一个列表里消失，管理员拿不到他的 id，而恢复接口要的正是那个 id。
+ * **This block exists because otherwise reactivation is out of reach**: once deactivated, that
+ * person disappears from the member table, from the user picker, from every list, so an admin
+ * cannot get hold of their id -- and their id is exactly what the reactivate endpoint wants.
  *
- * 一个都没有时整块不出现——没有停用过的部署不该看到一个永远空的区块。
+ * When there are none at all the whole block is absent -- a deployment that has never
+ * deactivated anyone should not be shown a section that is permanently empty.
  */
 function DeactivatedUsers({ onChanged }: { onChanged: () => void }) {
   const list = useQuery({
@@ -225,7 +230,7 @@ function DeactivatedUsers({ onChanged }: { onChanged: () => void }) {
     </div>
   );
 }
-/** 管理员代开账号（注册关闭后的唯一入口）。 */
+/** An admin opens an account on someone's behalf (the only way in once registration is closed). */
 function CreateUser({ onCreated }: { onCreated: () => void }) {
   const queryClient = useQueryClient();
   const [email, setEmail] = useState("");

@@ -1,5 +1,6 @@
-//! Chat 会话持久化：对话/消息仓储。轨迹（steps）与引用（sources）随
-//! assistant 消息落库，历史回放与实时流共用同一数据形状。
+//! Chat session persistence: the conversation/message repository. The trace (steps) and the
+//! citations (sources) are persisted together with the assistant message, and history replay and
+//! the live stream share the same data shape.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -19,11 +20,13 @@ pub async fn create(pool: &PgPool, kb_id: Uuid, user_id: Uuid, title: &str) -> A
     Ok(id)
 }
 
-/// 我在这个库里的会话。**可搜、可翻页**——标题会重（同一个问题问两次就重了），
-/// 而固定一百条之后的会话界面上根本不存在。
+/// My conversations in this database. **Searchable and paginated** -- titles repeat (ask the same
+/// question twice and there they are), and conversations past a fixed hundred simply do not exist
+/// as far as the UI is concerned.
 ///
-/// 搜的是标题与消息正文两处：人记得住的往往是「我问过那个关于 Q3 的」，
-/// 而那句话在正文里，标题可能被截成了别的样子。
+/// The search covers two places, the title and the message body: what a person remembers is
+/// usually "I asked that thing about Q3", and that sentence is in the body, while the title may
+/// have been truncated into something else entirely.
 pub async fn list(
     pool: &PgPool,
     kb_id: Uuid,
@@ -63,10 +66,11 @@ pub async fn list(
     Ok((rows, total))
 }
 
-/// 改一个会话的标题。
+/// Rename a conversation.
 ///
-/// **标题本来是从第一句话自动取的**，而那句话往往不是它后来变成的样子——
-/// 一段对话跑偏是常态，改名让人能按自己记得的方式找回它。
+/// **The title was taken automatically from the first sentence**, and that sentence is often not
+/// what the conversation later turned into -- a conversation drifting off is the norm, and
+/// renaming lets a person find it again the way they remember it.
 pub async fn rename(
     pool: &PgPool,
     kb_id: Uuid,
@@ -97,7 +101,7 @@ pub async fn rename(
     Ok(())
 }
 
-/// 归属校验：会话必须属于本 KB 本人。
+/// Ownership check: the conversation must belong to this KB and this person.
 pub async fn require_owned(
     pool: &PgPool,
     kb_id: Uuid,
@@ -126,28 +130,33 @@ pub async fn messages(pool: &PgPool, conversation_id: Uuid) -> AppResult<Vec<Con
     Ok(rows)
 }
 
-/// 一轮回放的历史。
+/// The history for one round of replay.
 ///
-/// 三样东西，各自回答一个不同的问题：正文（说过什么）、实体（认下了谁）、
-/// 最近一轮的工具往返（**做过什么**）。
+/// Three things, each answering a different question: the body (what was said), the entities (who
+/// was pinned down), and the most recent round of tool round-trips (**what was done**).
 ///
-/// 第三样是后加的。原先的判断是「回放身份足矣：有了 id，下一轮直接调
-/// entity_facts」——省下的是每轮堆积的 chunk 正文，那个考虑没错。但它把
-/// 「我已经查过了」这件事也一起省掉了：跨轮之后模型只看得见自己写的散文，
-/// 于是接着说「翻译」时重查一遍，还落到了另一批同名实体上。
+/// The third was added later. The original judgement was "replaying identity is enough: with the
+/// id in hand, the next round calls entity_facts directly" -- what that saved was the chunk
+/// bodies piling up every round, and that consideration was not wrong. But it also saved away the
+/// fact that "I already looked this up": across rounds the model could only see its own prose, so
+/// when the follow-up was "translate it" it looked everything up again, and landed on a different
+/// batch of same-named entities.
 ///
-/// 折中是**只回放最近一轮**：需要的是「我刚做过什么」，不是二十轮的输出。
+/// The compromise is **replaying only the most recent round**: what is needed is "what I just
+/// did", not the output of twenty rounds.
 pub struct History {
-    /// `(role, content)`，按时间序
+    /// `(role, content)`, in time order
     pub turns: Vec<(String, String)>,
-    /// 这场对话里已经认下的实体（去重）
+    /// The entities already pinned down in this conversation (deduplicated)
     pub entities: Vec<serde_json::Value>,
-    /// **最近一轮助手做过什么**：带 `tool_calls` 的助手消息与配套的 tool 结果。
+    /// **What the assistant did in the most recent round**: the assistant message carrying
+    /// `tool_calls` plus the matching tool results.
     ///
-    /// 只有最近一轮。这一段是为了让模型知道自己刚做过什么——接着说
-    /// 「翻译」「短一点」的时候，证据就在眼前，不必重查（也就不会重查成
-    /// 另一批同名实体）。搬二十轮的工具输出回来是另一回事，那正是当初
-    /// 只存正文的理由。
+    /// The most recent round only. This section exists so the model knows what it just did -- when
+    /// the follow-up is "translate it" or "make it shorter", the evidence is right there and it
+    /// does not have to look it up again (and so cannot look it up into a different batch of
+    /// same-named entities). Hauling twenty rounds of tool output back is another matter, and that
+    /// is exactly why only the body was stored to begin with.
     pub last_tool_exchange: Vec<serde_json::Value>,
 }
 
@@ -167,8 +176,9 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
     .fetch_all(pool)
     .await?;
     rows.reverse();
-    // 实体按 id 去重、保持首次出现的顺序：同一个实体在几轮里反复出现是常态，
-    // 每轮各列一遍只是把同一件事说三遍
+    // Deduplicate entities by id while keeping first-appearance order: the same entity recurring
+    // over several rounds is the norm, and listing it again each round is just saying the same
+    // thing three times
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entities: Vec<serde_json::Value> = Vec::new();
     for (_, _, res, _, _) in &rows {
@@ -179,7 +189,8 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
             }
         }
     }
-    // 最后一条助手消息的那一段。**倒着找**——最后一条通常是刚落库的用户消息
+    // The section from the last assistant message. **Searched backwards** -- the last message is
+    // usually the user message that was just persisted
     let last_tool_exchange = rows
         .iter()
         .rev()
@@ -193,25 +204,28 @@ pub async fn recent_context(pool: &PgPool, conversation_id: Uuid, n: i64) -> App
     })
 }
 
-/// 一轮除了正文之外留下的东西。
+/// What a round leaves behind besides the body.
 ///
-/// **四个都是 `serde_json::Value`，散着传编译器帮不上忙**——传错顺序会得到
-/// 一条能落库、也能读回来、只是内容张冠李戴的记录。与 `RelationAxioms` 同一条理由。
+/// **All four are `serde_json::Value`, and passed loose the compiler cannot help you** -- get the
+/// order wrong and you get a record that persists fine, reads back fine, and merely has the wrong
+/// content under every heading. Same reasoning as `RelationAxioms`.
 #[derive(Default)]
 pub struct TurnRecord {
-    /// 行动轨迹：调了什么、拿到多少（界面显示）
+    /// The action trace: what was called and how much came back (shown in the UI)
     pub steps: serde_json::Value,
-    /// 引用清单
+    /// The citation list
     pub sources: serde_json::Value,
-    /// 这一轮认下的实体（id / 名字 / 类型）。下一轮回放，让模型接着走而不是重搜
+    /// The entities pinned down this round (id / name / type). Replayed next round so the model
+    /// carries on instead of searching again
     pub resolved: serde_json::Value,
-    /// 这一轮调了什么、拿回什么（已截断的那一份）。下一轮回放最近的一段——
-    /// 没有它，模型跨轮之后就不知道自己查过，于是重查
+    /// What was called this round and what came back (the already-truncated copy). The most
+    /// recent one is replayed next round -- without it the model does not know, across rounds,
+    /// that it already looked something up, so it looks it up again
     pub tool_exchange: serde_json::Value,
 }
 
 impl TurnRecord {
-    /// 用户消息：四样都空。
+    /// A user message: all four empty.
     pub fn empty() -> Self {
         Self {
             steps: serde_json::json!([]),

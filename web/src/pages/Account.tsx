@@ -1,4 +1,4 @@
-/* 个人信息页：头像（首字母占位）、显示名、邮箱、改密码。 */
+/* Profile page: avatar (initial as a placeholder), display name, email, change password. */
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";

@@ -1,17 +1,21 @@
-//! 数据源授权（0014）。
+//! Data source grants (0014).
 //!
-//! 补的洞:注册是部署级动作,而挂载的守卫是 `require_kb(kb_id, Role::Admin)`
-//! ——请求者自己那个库的管理员。可挂载列表返回的又是全部署每一个源。于是任何
-//! 一个知识库的管理员,都能把任意生产库挂进自己库,而挂上之后该库每个 Viewer
-//! 都能通过 `query_data` 对它跑只读 SQL。
+//! The hole this plugs: registration is a deployment-level action, while the guard on mounting is
+//! `require_kb(kb_id, Role::Admin)` -- an admin of the requester's own knowledge base. And the
+//! mountable list returned every single source in the whole deployment. So an admin of any one
+//! knowledge base could mount any production database into their own KB, and once mounted every
+//! Viewer of that KB could run read-only SQL against it through `query_data`.
 //!
-//! 这里钉三件事:
+//! Three things are nailed down here:
 //!
-//! - **看不见**:没授权的源不进可挂载列表
-//! - **也挂不上**:列表过滤只挡「看得见」,而挂载端点是照着 id 调的——
-//!   守卫必须在两侧都有,这条测的是端点那一侧
-//! - **收回是真收回**:撤授权连同已挂上的一起卸掉。只删授权行的话,问数读的
-//!   还是 `kb_data_sources`,等于撤销不生效——一个不生效的权限撤销比没有还危险
+//! - **Cannot see it**: an ungranted source does not enter the mountable list
+//! - **Cannot mount it either**: the list filter only blocks "seeing it", while the mount endpoint
+//!   is called with an id -- the guard has to be on both sides, and this one tests the endpoint
+//!   side
+//! - **Revoking really revokes**: revoking a grant unmounts whatever was already mounted along
+//!   with it. If you only delete the grant row, data questions still read `kb_data_sources`, which
+//!   amounts to the revocation not taking effect -- and a revocation that does not take effect is
+//!   more dangerous than none at all
 
 use sqlx::PgPool;
 use utopia_store::datasources;
@@ -19,9 +23,9 @@ use uuid::Uuid;
 
 struct Fixture {
     org: Uuid,
-    /// 授权给它的工作区
+    /// The workspace it is granted to
     ours: Uuid,
-    /// 没授权的工作区——它的库不该够得着这个源
+    /// The workspace with no grant -- its knowledge bases must not be able to reach this source
     theirs: Uuid,
     our_kb: Uuid,
     their_kb: Uuid,
@@ -94,67 +98,67 @@ async fn a_source_reaches_only_where_it_was_granted() -> anyhow::Result<()> {
     let f = seed(&pool).await?;
 
     let run = async {
-        // ---- 一、没授权 = 谁都够不着
+        // ---- 1. No grant = nobody can reach it
         assert!(
             datasources::granted_to_workspace(&pool, f.ours)
                 .await?
                 .is_empty(),
-            "没授权过，可挂载列表就该是空的"
+            "with nothing granted, the mountable list must be empty"
         );
         assert!(
             !datasources::is_granted(&pool, f.our_kb, f.source).await?,
-            "没授权，挂载端点的守卫必须说不"
+            "with no grant, the mount endpoint's guard must say no"
         );
 
-        // ---- 二、授权一个工作区，另一个不受影响
+        // ---- 2. Granting one workspace leaves the other unaffected
         datasources::grant(&pool, f.source, f.ours, f.actor).await?;
         let ours = datasources::granted_to_workspace(&pool, f.ours).await?;
-        assert_eq!(ours.len(), 1, "授权过的工作区看得见它");
+        assert_eq!(ours.len(), 1, "a workspace that was granted can see it");
         assert!(
             !ours[0].summary.contains("p@"),
-            "列表里只能有 host:port/db 摘要，凭据不出服务端"
+            "the list may only carry the host:port/db summary; credentials stay server-side"
         );
         assert!(
             datasources::granted_to_workspace(&pool, f.theirs)
                 .await?
                 .is_empty(),
-            "**授权是逐工作区的**：给了一个不等于给了全部署"
+            "**grants are per workspace**: giving one is not giving the whole deployment"
         );
 
-        // ---- 三、端点侧的守卫：列表过滤只挡「看得见」
+        // ---- 3. The guard on the endpoint side: the list filter only blocks "seeing it"
         assert!(datasources::is_granted(&pool, f.our_kb, f.source).await?);
         assert!(
             !datasources::is_granted(&pool, f.their_kb, f.source).await?,
-            "没授权的工作区，就算自己拼一个 uuid 打过来也挂不上"
+            "an ungranted workspace cannot mount it even by POSTing a uuid it made up"
         );
 
-        // ---- 四、一个源可授权给多个工作区（多对多，不是一对多）
+        // ---- 4. One source can be granted to several workspaces (many-to-many, not one-to-many)
         datasources::grant(&pool, f.source, f.theirs, f.actor).await?;
         assert_eq!(
             datasources::grants_for_source(&pool, f.source).await?.len(),
             2,
-            "同一个数仓要能同时服务多个工作区"
+            "the same warehouse has to be able to serve several workspaces at once"
         );
         datasources::grant(&pool, f.source, f.theirs, f.actor).await?;
         assert_eq!(
             datasources::grants_for_source(&pool, f.source).await?.len(),
             2,
-            "重复授权是幂等的"
+            "granting the same thing twice is idempotent"
         );
 
-        // ---- 五、收回连同挂载一起收
+        // ---- 5. Revoking takes the mounts with it
         datasources::mount(&pool, f.our_kb, f.source).await?;
         datasources::mount(&pool, f.their_kb, f.source).await?;
         let unmounted = datasources::revoke(&pool, f.source, f.theirs).await?;
-        assert_eq!(unmounted, 1, "撤授权要把那个工作区里已挂上的一起卸掉");
+        assert_eq!(unmounted, 1, "revoking unmounts that workspace's mounts");
         assert!(
             datasources::mounted(&pool, f.their_kb).await?.is_empty(),
-            "**留着挂载 = 撤销不生效**：问数读的是 kb_data_sources"
+            "**keeping the mount = revocation has no effect**: data questions read kb_data_sources"
         );
         assert_eq!(
             datasources::mounted(&pool, f.our_kb).await?.len(),
             1,
-            "另一个工作区的挂载不受牵连"
+            "the other workspace's mount is not dragged into it"
         );
         Ok::<_, anyhow::Error>(())
     }

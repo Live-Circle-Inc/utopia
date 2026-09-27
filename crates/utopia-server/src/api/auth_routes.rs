@@ -58,7 +58,8 @@ pub async fn register(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // 注册开关：库内配置（/admin 可切）优先；建库前（首用户引导）总是放行
+    // Registration switch: the in-database setting (toggleable from /admin) wins; before the
+    // database is built (first-user bootstrap) it always lets you through
     let open = utopia_store::access::open_registration(&state.pool)
         .await
         .unwrap_or(state.open_registration);
@@ -91,10 +92,12 @@ pub async fn register(
     ))
 }
 
-/// 登录失败留痕：没有账号可归属，actor 记 NULL，尝试的邮箱进 detail。
-/// 区分「邮箱不存在」与「密码不对」——同一 IP 上大量前者是邮箱枚举，
-/// 集中在一个账号上的后者是撞库，两种攻击的形状不一样。台账仅管理员可读，
-/// 不存在借此探测账号是否注册的问题。
+/// Leave a trace of a failed login: there is no account to attribute it to, so actor is NULL
+/// and the attempted email goes into detail. Tell "the email does not exist" apart from "the
+/// password is wrong" -- a flood of the former from one IP is email enumeration, a flood of the
+/// latter concentrated on a single account is credential stuffing, and the two attacks have
+/// different shapes. The ledger is readable by admins only, so there is no way to use this to
+/// probe whether an account is registered.
 async fn record_login_failure(state: &AppState, email: &str, reason: &str) {
     let _ = utopia_store::audit::record_opt(
         &state.pool,
@@ -139,8 +142,9 @@ pub async fn login(
     Ok((jar, Json(json!({ "user": user, "token": token }))))
 }
 
-/// 登出不要求有效会话——cookie 过期时也必须能清掉它，否则前端就卡在一个
-/// 死会话上。所以这里自己解 token 取身份，解不出就只清 cookie 不留痕。
+/// Logging out does not require a valid session -- an expired cookie must still be clearable,
+/// otherwise the frontend is stuck on a dead session. So this decodes the token itself to get
+/// the identity; if it will not decode, it just clears the cookie and records nothing.
 pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -175,7 +179,7 @@ pub struct UpdateMeReq {
     pub display_name: String,
 }
 
-/// 个人资料：改显示名。
+/// Profile: change the display name.
 pub async fn update_me(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -197,7 +201,8 @@ pub struct ChangePasswordReq {
     pub new_password: String,
 }
 
-/// 改密码：验旧密 → 哈希新密。旧密错误与"未登录"区分开，前端能给出准确提示。
+/// Change password: verify the old one → hash the new one. A wrong old password is kept
+/// distinct from "not logged in", so the frontend can give an accurate message.
 pub async fn change_password(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

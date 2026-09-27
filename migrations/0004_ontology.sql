@@ -1,44 +1,52 @@
--- 本体：抽取未匹配统计、导入、提案与人认可过的细化配对。
+-- Ontology: unmatched-extraction counts, imports, proposals, and human-approved refinement
+-- pairs.
 
--- 抽取过程中命中白名单之外的类型/关系：不是垃圾，是本体扩展的信号
+-- Types/relations met during extraction that fall outside the allowlist: not garbage, but the
+-- signal that the ontology wants extending
 CREATE TABLE ontology_misses (
     kb_id      UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    -- attribute_type 与 relation_type 分开：词表外的谓词带着字面值时（
-    -- `founding_date: "2015"`），缺的是一个属性而不是一个关系，记错了会让
-    -- 本体提案去建一条关系
+    -- attribute_type is kept apart from relation_type: when a predicate outside the vocabulary
+    -- carries a literal value (`founding_date: "2015"`), what is missing is an attribute and not
+    -- a relation, and recording it wrongly sends the ontology proposal off to create a relation
     kind       TEXT NOT NULL
                CHECK (kind IN ('entity_type', 'relation_type', 'attribute_type')),
     key        TEXT NOT NULL,
     example    TEXT,
     count      INT NOT NULL DEFAULT 1,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 人说过不要。**标记而不是删除**：dismiss 从前是 DELETE，下一次抽取遇到
-    -- 同一个词原样插回来——用户的「不要」活不过一轮抽取。自动扩本体开着时，
-    -- 那等于系统覆盖人的明确决定
+    -- A human said no. **Flag it, do not delete it**: dismiss used to be a DELETE, and the next
+    -- extraction to meet the same word inserted it straight back -- the user's "no" did not
+    -- survive one round of extraction. With automatic ontology extension switched on, that
+    -- amounts to the system overriding a human's explicit decision
     dismissed_at TIMESTAMPTZ,
     PRIMARY KEY (kb_id, kind, key)
 );
 
--- 本体导入的第一层：原文保真。
+-- The first layer of an ontology import: faithful to the source text.
 --
--- 投影只覆盖今天能消费的那部分（类、标签、rdfs:comment、subClassOf、
--- 对象/数据属性、functional、domain/range）。**读不懂的不是错误，是"暂未投影"**——
--- 原文按内容寻址存进 blob，将来推理机上线或我们补上新消费者时重跑，
--- 用户什么都不用做。这样"我们表达不了"从能力缺口降级成"投影暂未覆盖"。
+-- The projection covers only the part we can consume today (classes, labels, rdfs:comment,
+-- subClassOf, object/data properties, functional, domain/range). **What we cannot read is not an
+-- error, it is "not projected yet"** -- the source text is stored in the blob store addressed by
+-- content, and gets re-run when a reasoner comes online or when we add a new consumer, with
+-- nothing for the user to do. That demotes "we cannot express it" from a capability gap to "the
+-- projection does not cover it yet".
 CREATE TABLE ontology_imports (
     id            UUID PRIMARY KEY,
     kb_id         UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    -- blob 的内容指纹；同一份文件重复导入不重复占空间
+    -- The content fingerprint of the blob; importing the same file twice does not take up the
+    -- space twice
     sha256        TEXT NOT NULL,
     filename      TEXT NOT NULL,
     -- turtle | rdfxml
     format        TEXT NOT NULL,
     byte_size     BIGINT NOT NULL,
-    -- 投影版本：将来投影逻辑变了，据此知道哪些导入该重跑
+    -- Projection version: when the projection logic changes later, this is how we know which
+    -- imports should be re-run
     projection_version INT NOT NULL DEFAULT 1,
-    -- 这次投影做了什么（新建/更新/暂未投影的计数与明细），预览与事后审计共用
+    -- What this projection did (counts and details of created/updated/not-projected-yet), shared
+    -- by the preview and by after-the-fact auditing
     summary       JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- 谁导的。删号后留 NULL，与审计台账同规矩
+    -- Who imported it. Left NULL once the account is deleted, the same rule as the audit ledger
     imported_by   UUID REFERENCES users(id) ON DELETE SET NULL,
     imported_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -46,56 +54,68 @@ CREATE TABLE ontology_imports (
 CREATE INDEX ontology_imports_kb_idx ON ontology_imports (kb_id, imported_at DESC);
 
 
--- 本体提案落库。
+-- Ontology proposals, persisted.
 --
--- 从前它只活在浏览器内存里（`Ontology.tsx` 的 `useState<OntologyProposals>`）：
--- 刷新一次、切走一次、崩一次，整批提议就没了，想再看只能重跑一次模型。
+-- It used to live only in browser memory (`Ontology.tsx`'s `useState<OntologyProposals>`): one
+-- refresh, one navigation away, one crash, and the whole batch of proposals was gone; seeing
+-- them again meant re-running the model.
 --
--- **丢的不是原材料。** 未匹配的说法一直存在 `ontology_misses` 里。丢的是**聚类
--- 结果**——哪些说法被归到同一条提议底下、以及"采纳后将重新归类 N 条"那个估算。
--- 而那正是唯一能查证过并的东西：0003 记着模型建议把 `optimized_for` 并进
--- `runs_on`（"为 RTX 优化"不等于"跑在 RTX 上"），**它是靠 tooltip 里看得见归并了
--- 哪些说法才被抓出来的**，并且成了"不该全自动归并"的直接证据。能查证的东西不该
--- 只活在一个页面的生命周期里。
+-- **What was lost was not the raw material.** The unmatched phrasings were in `ontology_misses`
+-- all along. What was lost was the **clustering result** -- which phrasings ended up under the
+-- same proposal, and that estimate of "adopting this will reclassify N of them". And that is
+-- precisely the only thing by which a merge can be checked: 0003 records the model suggesting
+-- that `optimized_for` be merged into `runs_on` ("optimized for RTX" is not the same as "runs on
+-- RTX"), and **it was caught only because the tooltip made visible which phrasings had been
+-- merged in**, and it became the direct evidence for "merging must not be fully automatic".
+-- Something that can be checked should not live only for the lifetime of one page.
 CREATE TABLE ontology_proposals (
     id         UUID PRIMARY KEY,
     kb_id      UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
-    -- 提案分档，与接口返回的四个小节同名：
+    -- The proposal's bucket, named after the four sections the API returns:
     -- entity_types | relation_types | attribute_types | map_to
     section    TEXT NOT NULL,
     key        TEXT NOT NULL,
-    -- 那一条提案的原样：label、description、reason、forms、datatype、temporal…
+    -- That one proposal exactly as it came: label, description, reason, forms, datatype,
+    -- temporal...
     --
-    -- **存 JSONB 而不是拆成列**：四个小节的形状本来就不同（关系有 temporal 与
-    -- forms，属性有 datatype，map_to 有目标），拆开要么四张表要么一张稀疏宽表。
-    -- 前端消费的也正是这个 JSON，存原样等于不改契约。要查归并了哪些说法仍然
-    -- 查得动（`payload->'forms'`）
+    -- **Stored as JSONB rather than split into columns**: the four sections genuinely have
+    -- different shapes (relations have temporal and forms, attributes have datatype, map_to has
+    -- a target), so splitting them means either four tables or one sparse wide table. This JSON
+    -- is also exactly what the frontend consumes, so storing it verbatim means not changing the
+    -- contract. Asking which phrasings got merged still works (`payload->'forms'`)
     payload    JSONB NOT NULL,
-    -- open = 还等着人看；adopted / rejected = 已经有人表过态
+    -- open = still waiting for a human to look; adopted / rejected = somebody has taken a
+    -- position
     status     TEXT NOT NULL DEFAULT 'open'
                CHECK (status IN ('open', 'adopted', 'rejected')),
     decided_by UUID REFERENCES users(id),
     decided_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 同一个库里同一档下的同一个 key 只有一条。重跑 Suggest 是刷新它，不是再堆一条
+    -- One row only per key, per bucket, per kb. Re-running Suggest refreshes it, it does not
+    -- pile on another
     UNIQUE (kb_id, section, key)
 );
 
--- "还有多少条等着看"是这张表最常被问的问题（0003 的另一个缺口：关掉自动扩展
--- 开关之后没有"自上次以来有 N 个新说法"的提醒，信号在面板里但没人主动看）
+-- "How many are still waiting to be looked at" is the question this table is asked most often
+-- (0003's other gap: with the automatic-extension switch turned off there was no "N new
+-- phrasings since last time" nudge, so the signal sat in a panel and nobody went to look)
 CREATE INDEX ontology_proposals_open_idx
     ON ontology_proposals (kb_id, created_at DESC)
     WHERE status = 'open';
 
--- 人认可过的"粗类 → 细类"配对。认可一次，之后同一对不再进人工。
+-- Human-approved "coarse class → fine class" pairs. Approved once, and the same pair never goes
+-- to a human again.
 --
--- 为什么需要它：待人工那一档由"选中的类在不在粗类子树里"触发，而实测那条
--- 判据测的往往不是风险，是**种子类跟导入词汇表的分类树连没连上**。
--- schema.org 的 Place 另起了 place 这个 key，内置 location 一个子类都没有，
--- 于是每一次 location → city 都算跨轴——24 个实体里报了 14 条，条条正确。
+-- Why it is needed: the awaiting-human bucket is triggered by "is the selected class inside the
+-- coarse class's subtree", and measured in practice, what that criterion tests is often not risk
+-- but **whether the seed classes are wired up to the imported vocabulary's classification tree
+-- at all**. schema.org's Place started a separate key, place, and the built-in location has not
+-- one single subclass, so every single location → city counts as crossing axes -- 14 reported
+-- out of 24 entities, every one of them correct.
 --
--- 跨轴是 (粗类, 目标类) 这一对的属性，不是实体的属性。人看过一次
--- "location 下面的东西可以是 city"，第二个城市就不该再问一遍。
+-- Crossing axes is a property of the (coarse class, target class) pair, not a property of the
+-- entity. Once a human has seen that "a thing under location can be a city", the second city
+-- should not ask all over again.
 CREATE TABLE type_refinement_pairs (
     kb_id       uuid NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
     from_type_id uuid NOT NULL REFERENCES entity_types(id) ON DELETE CASCADE,

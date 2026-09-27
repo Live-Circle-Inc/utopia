@@ -1,4 +1,5 @@
-//! 摄入来源仓储："来源即文件夹"——source 是容器，挂着它摄入的文档，可定时同步。
+//! The ingestion source repository: "a source is a folder" -- a source is a container holding
+//! the documents it ingested, and it can sync on a schedule.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -6,20 +7,26 @@ use utopia_core::models::{Role, Source, SourceKind, SourceView, SyncRun, SOURCE_
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// folder = 纯容器（上传/拖拽入内，无同步语义）；url/rss = 拉取型；api = 推送型。
-/// 本机目录监听（watch_folder）已否决——自部署用户看不到服务器磁盘；
-/// 对象存储 / WebDAV / Notion 是它的替代形态（0013）。
-/// custom = 自定义拉取器：任何实现 Utopia ingest 接口的 URL（返回 items JSON）即可定时摄取。
-/// github_issues / jira_issues = 工单：一张工单连同它的状态变更史成为一篇文档。
+/// folder = a pure container (upload/drag things in, no sync semantics); url/rss = pull-style;
+/// api = push-style.
+/// Watching a local directory (watch_folder) was rejected -- self-hosting users cannot see the
+/// server's disk; object storage / WebDAV / Notion are its replacement shapes (0013).
+/// custom = a custom puller: any URL implementing the Utopia ingest interface (returning items
+/// JSON) can be ingested on a schedule.
+/// github_issues / jira_issues = tickets: one ticket, together with its status change history,
+/// becomes one document.
 ///
-/// 种类的清单**不在这里写**：`SourceKind`（utopia-core）一个枚举出全部——创建的白名单、
-/// 同步的分派、前端的下拉框（有测试对表）。从前这里有一张手写的 `KINDS`，五种连接器
-/// 加了同步却没进这张表，界面上选得到、建不出来（#247）
+/// The list of kinds is **not written here**: `SourceKind` (utopia-core) enumerates the whole lot
+/// in one place -- the creation allowlist, the sync dispatch, the frontend dropdown (with a test
+/// checking the tables against each other). There used to be a hand-written `KINDS` here, and
+/// five connectors gained sync support without making it into that table: selectable in the UI,
+/// impossible to create (#247)
 pub fn creatable_kinds() -> Vec<&'static str> {
     SourceKind::creatable().map(|k| k.as_str()).collect()
 }
 
-/// 校验并规范化标准 5 段 cron 表达式（内部用 cron crate 的 6 段：补秒位）。
+/// Validates and normalizes a standard 5-field cron expression (internally the cron crate's
+/// 6-field form: a seconds slot gets prepended).
 pub fn validate_cron(expr: &str) -> AppResult<String> {
     let normalized = expr.split_whitespace().collect::<Vec<_>>().join(" ");
     let fields = normalized.split(' ').count();
@@ -37,7 +44,7 @@ pub fn validate_cron(expr: &str) -> AppResult<String> {
     Ok(normalized)
 }
 
-/// cron 的下一次触发时刻（服务器本地时区）。
+/// The next firing time of a cron (in the server's local timezone).
 fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     use std::str::FromStr;
     let schedule = cron::Schedule::from_str(&format!("0 {expr}")).ok()?;
@@ -49,9 +56,10 @@ fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
 }
 
 pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
-    // config 剔掉凭据：列表给 Viewer 看，哪一种连接器的密钥都不下发。
-    // 键在 `SOURCE_SECRET_KEYS` 一张表上——从前这里只减 `auth_header`，五种连接器
-    // 的密钥就这么漏出去的（#246）
+    // Credentials stripped out of config: the list is for Viewers to see, and no connector's
+    // secret of any kind is handed out. The keys live in one table, `SOURCE_SECRET_KEYS` -- this
+    // used to subtract `auth_header` alone, which is exactly how five connectors' secrets leaked
+    // (#246)
     let rows: Vec<SourceView> = sqlx::query_as(
         "SELECT s.id, s.kind, s.name, s.config - $2::text[] AS config, s.icon,
                 s.sync_interval_minutes, s.sync_cron,
@@ -99,14 +107,15 @@ pub async fn create(
             "Source name is required",
         ));
     }
-    // 互斥：cron 优先（UI 只会传其一）
+    // Mutually exclusive: cron wins (the UI only ever sends one of them)
     let cron_norm = sync_cron.map(validate_cron).transpose()?;
     let interval = if cron_norm.is_some() {
         None
     } else {
         sync_interval_minutes
     };
-    // serde 缺省的 Value::Null 会以 jsonb null 落库，前端读 config.x 直接炸——规范化为空对象
+    // serde's default Value::Null lands in the database as a jsonb null, and the frontend
+    // reading config.x blows up on the spot -- so normalize it to an empty object
     let config = if config.is_null() {
         serde_json::json!({})
     } else {
@@ -129,7 +138,7 @@ pub async fn create(
     Ok(source)
 }
 
-/// 设置 api 来源的推送密钥（创建 / 轮换时）。
+/// Sets the push token of an api source (on creation / rotation).
 pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> AppResult<()> {
     let res = sqlx::query("UPDATE sources SET ingest_token = $2 WHERE id = $1")
         .bind(source_id)
@@ -142,7 +151,8 @@ pub async fn set_ingest_token(pool: &PgPool, source_id: Uuid, token: &str) -> Ap
     Ok(())
 }
 
-/// 更新调度：interval 与 cron 互斥，任一被显式设置时都会覆盖两者。
+/// Updates the schedule: interval and cron are mutually exclusive, and explicitly setting
+/// either one overwrites both.
 #[allow(clippy::too_many_arguments)]
 pub async fn update(
     pool: &PgPool,
@@ -182,7 +192,8 @@ pub async fn update(
     Ok(source)
 }
 
-/// 删除来源；其文档保留（source_id 置 NULL，落回 Uploads 组）。
+/// Deletes a source; its documents stay (source_id set to NULL, falling back into the Uploads
+/// group).
 pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<()> {
     let res = sqlx::query("DELETE FROM sources WHERE id = $1")
         .bind(id)
@@ -194,8 +205,9 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// 到期待同步的来源（调度器每分钟扫）。
-/// interval 型在 SQL 里判定；cron 型取回 Rust 侧求下一次触发时刻再过滤。
+/// Sources due for a sync (the scheduler scans every minute).
+/// The interval kind is decided in SQL; the cron kind is fetched back and filtered on the Rust
+/// side by computing the next firing time.
 pub async fn due_sources(pool: &PgPool) -> AppResult<Vec<Source>> {
     let rows: Vec<Source> = sqlx::query_as(
         "SELECT * FROM sources
@@ -212,9 +224,10 @@ pub async fn due_sources(pool: &PgPool) -> AppResult<Vec<Source>> {
     Ok(rows
         .into_iter()
         .filter(|s| match &s.sync_cron {
-            None => true, // interval 型已在 SQL 判定
+            None => true, // the interval kind was already decided in SQL
             Some(expr) => {
-                // 基准取上次同步时刻（没同步过取创建时刻）：错过的触发点在下一轮扫描补上
+                // The baseline is the last sync time (or the creation time if it never synced):
+                // a missed firing point gets caught up on the next scan
                 let anchor = s.last_sync_at.unwrap_or(s.created_at);
                 cron_next_after(expr, anchor).is_some_and(|next| next <= now)
             }
@@ -222,7 +235,8 @@ pub async fn due_sources(pool: &PgPool) -> AppResult<Vec<Source>> {
         .collect())
 }
 
-/// 标记入队（幂等：已在队列/运行中则返回 false，避免重复入队）。
+/// Marks it queued (idempotent: returns false if it is already queued/running, which avoids
+/// double-queueing).
 pub async fn mark_queued(pool: &PgPool, id: Uuid) -> AppResult<bool> {
     let res = sqlx::query(
         "UPDATE sources SET last_sync_status = 'queued'
@@ -242,10 +256,12 @@ pub async fn mark_running(pool: &PgPool, id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// 一次同步收尾。失败时记一条告警，成功时什么都不做——
-/// **"现在好了没有"不是告警中心该回答的问题**，来源页面上就写着。
+/// Wraps up one sync. On failure it records an alert; on success it does nothing at all --
+/// **"is it fine now?" is not a question the alert centre should answer**, and the source page
+/// says so right there.
 ///
-/// 返回值是"记了没有"，调用方据此决定要不要推事件。
+/// The return value is "did it record one", which is how the caller decides whether to emit an
+/// event.
 pub async fn finish_sync(
     pool: &PgPool,
     id: Uuid,
@@ -276,12 +292,14 @@ pub async fn finish_sync(
             kb_id: Some(kb_id),
             severity: "error",
             kind: crate::alerts::kind::SOURCE_SYNC_FAILED,
-            // 内容类给 editor，不只给 admin：管理员需要知道该修连接了，
-            // 但**配这个源的人**更需要知道你的东西没进来
+            // Content-level alerts go to editors, not only admins: an admin needs to know the
+            // connection wants fixing, but **whoever configured this source** needs even more to
+            // know that your stuff did not come in
             min_role: Role::Editor,
             subject_type: Some("source"),
             subject_id: Some(id),
-            // 名字存一份：源被删之后 subject_id 解析不出名字，而告警该留得住
+            // Keep a copy of the name: once the source is deleted, subject_id resolves to no
+            // name, and the alert ought to outlive it
             detail: serde_json::json!({ "name": name, "error": msg }),
         },
     )
@@ -289,13 +307,15 @@ pub async fn finish_sync(
     Ok(true)
 }
 
-/// 文档打标签（整组替换）。
+/// Tags a document (the whole set is replaced).
 ///
-/// **零调用，故意留着**：没有路由，界面上也没有入口。标签会是文档上唯一
-/// 「人自己贴的」维度——来源是它从哪来的，名字与状态是系统给的，三者都表达
-/// 不了「这批要脱敏」这种横跨来源、只有人知道的分组。要不要有这个维度，
-/// 悬而未决——完整的两面之辞写在 `migrations/0002_ingest.sql` 的 `tags` 列上，
-/// 别当死代码删掉。
+/// **Zero callers, deliberately kept**: there is no route, and no entry point in the UI either.
+/// Tags would be the one dimension on a document that "a person stuck on it themselves" -- the
+/// source is where it came from, the name and the status are given by the system, and none of the
+/// three can express a grouping like "this batch needs redacting" that cuts across sources and is
+/// known only to a human. Whether that dimension should exist is still undecided -- the full
+/// argument for both sides is written on the `tags` column in `migrations/0002_ingest.sql`, so do
+/// not delete this as dead code.
 pub async fn set_document_tags(
     pool: &PgPool,
     kb_id: Uuid,
@@ -321,7 +341,7 @@ pub async fn set_document_tags(
     Ok(())
 }
 
-/// 同步用去重：该 KB 是否已有同内容文档。
+/// Dedup for syncing: does this kb already hold a document with the same content.
 pub async fn document_exists_by_sha(pool: &PgPool, kb_id: Uuid, sha256: &str) -> AppResult<bool> {
     let row: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM documents WHERE kb_id = $1 AND sha256 = $2 LIMIT 1")
@@ -332,7 +352,8 @@ pub async fn document_exists_by_sha(pool: &PgPool, kb_id: Uuid, sha256: &str) ->
     Ok(row.is_some())
 }
 
-/// 记录同步时刻（避免调度器在长同步过程中重复触发后又立刻到期）。
+/// Records the sync time (keeps the scheduler from firing again during a long sync and then
+/// coming due immediately after).
 pub async fn touch_sync_time(pool: &PgPool, id: Uuid, at: DateTime<Utc>) -> AppResult<()> {
     sqlx::query("UPDATE sources SET last_sync_at = $2 WHERE id = $1")
         .bind(id)
@@ -343,7 +364,7 @@ pub async fn touch_sync_time(pool: &PgPool, id: Uuid, at: DateTime<Utc>) -> AppR
 }
 
 // ---------------------------------------------------------------------------
-// 同步运行记录（渠道审计历史）
+// Sync run records (the channel audit history)
 // ---------------------------------------------------------------------------
 
 pub async fn start_run(pool: &PgPool, source_id: Uuid) -> AppResult<Uuid> {
@@ -376,7 +397,7 @@ pub async fn finish_run(
     .bind(updated_docs)
     .execute(pool)
     .await?;
-    // 每来源只留最近 50 条
+    // Only the most recent 50 per source are kept
     sqlx::query(
         "DELETE FROM source_sync_runs WHERE source_id = $1 AND id NOT IN
          (SELECT id FROM source_sync_runs WHERE source_id = $1
@@ -412,9 +433,9 @@ mod tests {
             validate_cron("  0  9 * * Mon,Thu ").unwrap(),
             "0 9 * * Mon,Thu"
         );
-        assert!(validate_cron("9 * * *").is_err()); // 4 段
-        assert!(validate_cron("99 9 * * *").is_err()); // 分钟越界
-        assert!(validate_cron("0 0 0 0 0 0").is_err()); // 6 段
+        assert!(validate_cron("9 * * *").is_err()); // 4 fields
+        assert!(validate_cron("99 9 * * *").is_err()); // minute out of range
+        assert!(validate_cron("0 0 0 0 0 0").is_err()); // 6 fields
     }
 
     #[test]

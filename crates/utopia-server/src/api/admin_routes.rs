@@ -1,4 +1,5 @@
-//! 系统管理 API（仅系统管理员）：部署配置 + 代开账号。
+//! System administration API (system admins only): deployment configuration + creating accounts
+//! on someone's behalf.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -43,17 +44,20 @@ pub async fn get_deployment(
 #[derive(Deserialize)]
 pub struct DeploymentReq {
     pub open_registration: bool,
-    /// 任务 worker 并发（1-256）：**外层兜底**，防任务无限堆积。
-    /// 真正的节流是按模型的限额，这个值应当明显大于各模型限额之和
+    /// Job worker concurrency (1-256): **the outer backstop**, to stop jobs piling up without
+    /// bound. The real throttling is the per-model limits, and this value should be clearly
+    /// larger than the sum of those limits
     #[serde(default)]
     pub worker_concurrency: Option<i32>,
-    /// 未单独配置的模型走的并发缺省
+    /// The concurrency default used by models with no configuration of their own
     #[serde(default)]
     pub default_model_concurrency: Option<i32>,
-    /// 单个模型的并发；`max_concurrent` 为 null 表示删掉专属配置、回落到缺省
+    /// Concurrency for a single model; `max_concurrent` = null means delete the dedicated
+    /// configuration and fall back to the default
     #[serde(default)]
     pub model_limit: Option<ModelLimitReq>,
-    /// 新建知识库时本体用哪种语言播种。**不是界面语言**——那个在客户端
+    /// Which language the ontology is seeded in when a knowledge base is created. **Not the UI
+    /// language** -- that one lives in the client
     #[serde(default)]
     pub default_ontology_lang: Option<String>,
 }
@@ -74,12 +78,13 @@ pub async fn put_deployment(
     utopia_store::access::set_open_registration(&state.pool, req.open_registration).await?;
     if let Some(n) = req.worker_concurrency {
         utopia_store::access::set_worker_concurrency(&state.pool, n).await?;
-        // 热生效：调度循环每轮读这个值,无需重启
+        // Takes effect hot: the scheduling loop reads this value every round, no restart needed
         state
             .worker_concurrency
             .store(n as usize, std::sync::atomic::Ordering::Relaxed);
     }
-    // 按模型的限额即时生效：闸门每次调用前读库，发现限额变了就换一把新信号量
+    // The per-model limits take effect immediately: the gate reads the database before every
+    // call, and when it finds the limit changed it swaps in a fresh semaphore
     if let Some(l) = &req.default_ontology_lang {
         utopia_store::access::set_default_ontology_lang(&state.pool, l).await?;
     }
@@ -98,12 +103,13 @@ pub struct CreateUserReq {
     pub email: String,
     pub display_name: String,
     pub password: String,
-    /// 部署角色：admin | editor | viewer
+    /// Deployment role: admin | editor | viewer
     #[serde(default)]
     pub role: Option<String>,
 }
 
-/// 管理员代开账号（注册关闭后的唯一入口）。
+/// An admin creating an account on someone's behalf (the only way in once registration is
+/// closed).
 pub async fn create_user(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -145,15 +151,18 @@ pub async fn create_user(
     Ok(Json(json!({ "user": created })))
 }
 
-/// 停用一个账号（软删除，见 `users.deactivated_at`）。
+/// Deactivate an account (a soft delete, see `users.deactivated_at`).
 ///
-/// **不是 DELETE。** 审计事件、合并日志、改类账本、口径确认的 `actor_id` 都指着
-/// 这个人，那些是审计材料——人走了仍然要能回答「当时是谁做的」。停用只断访问：
-/// 登录查不到人，已签发的 token 下一次请求也查不到（会话校验走同一个函数），
-/// 成员列表里不再出现，而所有归因照旧。
+/// **Not a DELETE.** The `actor_id` of audit events, merge logs, retype ledgers and definition
+/// confirmations all point at this person, and those are audit material -- once the person is
+/// gone, "who did it at the time" still has to be answerable. Deactivation only cuts off access:
+/// login cannot find the person, an already-issued token cannot find them on its next request
+/// either (session validation goes through the same function), they no longer appear in member
+/// lists, while every attribution stays as it was.
 ///
-/// 两条护栏在 store 层而不是这里：不能停用自己、不能停用最后一个管理员。
-/// 放在下面是因为界面挡得住误点，挡不住直接调接口。
+/// Two guardrails sit in the store layer rather than here: you cannot deactivate yourself, and
+/// you cannot deactivate the last admin. They sit down there because the UI can block a misclick
+/// but cannot block a direct call to the API.
 pub async fn deactivate_user(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -174,11 +183,11 @@ pub async fn deactivate_user(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// 把停用的账号放回来。
+/// Put a deactivated account back.
 ///
-/// **可能失败**：停用期间有人用同一个 email 建了新账号，那个部分唯一索引
-/// （`users_email_active_idx`）会挡住恢复。让管理员看见冲突，好过悄悄让两个
-/// 在职账号共用一个 email。
+/// **This can fail**: if somebody created a new account with the same email during the
+/// deactivation, that partial unique index (`users_email_active_idx`) will block the restore.
+/// Letting the admin see the conflict beats quietly letting two active accounts share one email.
 pub async fn reactivate_user(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

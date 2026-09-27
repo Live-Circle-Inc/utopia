@@ -1,5 +1,6 @@
-//! utopia-llm: OpenAI 兼容协议的薄客户端。
-//! 一套代码适配 DeepSeek / Qwen(DashScope 兼容模式) / GLM / OpenAI / Ollama / vLLM。
+//! utopia-llm: a thin client for the OpenAI-compatible protocol.
+//! One set of code covers DeepSeek / Qwen(DashScope compatibility mode) / GLM / OpenAI /
+//! Ollama / vLLM.
 
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -12,16 +13,16 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// OpenAI 协议的工具调用（assistant 回合携带）。
+/// A tool call in the OpenAI protocol (carried on an assistant turn).
 #[derive(Debug, Clone)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// JSON 字符串参数（协议原样透传）
+    /// Arguments as a JSON string (passed through from the protocol verbatim)
     pub arguments: String,
 }
 
-/// 工具对话的一个 assistant 回合：文本与工具调用至少其一。
+/// One assistant turn of a tool conversation: text and tool calls, at least one of the two.
 #[derive(Debug)]
 pub struct AssistantTurn {
     pub content: Option<String>,
@@ -29,7 +30,8 @@ pub struct AssistantTurn {
 }
 
 impl AssistantTurn {
-    /// 还原为 OpenAI 协议的 assistant 消息（回灌对话历史用）。
+    /// Rebuilt as an OpenAI-protocol assistant message (for feeding the conversation history
+    /// back in).
     pub fn to_message(&self) -> serde_json::Value {
         let mut msg = json!({ "role": "assistant", "content": self.content });
         if !self.tool_calls.is_empty() {
@@ -47,70 +49,79 @@ impl AssistantTurn {
     }
 }
 
-/// 工具结果消息（role=tool）。
+/// A tool-result message (role=tool).
 pub fn tool_result_message(tool_call_id: &str, content: &str) -> serde_json::Value {
     json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
 }
 
-/// 带工具的流式回合事件。
+/// Streaming turn events for a conversation with tools.
 #[derive(Debug)]
 pub enum ToolStreamItem {
-    /// 增量正文（即时转发给前端）
+    /// A body delta (forwarded to the frontend immediately)
     Delta(String),
-    /// 流结束：完整回合（累积正文 + 归并后的工具调用）
+    /// End of stream: the complete turn (accumulated body + merged tool calls)
     Turn(AssistantTurn),
 }
 
-/// **没能从端点拿到一个能解析的回答。** 两种：连不上（DNS、连接、TLS、超时），
-/// 或者连上了但回来的根本不是这个 API（响应体解不成 JSON）。
+/// **Could not get a parseable answer out of the endpoint.** Two kinds: we never got through
+/// (DNS, connection, TLS, timeout), or we did get through but what came back is not this API at
+/// all (the response body does not parse as JSON).
 ///
-/// 合成一类是有意的：从用户那边看这两种是同一件事——"你配的这个地址不是模型 API"，
-/// 该做的也是同一件事：去看 URL、看代理。第一版只收传输层失败，结果最常见的那种
-/// 故障（URL 配错、代理挡在中间回了 HTML）一条告警都不产生，
-/// 正是"失败无声"本身。
+/// Merging them into one class is deliberate: from the user's side these are the same thing --
+/// "the address you configured is not a model API" -- and the thing to do is the same too: go look
+/// at the URL, look at the proxy. The first version only caught transport-layer failures, and the
+/// result was that the most common failure of all (URL misconfigured, a proxy in the middle
+/// returning HTML) produced not a single alert, which is "silent failure" itself.
 ///
-/// **不含**端点干干净净地回了 4xx/5xx：那说明它就是模型 API，只是密钥、
-/// 配额或模型名不对——另一类问题，该找的人也不同。
+/// **Does not cover** an endpoint that cleanly returned 4xx/5xx: that means it really is the model
+/// API, just with the wrong key, quota or model name -- a different class of problem, and a
+/// different person to go find.
 ///
-/// 有类型而不是匹配错误文本：调用链上任何一层加一句 context 都会改文本，
-/// 而 `anyhow` 的 source 链让 `downcast_ref` 一路都认得出来。
+/// A type rather than matching on error text: any layer of the call chain adding one line of
+/// context rewrites the text, while `anyhow`'s source chain keeps `downcast_ref` recognising it
+/// all the way up.
 #[derive(Debug, thiserror::Error)]
 #[error("LLM endpoint gave no usable answer: {0}")]
 pub struct Unreachable(#[from] pub reqwest::Error);
 
-/// anyhow 错误链里有没有 [`Unreachable`]。
+/// Whether the anyhow error chain contains an [`Unreachable`].
 pub fn is_unreachable(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<Unreachable>())
 }
 
-/// 端点在限流。**跟 [`Unreachable`] 一样做成类型**，理由也一样：调用方要据此
-/// 决定「等一会儿再来」而不是「这块废了」，而错误文本一路都在被 context 改写。
+/// The endpoint is rate limiting. **A type, just like [`Unreachable`]**, for the same reason: the
+/// caller has to use it to decide "come back in a bit" rather than "this chunk is a write-off",
+/// and the error text is being rewritten by context all the way up.
 ///
-/// 限流与其他 4xx 的区别是**它会自己好**。密钥错了重试一万次还是错，配额满了
-/// 等一分钟就过去——两者混在一起，重试预算就会花在永远不会好的那一类上。
+/// What sets rate limiting apart from the other 4xx is that **it gets better by itself**. A wrong
+/// key is still wrong after ten thousand retries, while a full quota clears in a minute -- mix the
+/// two together and the retry budget gets spent on the class that will never get better.
 #[derive(Debug, thiserror::Error)]
 #[error("LLM endpoint is rate limiting ({status}): {detail}")]
 pub struct RateLimited {
     pub status: u16,
-    /// **常常是 `None`。** 多数厂商的 429 不带 `Retry-After`（实测 SiliconFlow
-    /// 就不带），所以调用方必须自带退避，把这一项当「有则更准」的补充而不是判据。
+    /// **Often `None`.** Most vendors' 429s carry no `Retry-After` (measured: SiliconFlow does
+    /// not), so the caller must bring its own backoff and treat this as a "more precise when
+    /// present" extra rather than as the deciding signal.
     pub retry_after: Option<Duration>,
     pub detail: String,
 }
 
-/// anyhow 错误链里的 [`RateLimited`]，穿透 context 层。
+/// The [`RateLimited`] in an anyhow error chain, seen through the context layers.
 pub fn rate_limited(err: &anyhow::Error) -> Option<&RateLimited> {
     err.chain().find_map(|e| e.downcast_ref::<RateLimited>())
 }
 
-/// 账号付不起这次请求：欠费，或者套餐配额用尽。
+/// The account cannot pay for this request: unpaid balance, or the plan's quota is used up.
 ///
-/// **跟 [`RateLimited`] 分开，因为它不会自己好。** 限流等一分钟就过去，
-/// 欠费等到天亮也还是欠费——重试只是在把同一个错误说三遍，而真正该发生的事
-/// （有人去充值）不会因为重试而发生。
+/// **Kept apart from [`RateLimited`], because it does not get better by itself.** Rate limiting
+/// clears after a minute; an unpaid balance is still unpaid at daybreak -- retrying just says the
+/// same error three times over, while the thing that actually needs to happen (somebody tops the
+/// account up) does not happen because of a retry.
 ///
-/// 实测：一次跑测里 14 篇文档因为它整篇失败，而当时它跟普通失败走同一条路，
-/// 唯一能知道原因的办法是去数据库里翻 `graph_error`。
+/// Measured: in one test run 14 documents failed in their entirety because of this, and at the
+/// time it went down the same path as any ordinary failure -- the only way to learn the reason was
+/// to dig `graph_error` out of the database.
 #[derive(Debug, thiserror::Error)]
 #[error("LLM account cannot pay for this request ({status}): {detail}")]
 pub struct OutOfCredit {
@@ -118,15 +129,17 @@ pub struct OutOfCredit {
     pub detail: String,
 }
 
-/// anyhow 错误链里的 [`OutOfCredit`]，穿透 context 层。
+/// The [`OutOfCredit`] in an anyhow error chain, seen through the context layers.
 pub fn out_of_credit(err: &anyhow::Error) -> Option<&OutOfCredit> {
     err.chain().find_map(|e| e.downcast_ref::<OutOfCredit>())
 }
 
-/// `Retry-After` 的整数秒形态。
+/// The integer-seconds form of `Retry-After`.
 ///
-/// 规范还允许 HTTP-date，这里**不解析**：为一个很少有人发的头引一个日期库不划算，
-/// 而解析失败当成没有正是对的——调用方本来就得有退避，多猜一个数只会更难查。
+/// The spec also allows an HTTP-date, which we **do not** parse: pulling in a date library for a
+/// header hardly anyone sends is not worth it, and treating a parse failure as absent is exactly
+/// right -- the caller has to have backoff anyway, and one more guessed number only makes things
+/// harder to track down.
 fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)?
@@ -138,10 +151,11 @@ fn retry_after_of(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// 非 2xx 统一在这里成型，分成三类：欠费、限流、其他。
+/// Every non-2xx takes shape here, sorted into three classes: out of credit, rate limited, other.
 ///
-/// **503 不算限流**：它可能是端点真挂了、也可能是中间代理，把它算进来会让
-/// 「等一会儿再来」用在等不回来的地方。判据窄一点，宁可退回「其他」。
+/// **503 does not count as rate limiting**: it may be the endpoint genuinely down, or it may be a
+/// proxy in the middle, and counting it would apply "come back in a bit" where nothing is coming
+/// back. Keep the test narrow; falling back to "other" is the lesser evil.
 fn failure(
     kind: &str,
     status: reqwest::StatusCode,
@@ -149,12 +163,13 @@ fn failure(
     body: &serde_json::Value,
 ) -> anyhow::Error {
     let detail = err_detail(body);
-    // **欠费要先判，而且不能只看状态码。**
+    // **Out of credit is judged first, and it cannot go by status code alone.**
     //
-    // 402 是标准答案（SiliconFlow 用它），但 OpenAI 的余额耗尽走的是 **429**，
-    // 靠 body 里的 `insufficient_quota` 区分。只按状态码分类的话，一个没钱的
-    // OpenAI 账号会被当成限流，然后无限退避重试一个永远不会好的东西——
-    // 而退避越久，症状越像"端点慢"，越查不到根上。
+    // 402 is the textbook answer (SiliconFlow uses it), but OpenAI signals an exhausted balance
+    // with **429**, told apart by `insufficient_quota` in the body. Classify by status code alone
+    // and an OpenAI account with no money gets taken for rate limiting, then backs off and retries
+    // forever against something that will never get better -- and the longer the backoff, the more
+    // the symptom looks like "the endpoint is slow", the less anyone finds the root.
     if status == reqwest::StatusCode::PAYMENT_REQUIRED || says_out_of_credit(body) {
         return anyhow::Error::new(OutOfCredit {
             status: status.as_u16(),
@@ -179,24 +194,28 @@ pub struct LlmClient {
     pub model: String,
 }
 
-/// 建连多久算失败。
+/// How long establishing a connection may take before it counts as a failure.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// **多久没有新字节算这个请求死了。**
+/// **How long without a new byte before this request counts as dead.**
 ///
-/// 不能用 `Client::timeout`（请求总时长）：`chat_tools_stream` 是真流式，
-/// 一次长对话正当地跑几分钟，总时长封顶会把它拦腰砍断。而 `read_timeout`
-/// 量的是**沉默**——流式下 token 持续到达，永远碰不到它；非流式下它兜住的
-/// 正是「请求发出去就石沉大海」。
+/// `Client::timeout` (total request duration) will not do: `chat_tools_stream` is genuinely
+/// streaming, one long conversation legitimately runs for minutes, and a cap on total duration
+/// would cut it off mid-body. `read_timeout` measures **silence** instead -- under streaming,
+/// tokens keep arriving and it is never reached; under non-streaming it catches exactly the case
+/// of "the request went out and sank without a trace".
 ///
-/// 为什么是 300 秒而不是 60：非流式调用的首字节要等模型把整段生成完，
-/// 大提示词的抽取正常就要 60–120 秒，服务端排队时更久。设小了会把正常请求
-/// 判死，而这条路上「误杀」比「晚 5 分钟发现」贵得多——它会让本来能成的抽取失败。
+/// Why 300 seconds and not 60: the first byte of a non-streaming call waits for the model to
+/// finish generating the whole passage, extraction with a big prompt normally takes 60-120
+/// seconds, and longer when the server is queueing. Set it too low and normal requests get
+/// declared dead, and on this path "killing a healthy request" is far more expensive than
+/// "noticing five minutes late" -- it makes extractions fail that would otherwise have succeeded.
 ///
-/// **没有它的代价实测过**：`reqwest::Client::new()` 默认不设任何超时，
-/// 32 路并发打同一个账号时请求全部挂住，32 个 worker 槽被永久占满，
-/// 流水线停摆而**一条错误都不报**（jobs 的孤儿回收只在进程启动时跑一次，
-/// 进程活着就永远收不了尸）。7459 块的一次灌入死在第 55 块上。
+/// **The cost of not having it has been measured**: `reqwest::Client::new()` sets no timeout at
+/// all, and with 32 concurrent lanes hitting the same account every request hung, all 32 worker
+/// slots were occupied permanently, and the pipeline stalled while reporting **not a single
+/// error** (the orphan reclaim for jobs only runs once at process start, so while the process is
+/// alive nothing ever gets buried). One ingest of 7459 chunks died on chunk 55.
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 impl LlmClient {
@@ -204,8 +223,8 @@ impl LlmClient {
         Self::with_timeouts(base_url, api_key, model, CONNECT_TIMEOUT, READ_TIMEOUT)
     }
 
-    /// 超时可注入，只为**测得动**——生产走 [`LlmClient::new`]。
-    /// 拿 300 秒去测一次挂死要跑 5 分钟，那样的测试没人会留着。
+    /// Timeouts are injectable only to make this **testable** -- production goes through
+    /// [`LlmClient::new`]. Testing a hang with 300 seconds takes 5 minutes; nobody keeps that test.
     pub fn with_timeouts(
         base_url: &str,
         api_key: Option<&str>,
@@ -218,10 +237,11 @@ impl LlmClient {
                 .connect_timeout(connect)
                 .read_timeout(read)
                 .build()
-                // 只在 TLS 后端起不来时失败，那种情况下退回默认客户端也没有意义，
-                // 但也不该让整个进程崩在这里
+                // Only fails when the TLS backend cannot come up, and in that case falling back
+                // to the default client is meaningless too -- but the whole process should not
+                // die here either
                 .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "HTTP 客户端建不起来，退回无超时的默认客户端");
+                    tracing::error!(error = %e, "could not build the HTTP client, falling back to the default with no timeouts");
                     reqwest::Client::new()
                 }),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -238,7 +258,7 @@ impl LlmClient {
         req
     }
 
-    /// 非流式对话（连通性测试等轻量场景）。
+    /// Non-streaming chat (lightweight cases such as connectivity tests).
     pub async fn chat(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
         let resp = self
             .request("/chat/completions")
@@ -259,8 +279,8 @@ impl LlmClient {
             .ok_or_else(|| anyhow::anyhow!("Unexpected LLM response shape: {body}"))
     }
 
-    /// 工具对话（非流式）：messages 为 OpenAI 协议原始 JSON
-    /// （支持 assistant.tool_calls 与 role=tool 回合），tools 为 function 定义数组。
+    /// Tool conversation (non-streaming): messages is raw OpenAI-protocol JSON (assistant
+    /// .tool_calls and role=tool turns are supported), tools is an array of function definitions.
     pub async fn chat_tools(
         &self,
         messages: &[serde_json::Value],
@@ -315,8 +335,9 @@ impl LlmClient {
         })
     }
 
-    /// 工具对话（流式）：正文增量即时产出，工具调用按 OpenAI 协议的
-    /// index 分片归并（id/name 首帧到达，arguments 逐帧续传），流末给出完整回合。
+    /// Tool conversation (streaming): body deltas are produced immediately, tool calls are merged
+    /// by the OpenAI protocol's index shards (id/name arrive in the first frame, arguments continue
+    /// frame by frame), and the complete turn is given at the end of the stream.
     pub async fn chat_tools_stream(
         &self,
         messages: &[serde_json::Value],
@@ -406,7 +427,7 @@ impl LlmClient {
         Ok(stream)
     }
 
-    /// 流式对话：产出增量文本片段。
+    /// Streaming chat: produces incremental text fragments.
     pub async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -418,7 +439,7 @@ impl LlmClient {
         self.chat_stream_raw(&messages).await
     }
 
-    /// 流式对话（原始 JSON 消息，可携带工具回合上下文）。
+    /// Streaming chat (raw JSON messages, may carry tool-turn context).
     pub async fn chat_stream_raw(
         &self,
         messages: &[serde_json::Value],
@@ -442,7 +463,8 @@ impl LlmClient {
             while let Some(part) = bytes.next().await {
                 let part = part?;
                 buf.push_str(&String::from_utf8_lossy(&part));
-                // SSE 帧以空行分隔；逐帧取出已完整到达的部分
+                // SSE frames are separated by blank lines; take out frame by frame whatever has
+                // fully arrived
                 while let Some(pos) = buf.find("\n\n") {
                     let frame = buf[..pos].to_string();
                     buf.drain(..pos + 2);
@@ -467,7 +489,7 @@ impl LlmClient {
         Ok(stream)
     }
 
-    /// 批量 embedding。
+    /// Batch embedding.
     pub async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
         let resp = self
             .request("/embeddings")
@@ -488,7 +510,7 @@ impl LlmClient {
         for item in data {
             let v = item["embedding"]
                 .as_array()
-                .ok_or_else(|| anyhow::anyhow!("Embedding 响应缺少向量"))?
+                .ok_or_else(|| anyhow::anyhow!("Embedding response has no vector"))?
                 .iter()
                 .filter_map(|x| x.as_f64().map(|f| f as f32))
                 .collect();
@@ -498,12 +520,13 @@ impl LlmClient {
     }
 }
 
-/// 记一次调用的 token 开销。**缓存命中数是这里最重要的一列**：抽取靠
-/// "system 消息在一篇文档内逐块完全相同" 吃供应商的前缀缓存，
-/// 往 system 里塞逐块变化的内容会让它悄悄归零——只有这个数看得见。
+/// Record the token cost of one call. **The cache-hit count is the most important column here**:
+/// extraction feeds on the vendors' prefix caching by way of "the system message is byte-identical
+/// across every chunk within one document", and stuffing content that varies per chunk into system
+/// quietly drops it to zero -- this number is the only place that shows.
 ///
-/// 字段名各家不一：OpenAI 用 prompt_tokens_details.cached_tokens，
-/// DeepSeek 用 prompt_cache_hit_tokens。两个都读，谁在读谁。
+/// Field names differ by vendor: OpenAI uses prompt_tokens_details.cached_tokens, DeepSeek uses
+/// prompt_cache_hit_tokens. Read both, whichever one is there.
 fn log_usage(model: &str, body: &serde_json::Value) {
     let u = &body["usage"];
     if u.is_null() {
@@ -530,14 +553,15 @@ fn err_detail(body: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// 响应体说不说这是余额问题。
+/// Whether the response body says this is a balance problem.
 ///
-/// **给 429 用的**：OpenAI 用同一个状态码表示「太快了」和「没钱了」，
-/// `error.code` 或 `error.type` 里的 `insufficient_quota` 才是分界。
+/// **This is for the 429s**: OpenAI uses one status code for both "too fast" and "out of money",
+/// and `insufficient_quota` in `error.code` or `error.type` is the only dividing line.
 ///
-/// 只认这一个标识、不去匹配 message 的自由文本：措辞会改、会本地化，
-/// 而 `code` 是接口契约的一部分。认不出来就退回按状态码判，那是安全的一侧
-/// （当成限流退避几次，比当成欠费直接放弃温和）。
+/// Only this one marker is recognised, with no matching against the free text of message: wording
+/// changes and gets localised, while `code` is part of the interface contract. When it is not
+/// recognised we fall back to judging by status code, which is the safe side (backing off a few
+/// times as rate limiting is gentler than giving up outright as out of credit).
 fn says_out_of_credit(body: &serde_json::Value) -> bool {
     ["code", "type"]
         .iter()
@@ -549,8 +573,8 @@ fn says_out_of_credit(body: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
 
-    /// 真发一次注定失败的请求，拿一个货真价实的 `reqwest::Error`。
-    /// 端口 1 上不会有东西监听，而 127.0.0.1 不走代理。
+    /// Actually send a request doomed to fail, to get a genuine `reqwest::Error`.
+    /// Nothing will be listening on port 1, and 127.0.0.1 does not go through a proxy.
     async fn a_real_transport_error() -> reqwest::Error {
         reqwest::Client::builder()
             .no_proxy()
@@ -559,20 +583,21 @@ mod tests {
             .get("http://127.0.0.1:1/")
             .send()
             .await
-            .expect_err("端口 1 不该连得上")
+            .expect_err("port 1 should not be connectable")
     }
 
-    /// **接了连接却一个字节都不回**的服务端。
+    /// A server that **accepts the connection and then answers with not one byte**.
     ///
-    /// 这是生产上真正发生的形态，也是最难发现的一种：TCP 连得上、TLS 握得成、
-    /// 请求发得出去，然后没了。连接错误会立刻报，这种不会——没有超时的话
-    /// `send().await` 就永远停在那里，而调用它的 worker 槽再也不释放。
+    /// This is the shape that actually happens in production, and the hardest kind to spot: TCP
+    /// connects, TLS shakes hands, the request goes out, and then nothing. A connection error is
+    /// reported right away, this one is not -- without a timeout `send().await` just stops there
+    /// forever, and the worker slot that called it is never released again.
     async fn a_server_that_never_answers() -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            // 收下连接就攥着不放。**必须持有 socket**：一 drop 就是 FIN，
-            // 那样测的又变成了连接被关闭，不是沉默
+            // Take the connection and never let go. **The socket must be held**: dropping it is
+            // a FIN, and then what is being tested is a closed connection again, not silence
             let mut held = Vec::new();
             while let Ok((sock, _)) = listener.accept().await {
                 held.push(sock);
@@ -581,10 +606,11 @@ mod tests {
         addr
     }
 
-    /// 请求挂住时必须**报错返回**，而不是永远等下去。
+    /// When a request hangs it must **return an error**, not wait forever.
     ///
-    /// 没有这条守着，回归的样子是：一次灌入死在第 55 块，32 个 worker 槽被
-    /// 永久占满，jobs 表里全是 running，而日志和界面上一个字都没有。
+    /// Without this test standing guard, the regression looks like this: an ingest dies on chunk
+    /// 55, all 32 worker slots are occupied permanently, the jobs table is nothing but running,
+    /// and there is not one word in the logs or the UI.
     #[tokio::test]
     async fn a_silent_server_ends_in_an_error_not_a_hang() {
         let addr = a_server_that_never_answers().await;
@@ -605,44 +631,48 @@ mod tests {
         )
         .await;
 
-        // 外层 timeout 触发 = 客户端自己没有把它掐掉，正是要修的那个 bug
-        let inner = out.expect("客户端没有超时，请求一直挂着");
-        assert!(inner.is_err(), "沉默的服务端不该被当成成功");
+        // Outer timeout firing = the client never cut it off itself, exactly the bug being fixed
+        let inner = out.expect("the client did not time out, the request hung forever");
+        assert!(inner.is_err(), "a silent server must not count as success");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
-            "read_timeout 没生效：等了 {:?}",
+            "read_timeout did not take effect: waited {:?}",
             started.elapsed()
         );
     }
 
-    /// **判定必须穿透 context 层。**
+    /// **The check must see through the context layers.**
     ///
-    /// 这是整条链上最容易悄悄坏掉的一环：调用方每加一句 `.context("抽取失败")`
-    /// 就换掉一次错误文本，靠文本匹配的判定当天就废——而症状是告警再也不出现，
-    /// 没有任何测试会红，用户也不会来报"我没收到告警"。
+    /// This is the link in the whole chain most likely to break quietly: every
+    /// `.context("extraction failed")` a caller adds swaps the error text out, and a check that
+    /// matches on text is dead the same day -- while the symptom is that the alert never appears
+    /// again, no test goes red, and no user comes to report "I did not get an alert".
     #[tokio::test]
     async fn unreachable_survives_context_layers() {
         let raw = a_real_transport_error().await;
         let err = anyhow::Error::new(Unreachable(raw))
-            .context("embedding 失败")
-            .context("process_document 失败");
+            .context("embedding failed")
+            .context("process_document failed");
         assert!(is_unreachable(&err));
-        // 顺带钉住"文本会变"这件事本身：最外层已经不含端点的任何字样
+        // Also pins down "the text changes" itself: the outermost layer no longer mentions the
+        // endpoint at all
         assert!(!err.to_string().contains("endpoint"));
     }
 
-    /// 反面：普通错误不该被认成端点问题，否则告警会对任何失败都亮。
+    /// The flip side: an ordinary error must not be taken for an endpoint problem, or the alert
+    /// would light up on every failure.
     #[tokio::test]
     async fn an_ordinary_failure_is_not_the_endpoint() {
-        let e = anyhow::anyhow!("Embedding 响应缺少向量").context("抽取失败");
+        let e = anyhow::anyhow!("Embedding response has no vector").context("extraction failed");
         assert!(!is_unreachable(&e));
     }
 
-    /// **限流要穿透 context 层被认出来。**
+    /// **A rate limit has to be recognised through the context layers.**
     ///
-    /// 与 [`unreachable_survives_context_layers`] 同一个理由，后果更重：认不出来
-    /// 就退回「这块废了」，而限流本来一分钟后就过去了。实测一次 1884 块的灌入里
-    /// 55/60 篇文档因此整篇失败。
+    /// Same reason as [`unreachable_survives_context_layers`], with heavier consequences: not
+    /// recognising it falls back to "this chunk is a write-off", when the rate limit would have
+    /// cleared a minute later. Measured: in one ingest of 1884 chunks, 55 of 60 documents failed
+    /// in their entirety because of this.
     #[tokio::test]
     async fn a_rate_limit_survives_context_layers() {
         let err = anyhow::Error::new(RateLimited {
@@ -650,17 +680,18 @@ mod tests {
             retry_after: None,
             detail: "TPM limit reached".into(),
         })
-        .context("抽取失败")
-        .context("process_document 失败");
-        let hit = rate_limited(&err).expect("限流没被认出来");
+        .context("extraction failed")
+        .context("process_document failed");
+        let hit = rate_limited(&err).expect("the rate limit was not recognised");
         assert_eq!(hit.status, 429);
         assert!(!err.to_string().contains("rate limiting"));
     }
 
-    /// **没有 `Retry-After` 是常规情况，不是异常。**
+    /// **Having no `Retry-After` is the normal case, not the exception.**
     ///
-    /// 多数厂商的 429 不带这个头。判定必须只看类型，退避由调用方自己出——
-    /// 把 `retry_after.is_some()` 当判据的话，这些厂商一个都识别不了。
+    /// Most vendors' 429s do not carry the header. The check must go by type alone, with the
+    /// backoff supplied by the caller -- take `retry_after.is_some()` as the deciding signal and
+    /// not one of these vendors gets recognised.
     #[tokio::test]
     async fn a_rate_limit_without_retry_after_is_still_a_rate_limit() {
         let err = anyhow::Error::new(RateLimited {
@@ -672,7 +703,8 @@ mod tests {
         assert!(rate_limited(&err).unwrap().retry_after.is_none());
     }
 
-    /// 反面：限流不该被当成端点不可达，两者的处置完全不同。
+    /// The flip side: a rate limit must not be taken for an unreachable endpoint -- the two are
+    /// handled in completely different ways.
     #[tokio::test]
     async fn a_rate_limit_is_not_an_unreachable_endpoint() {
         let err = anyhow::Error::new(RateLimited {
@@ -687,20 +719,22 @@ mod tests {
         );
     }
 
-    /// **429 不一定是限流。** OpenAI 用同一个状态码表示「太快了」和「没钱了」，
-    /// 分界在 `error.code`。只按状态码分类的话，一个没钱的账号会被无限退避
-    /// 重试——而重试越久，症状越像「端点慢」，越查不到根上。
+    /// **A 429 is not necessarily a rate limit.** OpenAI uses one status code for both "too fast"
+    /// and "out of money", and the dividing line is in `error.code`. Classify by status code alone
+    /// and an account with no money gets retried with unbounded backoff -- and the longer the
+    /// retrying goes on, the more the symptom looks like "the endpoint is slow", the less anyone
+    /// finds the root.
     #[test]
     fn a_429_that_says_insufficient_quota_is_a_billing_problem() {
         let body = serde_json::json!({
             "error": { "message": "You exceeded your current quota", "code": "insufficient_quota" }
         });
         let e = failure("LLM", reqwest::StatusCode::TOO_MANY_REQUESTS, None, &body);
-        assert!(out_of_credit(&e).is_some(), "该判成欠费");
-        assert!(rate_limited(&e).is_none(), "不该判成限流");
+        assert!(out_of_credit(&e).is_some(), "should be out of credit");
+        assert!(rate_limited(&e).is_none(), "should not be a rate limit");
     }
 
-    /// 402 是标准答案，SiliconFlow 用的就是它。
+    /// 402 is the textbook answer, and it is exactly what SiliconFlow uses.
     #[test]
     fn a_402_is_a_billing_problem() {
         let body = serde_json::json!({ "message": "Sorry, your account balance is insufficient" });
@@ -708,7 +742,8 @@ mod tests {
         assert!(out_of_credit(&e).is_some());
     }
 
-    /// 反面：不带那个标识的 429 还是限流，别把会自己好的事判成要人动手。
+    /// The flip side: a 429 without that marker is still a rate limit -- do not judge something
+    /// that gets better by itself as something needing a human.
     #[test]
     fn a_plain_429_is_still_a_rate_limit() {
         let body = serde_json::json!({ "error": { "message": "TPM limit reached" } });
@@ -717,15 +752,17 @@ mod tests {
         assert!(out_of_credit(&e).is_none());
     }
 
-    /// 反面：别的 4xx 不是限流。密钥错了重试一万次还是错。
+    /// The flip side: other 4xx are not rate limits. A wrong key is still wrong after ten
+    /// thousand retries.
     #[tokio::test]
     async fn an_auth_failure_is_not_a_rate_limit() {
         let e = anyhow::anyhow!("LLM request failed (401 Unauthorized): bad key");
         assert!(rate_limited(&e).is_none());
     }
 
-    /// 端点干干净净地回了 4xx 不算——那说明它就是模型 API，
-    /// 只是密钥或模型名不对，该找的人和该做的事都不一样。
+    /// An endpoint that cleanly returned a 4xx does not count -- that means it really is the model
+    /// API, just with the wrong key or model name, and both the person to find and the thing to do
+    /// are different.
     #[tokio::test]
     async fn a_clean_api_error_is_a_different_problem() {
         let e = anyhow::anyhow!("LLM request failed (401 Unauthorized): bad key");

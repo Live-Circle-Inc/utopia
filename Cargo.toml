@@ -41,10 +41,11 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1"
-# 枚举的字符串化与遍历（来源种类 `SourceKind`）——手写两份清单的漂移就是 #247
+# Stringification and iteration for enums (the source kinds, `SourceKind`) -- two hand-written
+# lists drifting apart is exactly what #247 was
 strum = { version = "0.27", features = ["derive"] }
 
-# Phase 1: 摄入/检索/LLM
+# Phase 1: ingest / retrieval / LLM
 utopia-ingest = { path = "crates/utopia-ingest" }
 utopia-reason = { path = "crates/utopia-reason" }
 utopia-search = { path = "crates/utopia-search" }
@@ -55,10 +56,11 @@ text-splitter = "0.32"
 pdf-extract = "0.12"
 calamine = "0.36"
 pgvector = { version = "0.4", features = ["sqlx"] }
-# `gzip` 不是可选项：一次嵌入回 64×1024 个浮点数，写成 JSON 文本每个数字占
-# 21 字节而信息量只有 4 字节，一次响应 1.33 MB。实测同一条链路上不压缩 62 秒、
-# gzip 21 秒（429 KB）——服务端算完只用 1 秒，其余全在传。
-# `default-features = false` 把它一并关掉了，这里补回来。
+# `gzip` is not optional: one embedding call comes back with 64×1024 floats, and written out as
+# JSON text each number takes 21 bytes to carry 4 bytes of information -- 1.33 MB per response.
+# Measured on the same link: 62 seconds uncompressed, 21 seconds with gzip (429 KB) -- the server
+# spends only 1 second computing, all the rest is transfer.
+# `default-features = false` switches it off along with everything else, so it is added back here.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "http2", "rustls", "webpki-roots", "charset", "system-proxy", "gzip"] }
 
 feed-rs = "2"
@@ -73,8 +75,8 @@ quick-xml = "0.42"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 csv = "1"
 
-# 本体导入：Oxigraph 拆出来的小而专的解析器，只解析不推理——
-# 我们不需要 horned-owl 那套 OWL 推理机，投影只消费 RDF 三元组
+# Ontology import: the small, focused parsers split out of Oxigraph -- they parse, they do not
+# reason. We do not need horned-owl's OWL reasoner; the projection only consumes RDF triples
 oxttl = "0.2"
 oxrdfxml = "0.2"
 oxrdf = "0.3"

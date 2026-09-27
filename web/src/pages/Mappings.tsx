@@ -1,11 +1,15 @@
-// 数据映射：业务概念在数据库里对应什么、怎么算。
+// Data mappings: what a business concept corresponds to in the database, and how it is
+// computed.
 //
-// **这一页在此之前不存在**，而它管的东西一直都在：口径由探查任务提出、在
-// 「审阅」里被确认，然后沉进问数的 system prompt——人再也看不见它，也改不动。
-// `mappings::revise` 连同它的留痕表从建表起就是零调用的。
+// **This page did not exist before**, and yet what it governs was always there: definitions
+// were proposed by the exploration job, confirmed under "Review", and then sank into the
+// ask-your-data system prompt -- after which nobody could see them, let alone change them.
+// `mappings::revise`, along with its revision table, had zero callers from the day it was
+// created.
 //
-// 审批留在同一个端点上（`review/mappings/{id}`，那里已经在写审计流水），
-// 搬的是界面不是逻辑：判断一条口径对不对要看得见表结构，而那在这一页。
+// Approval stays on the same endpoint (`review/mappings/{id}`, which already writes the audit
+// trail); what moved is the UI, not the logic: judging whether a definition is right takes
+// seeing the table structure, and that lives on this page.
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Database, History, Pencil, Plus } from "lucide-react";
@@ -36,8 +40,9 @@ const TONE: Record<string, ChipTone> = {
   rejected: "neutral",
 };
 
-/** 「这个数怎么算」。SQL / 表达式 / 表名按这个优先级取一个——
- *  三者都在回答同一个问题，而 SQL 最具体、表名最粗 */
+/** "How is this number computed". Takes one of SQL / expression / table name, in that order
+ *  of priority -- all three answer the same question, and SQL is the most specific while the
+ *  table name is the coarsest */
 const howComputed = (m: ConceptMapping) =>
   m.sql ?? m.expr ?? m.table_name ?? null;
 
@@ -92,9 +97,9 @@ export function Mappings() {
         <p className="mt-1 text-xs text-neutral-500">{S.mapping.hint}</p>
       </div>
 
-      {/* 分段控件用全站那一套（`bg-white/10` 选中 + 静默的未选中），
-          不是 `u-btn-primary`——那是主操作的实心白，用在这里每个标签都像
-          一个行动号召 */}
+      {/* The segmented control uses the site-wide pattern (`bg-white/10` for selected +
+          a muted unselected state), not `u-btn-primary` -- that is the solid white of a
+          primary action, and used here every tab would look like a call to action */}
       <div className="flex w-fit rounded-lg overflow-hidden border border-white/10">
         {(["definitions", "sources"] as const).map((t) => (
           <button
@@ -199,8 +204,10 @@ export function Mappings() {
   );
 }
 
-/** 一条口径。**未表态的才给确认/拒绝两个按钮**——已表过态的给「编辑」，
- *  因为改口径和第一次拍板是两件事：前者要留痕（revisions），后者不用。 */
+/** One definition. **Only the ones nobody has ruled on get the confirm/reject buttons** --
+ *  the ones already ruled on get "edit", because changing a definition and calling it for the
+ *  first time are two different things: the former has to leave a trace (revisions), the
+ *  latter does not. */
 function MappingCard({
   kbId,
   mapping: m,
@@ -396,8 +403,9 @@ function EditForm({
   );
 }
 
-/** 改版历史。**留痕表从建表起就没人读过**——0006 说留它是为了答得出
- *  「上季度这个数是怎么算的」，这里是那句话的兑现处。 */
+/** Revision history. **Nobody had read the revision table since the day it was created** --
+ *  0006 said it was kept so that "how was this number computed last quarter" could be
+ *  answered, and this is where that sentence is made good. */
 function RevisionList({
   kbId,
   mappingId,
@@ -411,8 +419,9 @@ function RevisionList({
   });
 
   if (revs.isPending) return <Loading>{S.nav.loading}</Loading>;
-  // **取失败要说取失败。** `?? []` 会把一次 500 画成「还没改过」——
-  // 一条改过口径的记录被说成从没改过，比报错难查得多
+  // **A failed fetch has to say it failed.** `?? []` would paint a 500 as "never edited" --
+  // and a definition that was edited being reported as never edited is far harder to track
+  // down than an error message
   if (revs.isError)
     return (
       <div className="mt-3 border-t border-white/5 pt-3">
@@ -450,9 +459,11 @@ function RevisionList({
   );
 }
 
-/** 知识库层的数据源挂载。**从 KB 设置搬来的**——挂哪个库和口径怎么定，
- *  是同一件事的两半：不知道有哪些表，就判断不了口径对不对。
- *  注册新连接仍是部署级动作，管理员给直达入口，其他人指路找管理员。 */
+/** Data source mounting at the knowledge-base level. **Moved here from KB settings** -- which
+ *  database is mounted and how a definition is written are two halves of one thing: without
+ *  knowing which tables exist you cannot judge whether a definition is right.
+ *  Registering a new connection is still a deployment-level action: admins get a direct link,
+ *  everyone else gets pointed at an admin. */
 function DataSources({
   kbId,
   onExplored,
@@ -473,16 +484,18 @@ function DataSources({
   });
   const [picked, setPicked] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
-  // 与 notice 分开：一个是「成了」，一个是「成了一半」，配色也不同
+  // Kept apart from notice: one says "it worked", the other says "it half worked", and their
+  // colours differ too
   const [warning, setWarning] = useState<string | null>(null);
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["kbDataSources", kbId] });
 
   const mount = useMutation({
     mutationFn: (dsId: string) => api.mountDataSource(kbId, dsId),
-    // **挂载成了、schema 没成，是两件事。** 服务端此时回的是 ok（源确实挂上了），
-    // 所以不能照着 `schema_tables: 0` 说「已摄入 0 张表」——那等于说成功了。
-    // 说清楚半成的是哪一半，同一件事也进了告警中心
+    // **"The mount worked" and "the schema did not" are two different things.** The server
+    // returns ok here (the source really did get mounted), so we must not follow
+    // `schema_tables: 0` and say "ingested 0 tables" -- that amounts to claiming success.
+    // Say which half is the half that worked; the same thing also goes into the alert centre
     onSuccess: (r) => {
       setPicked("");
       setNotice(null);

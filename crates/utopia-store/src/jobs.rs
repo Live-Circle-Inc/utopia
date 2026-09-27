@@ -1,8 +1,10 @@
-//! 任务队列：Postgres `FOR UPDATE SKIP LOCKED` 消费。
-//! worker 与 API 同进程（tokio task），失败按 30s * attempts² 退避重试——
-//! 除非处理器把它标成了 `utopia_core::Terminal`，那种一次就到此为止（见 [`retry_delay`]）。
-//! 并发消费：调度循环按"运行中 < 目标数"续派，任务在独立 task 执行；
-//! 目标数经 AtomicUsize 热读——系统设置里改并发即时生效，无需重启。
+//! Job queue: consumed with Postgres `FOR UPDATE SKIP LOCKED`.
+//! The worker runs in the same process as the API (a tokio task), and failures are retried
+//! on a 30s * attempts² backoff -- unless the handler marked it `utopia_core::Terminal`,
+//! in which case one attempt is the end of it (see [`retry_delay`]).
+//! Concurrent consumption: the scheduling loop keeps dispatching while "running < target",
+//! and jobs execute in their own task; the target is read hot through an AtomicUsize --
+//! changing the concurrency in the system settings takes effect at once, no restart needed.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -31,19 +33,23 @@ pub async fn enqueue(pool: &PgPool, kind: &str, payload: serde_json::Value) -> A
     Ok(id)
 }
 
-/// 重排失败任务的范围（#216）。三个条件都可空，空 = 不限。
+/// The scope of a failed-job requeue (#216). All three conditions may be empty;
+/// empty = unrestricted.
 ///
-/// **按库圈要解 payload**：任务表没有 kb 列，payload 只带 `document_id` /
-/// `source_id` / `kb_id` 三种之一，各自解到库。没有库的系统任务只在不限库时才动
+/// **Scoping by KB means resolving the payload**: the jobs table has no kb column, and a
+/// payload carries only one of `document_id` / `source_id` / `kb_id`, each of which
+/// resolves to a KB. System jobs with no KB are only touched when the scope is unrestricted
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequeueScope<'a> {
     pub kb_id: Option<Uuid>,
     pub kind: Option<&'a str>,
-    /// 只排这个时刻之后失败的——告警上的「再跑一遍」圈的正是那次故障窗口
+    /// Only requeue what failed after this instant -- the "run it again" on an alert
+    /// circles exactly that outage window
     pub failed_since: Option<DateTime<Utc>>,
 }
 
-/// 库范围的 SQL 谓词，`$N` 是库 id；`requeue_failed` 与 `failed_count` 共用
+/// The KB-scope SQL predicate, where `$N` is the KB id; shared by `requeue_failed`
+/// and `failed_count`
 const KB_SCOPE: &str = "(
        (j.payload ? 'kb_id' AND j.payload->>'kb_id' = $KB::text)
     OR (j.payload ? 'document_id' AND EXISTS (
@@ -53,10 +59,12 @@ const KB_SCOPE: &str = "(
             SELECT 1 FROM sources s
              WHERE s.id::text = j.payload->>'source_id' AND s.kb_id = $KB)))";
 
-/// 把范围内的 failed 任务放回队列：`attempts` 归零、立即到期。
+/// Put the failed jobs in scope back on the queue: `attempts` reset to zero, due now.
 ///
-/// 处理器都是幂等的（启动时回收孤儿就靠这一点），所以重排永远安全；
-/// 此前 `failed` 是终点，余额耗尽一批文档全失败，充值之后只能逐个点或整源重抽
+/// The handlers are all idempotent (reclaiming orphans at startup rests on exactly that),
+/// so a requeue is always safe; before this `failed` was the end of the line -- the
+/// balance ran out, a whole batch of documents failed, and after topping up the only
+/// options were clicking them one at a time or re-extracting the entire source
 pub async fn requeue_failed(pool: &PgPool, scope: RequeueScope<'_>) -> AppResult<u64> {
     let sql = format!(
         "UPDATE jobs j
@@ -76,7 +84,7 @@ pub async fn requeue_failed(pool: &PgPool, scope: RequeueScope<'_>) -> AppResult
     Ok(res.rows_affected())
 }
 
-/// 范围内 failed 的条数——设置页那一行「N 个失败任务」
+/// How many failed jobs are in scope -- the "N failed jobs" line on the settings page
 pub async fn failed_count(pool: &PgPool, kb_id: Option<Uuid>) -> AppResult<i64> {
     let sql = format!(
         "SELECT count(*) FROM jobs j
@@ -86,7 +94,7 @@ pub async fn failed_count(pool: &PgPool, kb_id: Option<Uuid>) -> AppResult<i64> 
     Ok(sqlx::query_scalar(&sql).bind(kb_id).fetch_one(pool).await?)
 }
 
-/// 认领一个到期任务；没有则返回 None。
+/// Claim one due job; returns None if there is none.
 async fn claim_one(pool: &PgPool) -> AppResult<Option<Job>> {
     let job = sqlx::query_as(
         "UPDATE jobs SET status = 'running', locked_at = now(),
@@ -106,10 +114,11 @@ async fn claim_one(pool: &PgPool) -> AppResult<Option<Job>> {
 }
 
 async fn mark_done(pool: &PgPool, id: i64) -> AppResult<()> {
-    // **成功要把上一次的错清掉。** 重试成功后 last_error 仍留着失败那次的原文，
-    // 于是任务表里出现 status='done' 配着一条错误信息——查问题的人读到的是
-    // 一个已经不成立的原因。实测就这么误导过一次：bootstrap 明明跑成了，
-    // 表上还挂着 "column relation_type does not exist"。
+    // **Success has to clear the previous error.** After a successful retry last_error
+    // still held the text from the attempt that failed, so the jobs table showed
+    // status='done' paired with an error message -- and whoever was debugging read a
+    // cause that no longer held. It misled us exactly once in practice: bootstrap had
+    // plainly succeeded, and the table still carried "column relation_type does not exist".
     sqlx::query(
         "UPDATE jobs SET status = 'done', last_error = NULL, updated_at = now() WHERE id = $1",
     )
@@ -119,17 +128,21 @@ async fn mark_done(pool: &PgPool, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// 下一次重试等多久；`None` = 到此为止。
+/// How long to wait before the next retry; `None` = this is the end of it.
 ///
-/// 两个理由到此为止：**次数用完了**，或者**处理器说了这次不会因为重试而变好**
-/// （`utopia_core::Terminal`，见 issue #195）。后者以前不存在，于是余额耗尽的
-/// 任务照样把三次退避走完——七分钟里余额不会自己长回来，那三次只是把同一句
-/// 错误重说三遍，还把运维该看见的「失败」推迟了七分钟。
+/// Two reasons to stop here: **the attempts are used up**, or **the handler said this
+/// one will not get any better by being retried** (`utopia_core::Terminal`, see issue
+/// #195). The latter did not exist before, so a job that had run out of balance walked
+/// through all three backoffs anyway -- the balance does not grow back on its own inside
+/// seven minutes, so those three attempts only said the same error three times over, and
+/// on top of that pushed the "failed" that ops should have seen seven minutes later.
 ///
-/// 限流相反，它正是这套退避的服务对象：配额会自己恢复。#176 把两类分开就是
-/// 为了让它们各走各的路，而重试策略当时没跟上。
+/// Rate limiting is the opposite: it is exactly what this backoff exists to serve,
+/// because quota does recover on its own. #176 split the two kinds apart precisely so
+/// each could take its own path, and the retry policy did not keep up at the time.
 ///
-/// 抽成纯函数是为了能测——决定在这里，写库只是把决定落下去。
+/// Pulled out as a pure function so it can be tested -- the decision is made here, and
+/// the database write only records the decision.
 fn retry_delay(attempts: i32, max_attempts: i32, terminal: bool) -> Option<i64> {
     if terminal || attempts >= max_attempts {
         return None;
@@ -167,18 +180,22 @@ async fn mark_failed(pool: &PgPool, job: &Job, err: &anyhow::Error) -> AppResult
     Ok(())
 }
 
-/// worker 调度循环：运行中任务数低于目标并发就继续认领（有活立即续派），
-/// 空闲时 2s 轮询；每个任务在独立 tokio task 中执行，长抽取不再阻塞同步。
-/// `concurrency` 每轮热读——系统设置里改并发数即时生效。
-/// 任务分发逻辑由调用方以 handler 注入（store 不依赖上层 crate）。
+/// The worker scheduling loop: while the number of running jobs is below the target
+/// concurrency it keeps claiming (dispatching again the moment there is work), and polls
+/// every 2s when idle; each job executes in its own tokio task, so a long extraction no
+/// longer blocks syncing. `concurrency` is read hot every round -- changing the
+/// concurrency in the system settings takes effect immediately.
+/// The dispatch logic is injected by the caller as a handler (store does not depend on
+/// the crates above it).
 pub async fn run_worker<F, Fut>(pool: PgPool, concurrency: Arc<AtomicUsize>, handler: F)
 where
     F: Fn(Job) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let running = Arc::new(AtomicUsize::new(0));
-    // 孤儿回收：进程被杀时 running 任务无人收尸，文档会永远停在 extracting。
-    // 单进程部署下，启动时仍为 running 的必是孤儿——一律重排队（处理器均幂等）。
+    // Orphan reclamation: when the process is killed nobody buries the running jobs, and
+    // documents sit in extracting forever. In a single-process deployment, anything still
+    // running at startup must be an orphan -- requeue them all (every handler is idempotent).
     match sqlx::query(
         "UPDATE jobs SET status = 'queued', locked_at = NULL, updated_at = now()
          WHERE status = 'running'",
@@ -189,15 +206,15 @@ where
         Ok(r) if r.rows_affected() > 0 => {
             tracing::warn!(
                 count = r.rows_affected(),
-                "回收孤儿任务（上次进程退出时正在运行）"
+                "reclaimed orphaned jobs (they were running when the last process exited)"
             );
         }
         Ok(_) => {}
-        Err(e) => tracing::error!(error = %e, "孤儿任务回收失败"),
+        Err(e) => tracing::error!(error = %e, "failed to reclaim orphaned jobs"),
     }
     tracing::info!(
         concurrency = concurrency.load(Ordering::Relaxed),
-        "jobs worker 已启动"
+        "jobs worker started"
     );
     loop {
         let cap = concurrency.load(Ordering::Relaxed).max(1);
@@ -216,19 +233,19 @@ where
                     let outcome = match result {
                         Ok(()) => mark_done(&pool, job.id).await,
                         Err(e) => {
-                            tracing::warn!(job_id = job.id, kind = %job.kind, error = %e, "任务执行失败");
+                            tracing::warn!(job_id = job.id, kind = %job.kind, error = %e, "job failed");
                             mark_failed(&pool, &job, &e).await
                         }
                     };
                     if let Err(e) = outcome {
-                        tracing::error!(job_id = job.id, error = %e, "任务状态写回失败");
+                        tracing::error!(job_id = job.id, error = %e, "failed to write the job status back");
                     }
                     running.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Ok(None) => tokio::time::sleep(Duration::from_secs(2)).await,
             Err(e) => {
-                tracing::error!(error = %e, "任务认领失败，5s 后重试");
+                tracing::error!(error = %e, "failed to claim a job, retrying in 5s");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -239,7 +256,7 @@ where
 mod tests {
     use super::retry_delay;
 
-    /// 退避照旧：30s、120s、270s，第三次之后放弃。
+    /// Backoff unchanged: 30s, 120s, 270s, and give up after the third.
     #[test]
     fn an_ordinary_failure_backs_off_and_then_gives_up() {
         assert_eq!(retry_delay(1, 3, false), Some(30));
@@ -247,8 +264,9 @@ mod tests {
         assert_eq!(retry_delay(3, 3, false), None);
     }
 
-    /// 标成没救的**第一次就到此为止**——那三次退避加起来是七分钟，
-    /// 而余额不会在七分钟里自己长回来（#195）。
+    /// Marked hopeless means **it ends on the very first attempt** -- those three
+    /// backoffs add up to seven minutes, and the balance will not grow back on its
+    /// own inside seven minutes (#195).
     #[test]
     fn a_terminal_failure_does_not_spend_the_budget() {
         assert_eq!(retry_delay(1, 3, true), None);

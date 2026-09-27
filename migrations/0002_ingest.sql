@@ -1,18 +1,20 @@
--- 摄入管道：来源、文档、分块、版本与同步记录。
+-- The ingestion pipeline: sources, documents, chunks, versions and sync records.
 
--- 来源即文件夹：source 是 Library 中的容器，挂着它摄入的文档，可定时同步。
--- kind: upload（手动上传的虚拟归属，通常 source_id 为 NULL）| watch_folder | url | rss | api。
--- 设计见 docs/DESIGN.md §4 摄入渠道
+-- A source is a folder: a source is a container in the Library holding the documents it
+-- ingested, and it can be synced on a schedule.
+-- kind: upload (the virtual home for manual uploads, where source_id is usually NULL) |
+-- watch_folder | url | rss | api.
+-- For the design see docs/DESIGN.md section 4, ingestion channels
 CREATE TABLE sources (
     id         UUID PRIMARY KEY,
     kb_id      UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
     kind       TEXT NOT NULL DEFAULT 'upload',
     name       TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 各种源自己的配置（url 列表、rss 地址、选择器…）。形状按 kind 变，
-    -- 所以是 JSONB 而不是一堆稀疏列
+    -- Each kind of source's own configuration (url lists, rss addresses, selectors...). The
+    -- shape varies with kind, hence JSONB rather than a pile of sparse columns
     config     JSONB NOT NULL DEFAULT '{}',
-    -- NULL = 仅手动同步
+    -- NULL = manual sync only
     sync_interval_minutes INTEGER,
     last_sync_at     TIMESTAMPTZ,
     last_sync_status TEXT NOT NULL DEFAULT 'never'
@@ -20,12 +22,15 @@ CREATE TABLE sources (
     last_sync_error  TEXT,
     last_sync_added  INTEGER NOT NULL DEFAULT 0,
     icon       TEXT,
-    -- cron 表达式（标准 5 段），与 sync_interval_minutes 互斥。
-    -- UI 用可视化选择器构建，Advanced 模式才暴露原生表达式
+    -- A cron expression (the standard 5 fields), mutually exclusive with
+    -- sync_interval_minutes. The UI builds it with a visual picker, and only Advanced mode
+    -- exposes the raw expression
     sync_cron  TEXT,
-    -- **明文存，不是哈希。** 自部署威胁模型下「只看一次」是自找麻烦：
-    -- 改存明文随时可查（Editor 权限专用端点）。DB 失守时文档本体早已泄露，
-    -- 密钥哈希化没有额外收益；Rotate 保留应对泄露
+    -- **Stored in the clear, not hashed.** Under a self-hosted threat model "you only see it
+    -- once" is asking for trouble: storing it in the clear instead means it can be looked up at
+    -- any time (via a dedicated Editor-permission endpoint). By the time the DB has fallen the
+    -- documents themselves have long since leaked, so hashing the key buys nothing extra;
+    -- Rotate is kept for dealing with a leak
     ingest_token TEXT
 );
 CREATE INDEX sources_kb_idx ON sources (kb_id);
@@ -42,46 +47,56 @@ CREATE TABLE documents (
     status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending', 'parsing', 'indexing', 'embedding', 'ready', 'failed')),
     error           TEXT,
-    -- 文档时间：可信分级 + 可修改（见 DESIGN.md 4.2）
+    -- Document time: graded by trustworthiness and editable (see DESIGN.md 4.2)
     doc_time        TIMESTAMPTZ,
     doc_time_source TEXT NOT NULL DEFAULT 'file_mtime',
     text_len        INT NOT NULL DEFAULT 0,
     chunk_count     INT NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- 图谱抽取状态。**与摄入管道状态分离**：两段式可用，解析完就能检索，
-    -- 抽取慢慢跑
+    -- Graph extraction status. **Kept separate from the ingestion pipeline status**: usable in
+    -- two stages, so search works as soon as parsing is done while extraction takes its time
     graph_status    TEXT NOT NULL DEFAULT 'none'
                     CHECK (graph_status IN ('none', 'queued', 'extracting', 'done', 'failed')),
-    -- 文档标签（过滤与批量组织；不做实体文件夹）。
+    -- Document tags (for filtering and bulk organisation; not entity folders).
     --
-    -- **今天四层皆空，而且是故意留着的。** 没有任何地方写它、读它、露出它——
-    -- `set_document_tags` 零调用，前端连字段名都没提过。它穿过了 53 → 19 → 10
-    -- 三轮迁移折叠，没有一轮有人想起它。
+    -- **Empty at all four layers today, and deliberately left in place.** Nothing writes it,
+    -- reads it or exposes it -- `set_document_tags` has zero callers, and the frontend has never
+    -- so much as mentioned the field name. It came through three rounds of migration folding,
+    -- 53 to 19 to 10, and in none of them did anybody remember it.
     --
-    -- 留着不是忘了删：**标签会是这张表上唯一「人自己贴的」维度**。来源是文档
-    -- 从哪来的，名字与状态是系统给的，三者都不表达「这批要脱敏」「Q3 那一包」
-    -- 这种横跨来源的、只有人知道的分组。
+    -- It is kept not because deleting it was forgotten: **tags would be the only dimension on
+    -- this table that people attach themselves**. The source says where a document came from,
+    -- the name and the status are given by the system, and none of the three expresses a
+    -- grouping like "this batch needs redacting" or "that Q3 bundle" -- one that cuts across
+    -- sources and is known only to a human.
     --
-    -- 反对的一面同样成立：Utopia 的立论是**图才是组织结构**，而 0009 / 0010 /
-    -- 0011 删掉的正是「与本体重复的机制」。加了它就是在图旁边另建一套组织系统。
-    -- 还有更锋利的一问：标签背后最常见的真实需求是「这篇我还没核对」，而那不是
-    -- 标签，是**审阅状态**——那东西该有一等公民的表示。
+    -- The case against holds just as well: Utopia's thesis is that **the graph is the
+    -- organising structure**, and what 0009 / 0010 / 0011 deleted was precisely "mechanisms
+    -- that duplicate the ontology". Adding this means building a second organising system
+    -- alongside the graph. And there is a sharper question still: the most common real need
+    -- behind tags is "I have not checked this one yet", and that is not a tag, it is a **review
+    -- state** -- which deserves a first-class representation of its own.
     --
-    -- 悬而未决，等外部意见。下一个想清理死代码的人：这一段就是结论，别直接删。
+    -- Unresolved, waiting on outside opinion. To the next person who wants to clean up dead
+    -- code: this paragraph is the conclusion, do not just delete it.
     tags            TEXT[] NOT NULL DEFAULT '{}',
-    -- 来源内的逻辑身份（watch_folder 相对路径 / url / rss guid / api external_id）。
-    -- 摄入据此做三路判定：新增 / 变更 / 未变——内容变了原地替换文档而不是堆积
-    -- 新文档，旧版本记入 document_versions
+    -- The logical identity within a source (watch_folder relative path / url / rss guid / api
+    -- external_id). Ingestion uses it for a three-way decision: new / changed / unchanged --
+    -- when the content changed the document is replaced in place rather than piling up a new
+    -- document, and the old version is recorded in document_versions
     external_key    TEXT,
-    -- 目录里消失的文件打这个戳。**默认保留不删**
+    -- Files that have vanished from the directory get this stamp. **Kept, not deleted, by
+    -- default**
     missing_since   TIMESTAMPTZ,
-    -- 抽取失败的原因。独立成列而不是复用 error：那一列归解析管道所有
-    -- （set_status 会清空它），互不干扰
+    -- Why extraction failed. Its own column rather than reusing error, because that column
+    -- belongs to the parsing pipeline (set_status clears it), and the two must not interfere
     graph_error     TEXT,
-    -- 抽取任务的所有权凭证。重抽时自增即「解雇」正在跑的那个任务：它每处理完
-    -- 一个分块回读一次，发现 epoch 变了就安静退出，把文档让给新任务。
-    -- 单靠 graph_status 判断不可靠——接手者会把状态写回 extracting，旧任务无从分辨
+    -- The ownership token for the extraction job. Bumping it on a re-extract "fires" the job
+    -- that is currently running: it reads the value back after each chunk it finishes, and on
+    -- seeing the epoch change it exits quietly and hands the document over to the new job.
+    -- Going by graph_status alone is unreliable -- the job taking over writes the status back to
+    -- extracting, and the old job has no way to tell the difference
     extract_epoch   INT NOT NULL DEFAULT 0
 );
 CREATE INDEX documents_kb_idx ON documents (kb_id, created_at DESC);
@@ -97,14 +112,19 @@ CREATE TABLE chunks (
     heading      TEXT,
     char_start   INT NOT NULL DEFAULT 0,
     char_end     INT NOT NULL DEFAULT 0,
-    -- 维度不定（随所选 embedding 模型），P1 顺扫检索；量大后按已配维度建 HNSW 索引
+    -- The dimension is not fixed (it follows the chosen embedding model); P1 searches with a
+    -- sequential scan, and once the volume grows an HNSW index is built for the configured
+    -- dimension
     embedding    vector,
-    -- 版本软删除：文档更新时旧分块打标（superseded_at）而非物理删除——
-    -- fact_evidence 引用不断链、旧版原文可回放；打标时 embedding 清空（旧版不参与检索）
+    -- Soft deletion by version: on a document update the old chunks are marked
+    -- (superseded_at) rather than physically deleted -- fact_evidence references stay unbroken
+    -- and the old text can be replayed; the embedding is cleared when marking, so old versions
+    -- take no part in search
     doc_version   INT NOT NULL DEFAULT 1,
     superseded_at TIMESTAMPTZ,
-    -- 图谱抽取完成标记：文档更新时被"认领"的未变分块携带它跳过重抽（增量抽取），
-    -- 也让中断的抽取可断点续跑
+    -- The graph-extraction-finished mark: on a document update, unchanged chunks that get
+    -- "claimed" carry it over and skip re-extraction (incremental extraction), and it also lets
+    -- an interrupted extraction resume where it stopped
     extracted_at  TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -116,7 +136,7 @@ CREATE INDEX chunks_live_idx ON chunks (document_id) WHERE superseded_at IS NULL
 CREATE UNIQUE INDEX documents_source_key_idx
     ON documents (source_id, external_key) WHERE external_key IS NOT NULL;
 
--- 版本回放的原料（文件 blob 内容寻址，不删）
+-- The raw material for replaying versions (file blobs are content-addressed and never deleted)
 CREATE TABLE document_versions (
     id          UUID PRIMARY KEY,
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -127,8 +147,8 @@ CREATE TABLE document_versions (
     UNIQUE (document_id, version)
 );
 
--- 每次同步一行（时间/状态/产出/错误），渠道的可审计历史。
--- 每来源仅保留最近 50 条（finish_run 时修剪）
+-- One row per sync (time/status/output/error), the auditable history of a channel.
+-- Only the most recent 50 rows are kept per source (trimmed in finish_run)
 CREATE TABLE source_sync_runs (
     id           UUID PRIMARY KEY,
     source_id    UUID NOT NULL REFERENCES sources(id) ON DELETE CASCADE,

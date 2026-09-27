@@ -1,9 +1,11 @@
-//! 连接串解析。一个输入框、四种 scheme；这里把 URL 拆成各引擎要的字段。
+//! Connection-string parsing. One input box, four schemes; this is where the URL is split
+//! into the fields each engine wants.
 //!
-//! 写法沿用 `postgres://user:pass@host/db` 的形状：凭据在 userinfo 里，HTTP 族的
-//! 令牌放 password 位（`databricks://:TOKEN@…`），路径是「目录 / 库 / schema」，
-//! 引擎特有的开关走 query。`ssl=false` 让 HTTP 族走明文——给本地代理与测试用，
-//! 线上的三家都只认 https。
+//! The syntax follows the shape of `postgres://user:pass@host/db`: credentials live in the
+//! userinfo, the token for the HTTP family goes in the password slot
+//! (`databricks://:TOKEN@…`), the path is "catalog / database / schema", and engine-specific
+//! knobs ride in the query string. `ssl=false` puts the HTTP family on plaintext -- that is
+//! for local proxies and tests; all three hosted services only accept https.
 
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -32,8 +34,9 @@ fn segments(u: &Url) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// 令牌：password 位优先；没有 password 时 username 位也算（`databricks://TOKEN@host`
-/// 少打一个冒号是最常见的手滑）；最后看 `?token=`
+/// Token: the password slot wins; when there is no password the username slot counts too
+/// (`databricks://TOKEN@host` -- dropping one colon is the most common slip); last resort is
+/// `?token=`
 fn token_of(u: &Url) -> Option<String> {
     u.password()
         .map(decode)
@@ -48,7 +51,8 @@ fn base_of(u: &Url, https: bool, default_port: u16) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("{}://: a host is required", u.scheme()))?;
     let port = u.port().unwrap_or(default_port);
     let scheme = if https { "https" } else { "http" };
-    // 默认端口不写进 URL：reqwest 照样能连，日志里也干净
+    // The default port is not written into the URL: reqwest connects all the same, and the
+    // logs stay clean
     let explicit = match (https, port) {
         (true, 443) | (false, 80) => String::new(),
         _ => format!(":{port}"),
@@ -58,8 +62,9 @@ fn base_of(u: &Url, https: bool, default_port: u16) -> anyhow::Result<String> {
 
 /// `trino://user[:password]@host[:port]/[catalog[/schema]][?ssl=true|false]`
 ///
-/// 明文 http 是 Trino 的默认（8080）；带密码、`ssl=true`、或端口 443 / 8443 时走 https——
-/// Trino 自己也拒绝在明文上收密码。`presto://` 是同一个协议的旧名。
+/// Plaintext http is Trino's default (8080); with a password, with `ssl=true`, or on port
+/// 443 / 8443 it goes https -- Trino itself also refuses to take a password over plaintext.
+/// `presto://` is the old name for the same protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrinoConn {
     pub base: String,
@@ -95,7 +100,8 @@ impl TrinoConn {
 
 /// `databricks://:TOKEN@workspace-host/sql/1.0/warehouses/WAREHOUSE_ID[?catalog=main&schema=default]`
 ///
-/// 路径就是 JDBC 里的 httpPath，从控制台复制过来不用改；`?warehouse=ID` 也认。
+/// The path is exactly the httpPath from JDBC, so it can be pasted straight from the console
+/// with no edits; `?warehouse=ID` is accepted too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabricksConn {
     pub base: String,
@@ -132,13 +138,14 @@ impl DatabricksConn {
 
 /// `snowflake://:TOKEN@account.snowflakecomputing.com/[DATABASE[/SCHEMA]][?warehouse=WH&role=R&token_type=pat|oauth]`
 ///
-/// SQL API 不收密码，只收令牌：默认当作 programmatic access token，`token_type=oauth`
-/// 换成 OAuth 令牌。密钥对 JWT 要本地签名，这一版不做。
+/// The SQL API takes no password, only a token: by default it is treated as a programmatic
+/// access token, and `token_type=oauth` switches it to an OAuth token. Key-pair JWT has to be
+/// signed locally, which this version does not do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnowflakeConn {
     pub base: String,
     pub token: String,
-    /// `X-Snowflake-Authorization-Token-Type` 的值
+    /// The value of `X-Snowflake-Authorization-Token-Type`
     pub token_type: &'static str,
     pub database: Option<String>,
     pub schema: Option<String>,

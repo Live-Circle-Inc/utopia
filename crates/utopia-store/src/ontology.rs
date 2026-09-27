@@ -1,4 +1,5 @@
-//! 本体编辑器仓储：类型/关系 CRUD（带使用量与删除保护）+ 未匹配统计。
+//! Ontology editor repository: type/relation CRUD (with usage counts and delete guards) + miss
+//! stats.
 
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -27,7 +28,7 @@ pub async fn entity_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Enti
     .await?)
 }
 
-/// 某个类下的实体实例（按名称序，分页）。返回 (rows, total)。
+/// Entity instances under a class (name order, paginated). Returns (rows, total).
 pub async fn entity_instances(
     pool: &PgPool,
     kb_id: Uuid,
@@ -144,10 +145,11 @@ pub async fn create_entity_type(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// 改一个实体类。
+/// Edit an entity class.
 ///
-/// **`color: None` = 保持原色**，不是重置。从前这里是 `&str`，调用方不给就
-/// 写死一个默认灰蓝，于是任何一次不带颜色的改名都会抹掉用户挑过的颜色。
+/// **`color: None` = keep the current colour**, not a reset. This used to be a `&str`, and when the
+/// caller passed nothing it hard-coded a default grey-blue, so any rename that came without a
+/// colour wiped out the colour the user had picked.
 pub async fn update_entity_type(
     pool: &PgPool,
     kb_id: Uuid,
@@ -179,11 +181,14 @@ pub async fn update_entity_type(
     Ok(())
 }
 
-/// 把 `parents` 设成这个类的全部父类，第一个当主父（左栏画在那一支下）。
+/// Set `parents` as this class's complete set of parents; the first one becomes the primary parent
+/// (the left column draws it under that branch).
 ///
-/// **先查环再写**。单父时代只需要挡自环，一条链天然不会成环；DAG 里 A→B→A
-/// 完全可能，而 `type_matches_domain` 沿父链上溯，成环就是死循环。
-/// SQL 拦不住这个——外键只挡自环，更长的要应用来查。
+/// **Check for cycles before writing**. In the single-parent era all we had to block was a
+/// self-loop, since a single chain can never close into a cycle; in a DAG A→B→A is entirely
+/// possible, and `type_matches_domain` walks up the parent chain, so a cycle is an infinite loop.
+/// SQL cannot stop this -- the foreign key only blocks self-loops, anything longer has to be
+/// checked by the application.
 pub async fn set_parents(
     pool: &PgPool,
     kb_id: Uuid,
@@ -197,7 +202,8 @@ pub async fn set_parents(
         ));
     }
     if !parents.is_empty() {
-        // 候选父类的全部祖先里出现 child，就说明这条边会成环
+        // If child shows up among all the ancestors of the candidate parents, this edge closes a
+        // cycle
         let (cycles,): (i64,) = sqlx::query_as(
             "WITH RECURSIVE up(id) AS (
                  SELECT unnest($2::uuid[])
@@ -228,7 +234,8 @@ pub async fn set_parents(
         )
         .bind(child)
         .bind(p)
-        // 第一个当主父：界面上说明了"画在第一个下面"，不再多一个控件
+        // The first one is the primary parent: the interface says "drawn under the first one", so
+        // no extra control
         .bind(i == 0)
         .execute(pool)
         .await?;
@@ -247,9 +254,11 @@ pub async fn delete_entity_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResu
             "Cannot delete: {usage} entities use this type"
         )));
     }
-    // 只剩这一个 domain 的属性随类一起走：属性必须挂在类上，
-    // 留一个没有 domain 的属性等于留一个不会出现在任何地方的死行。
-    // 还挂在别的类上的则只掉一条关联（外键 CASCADE 负责）
+    // Attributes whose only remaining domain is this class go with it: an attribute has to hang off
+    // a class, and leaving an attribute with no domain leaves a dead row that will never show up
+    // anywhere.
+    // Ones still attached to other classes only lose one association row (the foreign key's CASCADE
+    // takes care of that)
     sqlx::query(
         "DELETE FROM relation_types r
          WHERE r.kind = 'attribute' AND r.kb_id = $1
@@ -275,7 +284,8 @@ pub async fn delete_entity_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResu
     Ok(())
 }
 
-/// 属性字段校验：attribute 必须有所属类和合法 datatype；relation 三者强制为空。
+/// Attribute field validation: an attribute must have an owning class and a valid datatype; for a
+/// relation all three are forced to be empty.
 fn validate_attribute_fields(
     kind: &str,
     domains: &[Uuid],
@@ -303,17 +313,20 @@ fn validate_attribute_fields(
     }
 }
 
-/// 两条指向别的关系的公理，落库前必须过这里。
+/// The two axioms that point at another relation must go through here before they hit the database.
 ///
-/// **最要紧的一条是同库。** 列上的外键是 `REFERENCES relation_types(id)`，
-/// 它不认知识库——数据库层面，A 库的关系可以指向 B 库的关系。RDF 导入那条路
-/// 天然过不去（按 IRI 在本库里查），而接口收的是裸 UUID：不在这里挡，
-/// 拿到任意一个 UUID 就能让推理机跨库读公理。**不能靠前端只列本库选项**，
-/// 那是界面礼貌，不是边界。
+/// **The most important one is same-knowledge-base.** The foreign key on the column is `REFERENCES
+/// relation_types(id)`, which knows nothing about knowledge bases -- at the database level, a
+/// relation in KB A can point at a relation in KB B. The RDF import path cannot get there by
+/// construction (it looks IRIs up inside this KB), but the API takes a bare UUID: without a check
+/// here, any UUID you can get hold of lets the reasoner read axioms across KBs. **We cannot rely on
+/// the frontend only listing options from this KB**, that is interface politeness, not a boundary.
 ///
-/// 另外两条：属性没有逆（它的宾语是字面值，反过来无从谈起），
-/// 子属性不能是自己（DB 有 CHECK，但撞上去是 500，得在这里给出人话）。
-/// 而**逆是自己允许**——那等于对称，R0 会提示改用 `symmetric` 更直白，不算错。
+/// The other two: an attribute has no inverse (its object is a literal value, so there is nothing
+/// to turn around), and a sub-property cannot be itself (the DB has a CHECK, but hitting it is a
+/// 500, so we have to say it in plain words here).
+/// And **being its own inverse is allowed** -- that is the same as symmetric, and R0 will suggest
+/// `symmetric` as more direct; it is not an error.
 async fn validate_property_links(
     pool: &PgPool,
     kb_id: Uuid,
@@ -345,8 +358,9 @@ async fn validate_property_links(
                 .fetch_optional(pool)
                 .await?;
         match ok {
-            // 不区分「不存在」与「在别的库」：能问出哪个 UUID 存在于别处，
-            // 本身就是一点不该给的信息
+            // Do not distinguish "does not exist" from "is in another KB": being able to probe
+            // which UUID exists elsewhere is itself a piece of information we should not be handing
+            // out
             None => {
                 return Err(AppError::invalid(
                     "unknown_relation",
@@ -387,7 +401,8 @@ pub async fn create_relation_type(
         ));
     }
     validate_attribute_fields(kind, domains, datatype)?;
-    // 新建的行 id 还不存在，指向自己无从谈起——所以 self_id 传 None
+    // The new row's id does not exist yet, so pointing at itself is impossible -- hence self_id =
+    // None
     validate_property_links(pool, kb_id, None, kind, ax).await?;
     let is_attr = kind == "attribute";
     let id = Uuid::now_v7();
@@ -416,7 +431,8 @@ pub async fn create_relation_type(
     .bind(ax.symmetric)
     .bind(ax.asymmetric)
     .bind(ax.irreflexive)
-    // 属性不带这两条（上面已经拦了非空的情况，这里是兜底）
+    // Attributes carry neither of these (the non-empty case was rejected above; this is the
+    // backstop)
     .bind(if is_attr { None } else { ax.inverse_of })
     .bind(if is_attr { None } else { ax.sub_property_of })
     .execute(pool)
@@ -427,13 +443,13 @@ pub async fn create_relation_type(
         }
         _ => AppError::Db(e),
     })?;
-    // attribute 不写 range：它的值域是字面量类型，落在 datatype 上
+    // An attribute writes no range: its value space is a literal type, which lives in datatype
     set_domains_ranges(pool, id, domains, if is_attr { &[] } else { ranges }).await?;
     Ok(id)
 }
 
-/// 覆盖式写入 domain / range。**先删后插**，所以它既能用于新建也能用于重导入，
-/// 且不会留下上一轮的残余。
+/// Overwriting write of domain / range. **Delete first, then insert**, so it serves both creation
+/// and re-import, and never leaves residue from the previous round.
 async fn set_domains_ranges(
     pool: &PgPool,
     relation_type_id: Uuid,
@@ -451,7 +467,7 @@ async fn set_domains_ranges(
         if ids.is_empty() {
             continue;
         }
-        // unnest 一次插完，省去逐条往返
+        // unnest inserts them all at once, saving a round trip per row
         sqlx::query(&format!(
             "INSERT INTO {table} (relation_type_id, entity_type_id)
              SELECT $1, x FROM unnest($2::uuid[]) AS x
@@ -476,8 +492,8 @@ pub async fn update_relation_type(
     description: &str,
     datatype: Option<&str>,
     unit: Option<&str>,
-    // None = 不动。不管 domain 的调用方（属性表单）传 None，
-    // 否则一次不相干的改名就会把属性的 domain 清空
+    // None = leave alone. Callers that do not care about domain (the attribute form) pass None,
+    // otherwise one unrelated rename would clear the attribute's domain
     domains: Option<&[Uuid]>,
     ranges: Option<&[Uuid]>,
 ) -> AppResult<()> {
@@ -491,8 +507,9 @@ pub async fn update_relation_type(
             "datatype must be text / number / date / bool".into(),
         ));
     }
-    // 指向别的关系的两条要先问过库：目标在不在本库、是不是关系。
-    // 只在真的填了的时候查——清空（两个都 None）没有目标可验
+    // The two that point at another relation have to be checked against the DB first: is the target
+    // in this KB, and is it a relation.
+    // Only check when they are actually set -- clearing them (both None) leaves no target to verify
     if ax.inverse_of.is_some() || ax.sub_property_of.is_some() {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT kind FROM relation_types WHERE id = $1 AND kb_id = $2")
@@ -503,13 +520,15 @@ pub async fn update_relation_type(
         let (kind,) = row.ok_or(AppError::NotFound)?;
         validate_property_links(pool, kb_id, Some(id), &kind, ax).await?;
     }
-    // kind 不可变（改它会让存量事实语义错乱）。domain/range 可改——
-    // 它们是签名不是身份，"这个属性也适用于承包商" 是个正当的编辑。
-    // datatype/unit 只对 attribute 行生效，datatype 缺省保持原值
+    // kind is immutable (changing it would scramble the meaning of existing facts). domain/range
+    // can change -- they are a signature, not an identity, and "this attribute also applies to
+    // contractors" is a legitimate edit.
+    // datatype/unit only take effect on attribute rows, and an absent datatype keeps the old value
     //
-    // 两条链**跟着六位公理一起覆盖式写**：缺省 = 清空，不是「不动」。
-    // 与 `is_transitive` 那几位同一条规矩——它们是同一个表单里同时提交的
-    // 一组声明，一半覆盖一半保留才是真正会出事的语义
+    // The two links are **overwritten together with the six axiom flags**: absent = cleared, not
+    // "leave alone". Same rule as the `is_transitive` group -- they are one set of declarations
+    // submitted together from a single form, and overwriting half while keeping half is the
+    // semantics that really does get you into trouble
     let res = sqlx::query(
         "UPDATE relation_types
             SET label = $3, temporal = $4,
@@ -553,7 +572,7 @@ pub async fn update_relation_type(
                 "An attribute needs a class (domain)",
             ));
         }
-        // 属性没有 range：它的值域是字面量类型，落在 datatype 上
+        // An attribute has no range: its value space is a literal type, which lives in datatype
         let next_ranges: &[Uuid] = if kind == "attribute" {
             &[]
         } else {
@@ -588,7 +607,7 @@ pub async fn delete_relation_type(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppRe
     Ok(())
 }
 
-/* ---- 未匹配统计 ---- */
+/* ---- Miss statistics ---- */
 
 pub async fn record_miss(
     pool: &PgPool,
@@ -598,18 +617,22 @@ pub async fn record_miss(
     example: Option<&str>,
 ) -> AppResult<()> {
     sqlx::query(
-        // **被拒绝过的照样累加。**
+        // **Dismissed ones keep counting up all the same.**
         //
-        // 从前这里带着 `WHERE dismissed_at IS NULL`，理由是"否则计数会把'不要'
-        // 重新顶成一个待处理信号"。那个理由针对的是**呈现**，用的手段却是
-        // **停止计数**——两件事被绑在一起了，代价是一次点击变成永久失明：
-        // 第一篇里出现一次的说法被忽略掉，后面二十篇都在用它，计数仍停在 1，
-        // 谁也不知道当初那个判断已经不成立，那批事实永远没有谓词。
+        // This used to carry `WHERE dismissed_at IS NULL`, on the grounds that "otherwise the count
+        // pushes a 'no thanks' back up into a pending signal". That reasoning was about
+        // **presentation**, but the mechanism used was **stopping the count** -- the two got tied
+        // together, and the price was that one click turned into permanent blindness: a phrase that
+        // appeared once in the first document gets dismissed, the next twenty documents all use it,
+        // the count is still stuck at 1, nobody knows the original judgement no longer holds, and
+        // that batch of facts never gets a predicate.
         //
-        // 用户是对**当时看得见的证据**做的判断，不是对所有时间。所以计数照记，
-        // 抑制交给读取侧：`list_misses` 仍然只返回未忽略的，提案与自动扩本体
-        // 一步没变；已忽略的连同更新后的计数走 `list_dismissed_misses`，
-        // 在面板上单列一处，人看见涨到 40 了可以自己撤回
+        // The user judged the **evidence visible at the time**, not all of time. So we keep
+        // counting and leave suppression to the read side: `list_misses` still returns only the
+        // non-dismissed ones, so proposals and automatic ontology extension are unchanged; the
+        // dismissed ones, with their updated counts, go through `list_dismissed_misses` and get
+        // their own single spot on the panel, where someone who sees it has climbed to 40 can undo
+        // the dismissal themselves
         "INSERT INTO ontology_misses (kb_id, kind, key, example)
          VALUES ($1, $2, left($3, 80), left($4, 200))
          ON CONFLICT (kb_id, kind, key)
@@ -637,11 +660,13 @@ pub async fn list_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMi
     .await?)
 }
 
-/// 已被忽略的说法，连同**它此后继续累积的计数**。
+/// Phrases that have been dismissed, together with **the count they keep accumulating afterwards**.
 ///
-/// 存在的理由是忽略这个动作曾经是单向门：点下去之后既不再呈现、也不再计数，
-/// 于是"当时只出现过一次"这个判断依据一旦过期，没有任何人看得见。
-/// 这个列表是那扇门上的窗——抑制照旧，但看得见抑制掉的是什么、现在有多重。
+/// The reason this exists is that dismissing used to be a one-way door: once clicked, the phrase
+/// was neither shown nor counted again, so the moment the basis for the judgement -- "it only
+/// appeared once at the time" -- went stale, nobody could see it.
+/// This list is the window in that door -- suppression works as before, but you can see what is
+/// being suppressed and how heavy it has become by now.
 pub async fn list_dismissed_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyMiss>> {
     Ok(sqlx::query_as(
         "SELECT kind, key, example, count FROM ontology_misses
@@ -653,7 +678,7 @@ pub async fn list_dismissed_misses(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<
     .await?)
 }
 
-/// 撤回一次忽略：这个说法重新进入提案与自动扩本体。
+/// Undo a dismissal: this phrase re-enters proposals and automatic ontology extension.
 pub async fn restore_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE ontology_misses SET dismissed_at = NULL, updated_at = now()
@@ -667,10 +692,12 @@ pub async fn restore_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> 
     Ok(())
 }
 
-/// 用户说"不要这个"。**标记而非删除**——删掉的话下一次抽取遇到同一个词
-/// 原样插回来，用户的拒绝活不过一轮抽取。自动扩展路径也据此绕开。
+/// The user said "not this one". **Mark, do not delete** -- if we deleted it, the next extraction
+/// run would hit the same word and insert it right back, and the user's rejection would not survive
+/// a single round of extraction. The automatic extension path steers around it on the same basis.
 ///
-/// 可撤回（见 [`restore_miss`]），且撤回之后计数是连续的——忽略期间照样在记。
+/// Reversible (see [`restore_miss`]), and after the undo the count is continuous -- it kept being
+/// recorded all through the dismissal.
 pub async fn dismiss_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE ontology_misses SET dismissed_at = now()
@@ -684,8 +711,8 @@ pub async fn dismiss_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> 
     Ok(())
 }
 
-/// 本体已经覆盖了这个说法（采纳时调用）：与"用户拒绝"不同，这条真的可以清掉，
-/// 下次抽取它会命中本体，不再是未匹配。
+/// The ontology now covers this phrase (called on adoption): unlike "the user rejected it", this
+/// one really can be cleared -- next extraction it will hit the ontology and no longer be a miss.
 pub async fn clear_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> AppResult<()> {
     sqlx::query("DELETE FROM ontology_misses WHERE kb_id = $1 AND kind = $2 AND key = $3")
         .bind(kb_id)
@@ -696,9 +723,10 @@ pub async fn clear_miss(pool: &PgPool, kb_id: Uuid, kind: &str, key: &str) -> Ap
     Ok(())
 }
 
-/* ---- OWL 导入 ---- */
+/* ---- OWL import ---- */
 
-/// 建一个带 IRI 的类。IRI 是全局身份，重导入据它匹配（见 0001 P2）。
+/// Create a class with an IRI. The IRI is the global identity; re-import matches on it (see 0001
+/// P2).
 pub async fn create_entity_type_with_iri(
     pool: &PgPool,
     kb_id: Uuid,
@@ -719,9 +747,10 @@ pub async fn create_entity_type_with_iri(
     .bind(label)
     .bind(description)
     .bind(iri)
-    // 按 key 取色而不是所有类一个灰蓝——导入一个大本体进来才有得看
+    // Colour by key rather than one grey-blue for every class -- import a big ontology and you'll
+    // see why
     .bind(crate::palette::color_for_key(key))
-    // 形状说明来历：这条路带 IRI，就是词表声明的
+    // Shape says where it came from: this path carries an IRI, so it was declared by a vocabulary
     .bind(crate::palette::shape_for(iri))
     .execute(pool)
     .await
@@ -734,9 +763,9 @@ pub async fn create_entity_type_with_iri(
     Ok(id)
 }
 
-/// 重导入时按 IRI 更新标签与描述。**key 不动**——它可能已经被抽取出的实体
-/// 和提示词引用，改它等于把已有数据的引用打断；上游改 label 是常态，
-/// 而 IRI 才是身份。
+/// On re-import, update label and description by IRI. **key does not move** -- it may already be
+/// referenced by extracted entities and by the prompts, so changing it would break the references
+/// of existing data; upstream changing a label is normal, and the IRI is what the identity is.
 pub async fn update_type_from_import(
     pool: &PgPool,
     kb_id: Uuid,
@@ -747,8 +776,9 @@ pub async fn update_type_from_import(
     let row: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE entity_types
          SET label = $3,
-             -- 空描述不覆盖已有的：上游可能没写 rdfs:comment，而本地可能
-             -- 已经被人按自己的语料调过，那份调整比空值有价值
+             -- An empty description does not overwrite an existing one: upstream may not have
+             -- written rdfs:comment, while locally someone may already have tuned it to their own
+             -- corpus, and that tuning is worth more than a blank
              description = CASE WHEN $4 = '' THEN description ELSE $4 END
          WHERE kb_id = $1 AND iri = $2 RETURNING id",
     )
@@ -761,16 +791,18 @@ pub async fn update_type_from_import(
     Ok(row.map(|(id,)| id))
 }
 
-/// 设父类。自环与已是该父类的情形静默跳过。
-/// 从导入建一个属性（`kind='attribute'`），带 IRI。
+/// Set parent classes. Self-loops and the already-a-parent case are silently skipped.
+/// Create an attribute from an import (`kind='attribute'`), with an IRI.
 ///
-/// 与 [`create_relation_type`] 的区别只在多了 `iri` 与 key 冲突的处置：
-/// 导入按 IRI 认身份，key 撞了是"两个不同的东西争一个短标签"，
-/// 由调用方在计划阶段报告并跳过，到这里不该再撞——所以冲突时返回 None
-/// 而不是覆盖，让调用方把它计进"跳过"。
+/// The only differences from [`create_relation_type`] are the extra `iri` and how a key conflict is
+/// handled: an import takes the IRI as the identity, so a key collision is "two different things
+/// fighting over one short label", which the caller reports and skips during the planning phase; by
+/// the time we get here there should be no collision left -- so on conflict we return None instead
+/// of overwriting, and let the caller count it as "skipped".
 ///
-/// `temporal` 固定 `state`：属性是随时间变化的取值（薪资、人数），
-/// 新值闭合旧值正是我们要的。OWL 里没有对应概念，猜 event 或 eternal 都更差。
+/// `temporal` is fixed at `state`: an attribute is a value that changes over time (salary,
+/// headcount), and having a new value close out the old one is exactly what we want. OWL has no
+/// corresponding concept, and guessing event or eternal would both be worse.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_attribute_with_iri(
     pool: &PgPool,
@@ -808,14 +840,17 @@ pub async fn create_attribute_with_iri(
     Ok(Some(new_id))
 }
 
-/// 从导入建一个关系（`kind='relation'`），带 IRI。
+/// Create a relation from an import (`kind='relation'`), with an IRI.
 ///
-/// `temporal` 固定 `state`：OWL 没有对应概念，而 state（有区间）是三者里唯一
-/// 不丢信息的——event 会把区间压成时点，eternal 会宣称它永不改变。
+/// `temporal` is fixed at `state`: OWL has no corresponding concept, and state (which has an
+/// interval) is the only one of the three that loses no information -- event would squash the
+/// interval into a point in time, and eternal would claim it never changes.
 ///
-/// **`functional` / `inverse_functional` 照词汇表写**。它们驱动时态引擎自动闭合
-/// 旧事实，猜错就成批造假冲突（`part_of` 那次 59 条）。预览已经把声明为函数性的
-/// 关系单独列出来让人过目，所以这里不再自作主张改成 false。
+/// **`functional` / `inverse_functional` are written as the vocabulary has them**. They drive the
+/// temporal engine's automatic closing of old facts, and guessing wrong manufactures false
+/// conflicts in bulk (59 of them, that time with `part_of`). The preview already lists the
+/// relations declared functional separately for a human to look over, so we no longer take it upon
+/// ourselves to force them to false here.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_relation_with_iri(
     pool: &PgPool,
@@ -856,10 +891,11 @@ pub async fn create_relation_with_iri(
     Ok(Some(new_id))
 }
 
-/// 重导入时更新一个已按 IRI 认下的关系。
+/// On re-import, update a relation that has already been identified by IRI.
 ///
-/// **key 不动**（它可能已被事实引用），**空描述不覆盖**（人写过的比上游的准），
-/// **domain/range 整体重写**——它们是上游声明的结构，不是人调过的措辞。
+/// **key does not move** (it may already be referenced by facts), **an empty description does not
+/// overwrite** (what a human wrote is more accurate than what upstream has), **domain/range are
+/// rewritten wholesale** -- they are structure declared by upstream, not wording a human tuned.
 pub async fn update_relation_from_import(
     pool: &PgPool,
     kb_id: Uuid,
@@ -889,7 +925,8 @@ pub async fn update_relation_from_import(
     Ok(true)
 }
 
-/// 记一次导入。原文已按内容寻址存进 blob，这里只记账。
+/// Record an import. The original is already stored content-addressed in the blob store; this is
+/// only the bookkeeping.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_import(
     pool: &PgPool,
@@ -920,7 +957,7 @@ pub async fn record_import(
     Ok(id)
 }
 
-/// 一个库的导入历史（带导入人显示名；删号后为 NULL）。
+/// One KB's import history (with the importer's display name; NULL once the account is deleted).
 pub async fn list_imports(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyImportView>> {
     Ok(sqlx::query_as(
         "SELECT i.id, i.filename, i.format, i.byte_size, i.summary, i.imported_at,
@@ -934,37 +971,42 @@ pub async fn list_imports(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<OntologyI
     .await?)
 }
 
-/// 一条待嵌入的本体行。`text` 是要送去嵌入的那段字，`kind` 决定回写哪张表。
+/// An ontology row waiting to be embedded. `text` is the string to be sent off for embedding, and
+/// `kind` decides which table it is written back to.
 #[derive(Debug, Clone)]
 pub struct TypeToEmbed {
     pub id: Uuid,
     pub kind: TypeKind,
     pub text: String,
-    /// 写进哪一组列。类有两份向量：整段（label + 描述）与只有 label 的那份，
-    /// 分别服务长画像与短说法两种查询（见 `entity_types.label_embedding`）
+    /// Which group of columns to write into. A class has two vectors: the full one (label +
+    /// description) and the label-only one, serving long-profile queries and short-phrase queries
+    /// respectively (see `entity_types.label_embedding`)
     pub field: EmbedField,
 }
 
-/// 同一行的两份向量。**短查询比 Label，长画像比 Full**——查询分了两种形状，
-/// 文档也得分两种，否则短查询会被同义反复的类接管（`Map\nA map.` 那一类）。
+/// The two vectors for one row. **Short queries compare against Label, long profiles against Full**
+/// -- queries come in two shapes, so the documents have to come in two shapes as well, otherwise
+/// short queries get taken over by tautological classes (the `Map\nA map.` kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedField {
     Full,
     Label,
 }
 
-/// 本体行属于哪张表。类进 `entity_types`，关系与属性同住 `relation_types`。
+/// Which table an ontology row belongs to. Classes go into `entity_types`; relations and attributes
+/// share `relation_types`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeKind {
     Entity,
     Relation,
 }
 
-/// 嵌入用的那段字：标签在前、描述在后。
+/// The string used for embedding: label first, description after.
 ///
-/// **key 不进去。** key 是模型读写的令牌（`founding_date`），描述才是这个类型
-/// 的意思所在。把 key 混进来，检索会被"两个 key 长得像"带偏——而
-/// `position`（列表位次）与 `position`（职位）正是长得一模一样的两回事。
+/// **The key does not go in.** The key is the token the model reads and writes (`founding_date`);
+/// the description is where this type's meaning lives. Mix the key in and retrieval gets pulled off
+/// course by "these two keys look alike" -- and `position` (place in a list) versus `position` (a
+/// job title) are precisely two things that look exactly alike.
 fn embed_text(label: &str, description: &str) -> String {
     let d = description.trim();
     if d.is_empty() {
@@ -974,13 +1016,18 @@ fn embed_text(label: &str, description: &str) -> String {
     }
 }
 
-/// 哪些本体行的向量是陈的（没嵌过、描述改了、或换了嵌入模型）。
+/// Which ontology rows have stale vectors (never embedded, description changed, or the embedding
+/// model changed).
 ///
-/// 判据是**比对当时嵌的原文与模型名**，不是看时间戳：描述改了、模型换了，
-/// 时间戳一样看不出来。这样也不必在每个改描述的写入点挂钩子——漏一个就悄悄烂掉。
+/// The test is **comparing the text that was embedded and the model name**, not looking at a
+/// timestamp: if the description changed or the model changed, the timestamp shows nothing. It also
+/// means we do not have to hang a hook off every write site that edits a description -- miss one
+/// and it rots silently.
 ///
-/// `only` 限定只补一半。类型消解只用类，让它等 1633 个关系嵌完是白等六分钟；
-/// 而后台那个补齐任务不限，两边补的是同一批行，谁先跑到都算数。
+/// `only` narrows it to half the work. Type resolution uses classes alone, and making it wait for
+/// 1633 relations to finish embedding is six minutes wasted for nothing; the background backfill
+/// job does not narrow it. Both sides fill in the same set of rows, and whoever gets there first
+/// counts.
 pub async fn types_needing_embedding(
     pool: &PgPool,
     kb_id: Uuid,
@@ -989,7 +1036,8 @@ pub async fn types_needing_embedding(
 ) -> AppResult<Vec<TypeToEmbed>> {
     let mut out = Vec::new();
     if only == Some(TypeKind::Relation) {
-        // 类型消解只用类，等 1633 个关系嵌完是白等六分钟
+        // Type resolution uses classes alone; waiting for 1633 relations to embed is six minutes
+        // wasted
         return relations_needing_embedding(pool, kb_id, model).await;
     }
     let ents: Vec<(Uuid, String, String)> = sqlx::query_as(
@@ -1011,8 +1059,9 @@ pub async fn types_needing_embedding(
         text: embed_text(&label, &desc),
         field: EmbedField::Full,
     }));
-    // 只嵌 label 的那一份（见 `entity_types.label_embedding`）。短查询走这个索引——查询分了两种形状，
-    // 文档也得分两种，否则短查询被同义反复的类接管
+    // The label-only vector (see `entity_types.label_embedding`). Short queries use this index --
+    // queries come in two shapes, so the documents have to as well, otherwise short queries get
+    // taken over by tautological classes
     let labels: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, label FROM entity_types
          WHERE kb_id = $1
@@ -1060,14 +1109,15 @@ async fn relations_needing_embedding(
         id,
         kind: TypeKind::Relation,
         text: embed_text(&label, &desc),
-        // 关系没有短查询那一路,只有整段这一份
+        // Relations have no short-query path, only this full-text one
         field: EmbedField::Full,
     }));
     Ok(out)
 }
 
-/// 回写向量，连同"嵌的是哪段字、用的哪个模型"。三者必须同一次写入——
-/// 只写向量而不写来源，下一轮就会认为它还是陈的，从此每轮重嵌。
+/// Write the vector back, together with "which text was embedded and which model was used". All
+/// three must be written in the same statement -- write the vector without its provenance and the
+/// next round will still think it is stale, re-embedding it every round from then on.
 pub async fn set_type_embeddings(
     pool: &PgPool,
     model: &str,
@@ -1079,7 +1129,8 @@ pub async fn set_type_embeddings(
             TypeKind::Entity => "entity_types",
             TypeKind::Relation => "relation_types",
         };
-        // 两份向量各写各的列（见 `entity_types.label_embedding`）。列名前缀不同，其余一模一样
+        // The two vectors each write their own columns (see `entity_types.label_embedding`).
+        // Different column-name prefix, otherwise exactly the same
         let (vec_col, text_col, model_col) = match item.field {
             EmbedField::Full => ("embedding", "embedded_text", "embedded_model"),
             EmbedField::Label => (
@@ -1103,28 +1154,34 @@ pub async fn set_type_embeddings(
     Ok(())
 }
 
-/// 与给定向量最近的 k 个实体类型。
+/// The k entity types nearest to the given vector.
 ///
-/// **既没有描述、又不在分类树上的类不参加。** 导入一份词表时，凡被
-/// domainIncludes / rangeIncludes / equivalentClass 引用到的外部 IRI 都会建成一行
-/// （OMG、UNECE、GS1…），它们没有标签正文、没有父也没有子——不是词汇，是悬空引用。
+/// **Classes with neither a description nor a place in the class tree do not take part.** When a
+/// vocabulary is imported, every external IRI referenced by domainIncludes / rangeIncludes /
+/// equivalentClass gets a row of its own (OMG, UNECE, GS1...), and those have no label body, no
+/// parent and no child -- they are not vocabulary, they are dangling references.
 ///
-/// 它们偏偏很能赢：`embed_text` 在描述为空时退化成只嵌标签，于是这一行嵌的
-/// 就是 "Location" 一个词。短的那一侧距离系统性地更小（同一条规律在这个文件
-/// 和类型消解里已经栽过三次），于是一个空壳压过了带 83 字定义的
-/// `administrative_area`——实测 `杭州拱墅区` 正是这么丢的。
+/// And they happen to be very good at winning: when the description is empty, `embed_text` degrades
+/// to embedding the label alone, so what that row embeds is the single word "Location". The shorter
+/// side has a systematically smaller distance (we have already tripped over this same regularity
+/// three times, in this file and in type resolution), and so an empty shell beat
+/// `administrative_area` with its 83-character definition -- in a real run, `Hangzhou Gongshu
+/// District` was lost in exactly this way.
 ///
-/// 而且就算端上去也判不了：裁决看到的是 `- location (location)`，没有定义可依。
-/// 装 schema.org 的库里这样的行有 50 个，43 个连一条继承边都没有。
+/// And even if it were served up, it could not be judged: adjudication sees `- location
+/// (location)`, with no definition to go on. In a KB with schema.org installed there are 50 rows
+/// like this, and 43 of them do not have even a single inheritance edge.
 ///
-/// **只是不当候选，不删行**：domain / range 仍然指着它们，删了会断引用。
+/// **Only excluded as candidates, the rows are not deleted**: domain / range still point at them,
+/// and deleting them would break those references.
 pub async fn nearest_entity_types(
     pool: &PgPool,
     kb_id: Uuid,
     embedding: &[f32],
     limit: i64,
-    // true = 比只有 label 的那份向量（见 `entity_types.label_embedding`）。短说法走这一路：**短对短**，
-    // 否则 `district. place` 会被 `Map\nA map.` 这类同义反复的一行话赢过去
+    // true = compare against the label-only vector (see `entity_types.label_embedding`). Short
+    // phrases take this path: **short against short**, otherwise `district. place` loses to
+    // one-line tautologies like `Map\nA map.`
     by_label: bool,
 ) -> AppResult<Vec<TypeCandidate>> {
     let col = if by_label {
@@ -1160,10 +1217,11 @@ pub async fn nearest_entity_types(
         .collect())
 }
 
-/// 与给定向量最近的 k 个关系/属性。
+/// The k relations/attributes nearest to the given vector.
 ///
-/// `only_kind` 分道：字面值宾语的事实要找的是属性，实体宾语的要找的是关系。
-/// 不分道就会把 `founding_date` 这种属性推给一条关系事实，反过来也一样。
+/// `only_kind` splits the lanes: a fact with a literal object is looking for an attribute, one with
+/// an entity object is looking for a relation. Without the split we would push an attribute like
+/// `founding_date` at a relation fact, and the other way round too.
 pub async fn nearest_relation_types(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1200,10 +1258,11 @@ pub async fn nearest_relation_types(
         .collect())
 }
 
-/// 按 key 找关系/属性的 id。给"映射到已有类型"那条路用。
+/// Look up the id of a relation/attribute by key. For the "map onto an existing type" path.
 ///
-/// 不区分 kind：属性与关系同住一张表且共用 key 命名空间，调用方拿到 id 之后
-/// 该怎么用它自己清楚（改写事实时谓词就是谓词）。
+/// It does not distinguish kind: attributes and relations share one table and one key namespace,
+/// and once the caller has the id it knows perfectly well what to do with it (when rewriting a
+/// fact, a predicate is a predicate).
 pub async fn relation_type_id_by_key(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1218,10 +1277,10 @@ pub async fn relation_type_id_by_key(
     Ok(row.map(|(id,)| id))
 }
 
-/// 一个属性声明的 datatype。改写字面值事实时要按它换算。
+/// The datatype an attribute declares. Literal facts are converted according to it when rewritten.
 ///
-/// 以**库里这一条**为准而不是以请求为准：指向已有属性时请求里根本没有
-/// datatype，而即便有，本体说了算。
+/// **The row in the database** is authoritative, not the request: when pointing at an existing
+/// attribute the request has no datatype at all, and even if it did, the ontology decides.
 pub async fn relation_type_datatype(pool: &PgPool, id: Uuid) -> AppResult<Option<String>> {
     let row: Option<(Option<String>,)> =
         sqlx::query_as("SELECT datatype FROM relation_types WHERE id = $1")
@@ -1231,23 +1290,27 @@ pub async fn relation_type_datatype(pool: &PgPool, id: Uuid) -> AppResult<Option
     Ok(row.and_then(|(d,)| d))
 }
 
-/// 把一个 IRI 认到已有的**本地**类上（原本没有 IRI 的那种）。
+/// Adopt an IRI onto an existing **local** class (the kind that had no IRI before).
 ///
-/// **只写 IRI 与形状，不动 label、description、颜色。** 认领要解决的是
-/// "这棵树是断的"，不是"用词汇表的说法覆盖用户的说法"：种子类的描述是照着
-/// 抽取调过的、且跟库的语言走，而 schema.org 的描述是英文样板。覆盖它等于
-/// 悄悄换掉抽取提示词里最承重的那一句。
+/// **Only the IRI and the shape are written; label, description and colour are left alone.** What
+/// adoption is there to fix is "this tree is broken", not "overwrite the user's wording with the
+/// vocabulary's": a seed class's description was tuned against extraction and follows the KB's
+/// language, whereas schema.org's descriptions are English boilerplate. Overwriting it quietly
+/// swaps out the single most load-bearing sentence in the extraction prompt.
 ///
-/// **形状要跟着改，因为形状说的就是来历**（方=词表声明的，圆=语料里长的）。
-/// 一个类被认领成"词表声明的"却还画成圆，画面就在说谎。实测过这个缝：
-/// 往一个已有 `person` / `organization` 的库里导 schema.org，
-/// 那几个类拿到了 IRI 却仍是圆的——有 IRI 却是圆的，自相矛盾。
+/// **The shape does have to change with it, because the shape is exactly what states the
+/// provenance** (square = declared by a vocabulary, round = grown out of the corpus). A class
+/// adopted as "declared by a vocabulary" but still drawn round means the picture is lying. We hit
+/// this gap for real: importing schema.org into a KB that already had `person` / `organization`,
+/// those classes got their IRIs but stayed round -- having an IRI while being round is
+/// self-contradictory.
 ///
-/// 颜色不动：颜色是**身份**（同一个 key 永远同一个色），认领不改变它是谁。
-/// 形状是**来历**，认领恰恰改变了这一点。
+/// Colour is left alone: colour is **identity** (the same key always gets the same colour), and
+/// adoption does not change who it is. Shape is **provenance**, and adoption changes precisely
+/// that.
 ///
-/// 只在 `iri IS NULL` 时写，所以重复导入是幂等的，也绝不会抢走另一个
-/// 词汇表已经认领的类。
+/// It only writes when `iri IS NULL`, so a repeated import is idempotent, and it will never steal a
+/// class another vocabulary has already adopted.
 pub async fn adopt_iri_onto_key(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1267,10 +1330,12 @@ pub async fn adopt_iri_onto_key(
     Ok(row.map(|(id,)| id))
 }
 
-/// 与给定向量最近的若干**类 id**（只回 id，调用方手里已有类的全量数据）。
+/// The nearest **class ids** to the given vector (ids only; the caller already has the full class
+/// data in hand).
 ///
-/// 给抽取用：分块向量在抽取循环里本来就有（实体消解在用），拿它检索出这一块
-/// 可能用得上的类，只把这些铺进提示词。
+/// For extraction: the chunk vector is already there inside the extraction loop (entity resolution
+/// uses it), so we use it to retrieve the classes this chunk might need and lay only those into the
+/// prompt.
 pub async fn nearest_entity_type_ids(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1291,7 +1356,8 @@ pub async fn nearest_entity_type_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 同上，关系与属性。`only_kind` 分道：关系清单与属性清单在提示词里是两段。
+/// Same as above, for relations and attributes. `only_kind` splits the lanes: the relation list and
+/// the attribute list are two separate sections in the prompt.
 pub async fn nearest_relation_type_ids(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1315,16 +1381,18 @@ pub async fn nearest_relation_type_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 一次插完一批类，返回 key → id。
+/// Insert a batch of classes at once; returns key → id.
 ///
-/// **存在的理由是 fsync。** 逐条 `execute(pool)` 每条各自提交，导入 schema.org
-/// 那种量级（968 个类加约 1500 个属性）是五千次 fsync，实测 45 秒；同样的行数
-/// 放进一条语句是 536 毫秒。差的不是往返，是提交。
+/// **The reason this exists is fsync.** Row-by-row `execute(pool)` commits each row on its own, and
+/// importing something the size of schema.org (968 classes plus about 1500 properties) is five
+/// thousand fsyncs -- 45 seconds, measured. The same rows in a single statement are 536
+/// milliseconds. The difference is not the round trips, it is the commits.
 ///
-/// `ON CONFLICT DO NOTHING` 而不是报错：撞 key 的处置在计划阶段已经判过了
-/// （[`crate::ontology::create_entity_type_with_iri`] 的注释讲了为什么不覆盖），
-/// 这里只是把计划落地，撞上说明计划与库不同步，跳过并让调用方从返回的 map 里
-/// 发现少了谁。
+/// `ON CONFLICT DO NOTHING` rather than an error: how to handle a key collision was already decided
+/// during the planning phase (the comment on [`crate::ontology::create_entity_type_with_iri`]
+/// explains why we do not overwrite), and this only puts the plan into effect, so a collision here
+/// means the plan is out of sync with the database -- skip it and let the caller discover who is
+/// missing from the returned map.
 pub async fn create_entity_types_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1340,8 +1408,8 @@ pub async fn create_entity_types_bulk(
     let labels: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
     let descs: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
     let iris: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
-    // 颜色在 Rust 侧按 key 算好，跟着 UNNEST 一起进去——
-    // SQL 里调不到 Rust 函数，而这一批正是导入大本体走的路
+    // Colours are computed from the key on the Rust side and go in along with the UNNEST -- SQL
+    // cannot call a Rust function, and this batch is exactly the path a big ontology import takes
     let colours: Vec<&str> = keys
         .iter()
         .map(|k| crate::palette::color_for_key(k))
@@ -1367,36 +1435,40 @@ pub async fn create_entity_types_bulk(
     Ok(out.into_iter().map(|(id, k)| (k, id)).collect())
 }
 
-/// 批量建关系/属性时的一行。
+/// One row for bulk-creating relations/attributes.
 ///
-/// **`functional` / `inverse_functional` 必须照词汇表写下去，不能默认 false。**
-/// 它们是时态引擎自动闭合事实的依据，猜错会成批造假冲突——`part_of` 被误标成
-/// functional 那次积了 59 条。
+/// **`functional` / `inverse_functional` must be written as the vocabulary has them; they must not
+/// default to false.** They are what the temporal engine uses to close facts automatically, and
+/// guessing wrong manufactures false conflicts in bulk -- the time `part_of` was mislabelled
+/// functional it piled up 59 of them.
 pub struct BulkRelation {
     pub key: String,
     pub label: String,
     pub description: String,
     pub iri: String,
-    /// `relation` 或 `attribute`
+    /// `relation` or `attribute`
     pub kind: &'static str,
-    /// 只对属性有意义，关系传 `None`
+    /// Only meaningful for attributes; relations pass `None`
     pub datatype: Option<String>,
     pub functional: bool,
     pub inverse_functional: bool,
-    /// OWL 属性公理,一致性检查的判定依据（0002 R0）。
-    /// 同样必须照词汇表写下去——`alias_of` 双向是对的、`produces` 双向是错的,
-    /// 分开这两者的只能是本体
+    /// OWL property axioms, the basis on which the consistency check decides (0002 R0).
+    /// These too must be written as the vocabulary has them -- `alias_of` being bidirectional is
+    /// right, `produces` being bidirectional is wrong, and the only thing that tells the two apart
+    /// is the ontology
     pub transitive: bool,
     pub symmetric: bool,
     pub asymmetric: bool,
     pub irreflexive: bool,
 }
 
-/// 一次插完一批关系或属性，返回 key → id。语义同 [`create_entity_types_bulk`]。
+/// Insert a batch of relations or attributes at once; returns key → id. Same semantics as
+/// [`create_entity_types_bulk`].
 ///
-/// `kind` 决定走关系通道还是属性通道；`datatype` 只对属性有意义，关系传 `None`。
-/// `temporal` 固定 `state`——OWL 里没有对应概念，猜 event 或 eternal 都更差
-/// （与单条版的判断一致）。
+/// `kind` decides whether it goes down the relation lane or the attribute lane; `datatype` is only
+/// meaningful for attributes, relations pass `None`.
+/// `temporal` is fixed at `state` -- OWL has no corresponding concept, and guessing event or
+/// eternal would both be worse (consistent with the single-row version's reasoning).
 pub async fn create_relation_types_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1451,14 +1523,15 @@ pub async fn create_relation_types_bulk(
     Ok(out.into_iter().map(|(id, k)| (k, id)).collect())
 }
 
-/// 一次写完一批关系的 domain / range。
+/// Write the domain / range for a batch of relations at once.
 ///
-/// 单条版 [`set_domains_ranges`] 内部已经用 unnest 省了往返，但它对**每条关系**
-/// 都要跑 4 条语句（两张表各一次 DELETE 一次 INSERT）。1500 条关系就是 6000 次
-/// 独立提交，而提交才是代价。这里把所有关系的关联行摊平成两条语句。
+/// The single-row version [`set_domains_ranges`] already uses unnest internally to save round
+/// trips, but it has to run 4 statements for **every relation** (a DELETE and an INSERT on each of
+/// the two tables). 1500 relations is 6000 separate commits, and the commits are the cost. This
+/// flattens the association rows for all the relations into two statements.
 ///
-/// **不 DELETE**：调用方是刚建出来的新关系，关联表上不可能有旧行。
-/// 更新既有关系仍然走单条版。
+/// **No DELETE**: the caller has just created these relations, so there cannot be old rows in the
+/// association tables. Updating an existing relation still goes through the single-row version.
 pub async fn link_domains_ranges_bulk(
     pool: &PgPool,
     domains: &[(Uuid, Uuid)],
@@ -1486,12 +1559,14 @@ pub async fn link_domains_ranges_bulk(
     Ok(())
 }
 
-/// 一次设完一批类的父类。语义同 [`set_parents`]，但**不查环**。
+/// Set the parents for a batch of classes at once. Same semantics as [`set_parents`], but it **does
+/// not check for cycles**.
 ///
-/// 单条版每次都要跑一个递归 CTE 查环，一千个类就是一千次递归查询。
-/// 这里只用于导入新建的类：环是上游词汇表的问题，而 `set_parents` 对环的处置
-/// 本来也只是跳过那一条（`let _ =`），不是中断导入。导入完之后本体页
-/// 仍然能发现并让人处理。
+/// The single-row version has to run a recursive CTE for cycle detection every time, so a thousand
+/// classes is a thousand recursive queries. This is only used for classes newly created by an
+/// import: a cycle is the upstream vocabulary's problem, and `set_parents` only ever handled a
+/// cycle by skipping that one edge (`let _ =`) anyway, not by aborting the import. Once the import
+/// is done, the ontology page can still find it and let someone deal with it.
 pub async fn set_parents_bulk(pool: &PgPool, pairs: &[(Uuid, Uuid)]) -> AppResult<()> {
     if pairs.is_empty() {
         return Ok(());
@@ -1511,14 +1586,17 @@ pub async fn set_parents_bulk(pool: &PgPool, pairs: &[(Uuid, Uuid)]) -> AppResul
     Ok(())
 }
 
-/// 类互斥落库（见 `relation_types` 的公理列）。语义同 [`set_parents_bulk`]。
+/// Persist class disjointness (see the axiom columns on `relation_types`). Same semantics as
+/// [`set_parents_bulk`].
 ///
-/// **两个方向都写。** 解析侧已经把 `owl:disjointWith` 的对称性展开成两条,
-/// 这里照写即可——查"A 与 B 互斥吗"因此不必关心从哪一头问。
+/// **Both directions are written.** The parsing side has already expanded the symmetry of
+/// `owl:disjointWith` into two rows, so here we just write what we are given -- which means asking
+/// "are A and B disjoint" does not have to care which end you ask from.
 ///
-/// `a <> b` 挡自指:自己跟自己互斥是无意义的声明，而它会让一致性检查
-/// 把每个实体都报成矛盾。表上也有同样的 CHECK，两道都留着——
-/// 约束是最后一道，过滤在这里是为了不让一整批插入因为一条脏数据整个失败。
+/// `a <> b` blocks self-reference: declaring something disjoint from itself is a meaningless
+/// declaration, and it would make the consistency check report every entity as a contradiction. The
+/// table has the same CHECK and we keep both -- the constraint is the last line of defence, and
+/// filtering here is so that one dirty row does not fail an entire batch insert.
 pub async fn set_disjoint_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1543,13 +1621,16 @@ pub async fn set_disjoint_bulk(
     Ok(())
 }
 
-/// 把 `others` 设成这个类的**全部**互斥对象（不在其中的解除）。
+/// Set `others` as **all** of this class's disjointness targets (anything not in the list is
+/// released).
 ///
-/// 与 [`set_disjoint_bulk`] 的分工：那个是导入用的「只增不减」，这个是编辑用的
-/// 「这就是全部」。编辑必须能取消——否则界面上取消勾选没有任何效果，
-/// 而用户会以为自己改了。
+/// The division of labour with [`set_disjoint_bulk`]: that one is the import side's "only add,
+/// never remove", this one is the editor's "this is the whole set". Editing has to be able to
+/// cancel -- otherwise unchecking a box in the interface has no effect at all, while the user
+/// believes they changed something.
 ///
-/// 两个方向各写一行，与导入侧一致：查「A 与 B 互斥吗」因此不必关心从哪头问。
+/// One row per direction, same as the import side: asking "are A and B disjoint" therefore does not
+/// have to care which end you ask from.
 pub async fn set_disjoint_for(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1557,7 +1638,8 @@ pub async fn set_disjoint_for(
     others: &[Uuid],
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
-    // 先清掉这个类参与的全部互斥边——两个方向都要清，因为它两边都可能出现
+    // First clear every disjointness edge this class takes part in -- both directions, because it
+    // can show up on either side
     sqlx::query(
         "DELETE FROM entity_type_disjoint
           WHERE kb_id = $1 AND (a_id = $2 OR b_id = $2)",
@@ -1586,10 +1668,10 @@ pub async fn set_disjoint_for(
 }
 
 // ---------------------------------------------------------------------------
-// 本体提案（见 `ontology_proposals`）
+// Ontology proposals (see `ontology_proposals`)
 // ---------------------------------------------------------------------------
 
-/// 一条落库的提案。`payload` 是接口原样返回的那一条。
+/// One stored proposal. `payload` is the one the API returns verbatim.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StoredProposal {
     pub section: String,
@@ -1597,11 +1679,12 @@ pub struct StoredProposal {
     pub payload: serde_json::Value,
 }
 
-/// 把一轮 Suggest 的结果写下来。
+/// Write down the results of one Suggest round.
 ///
-/// **已经有人表过态的不动。** `WHERE status = 'open'` 那一句是这个函数的全部要点：
-/// 重跑 Suggest 会再次算出被拒绝过的那条提案（原材料还在 `ontology_misses` 里），
-/// 不加这句它就会被刷回 open——等于每跑一次都把人的否决抹掉一次。
+/// **Anything a human has already ruled on is left alone.** The `WHERE status = 'open'` clause is
+/// the entire point of this function: re-running Suggest computes the rejected proposal all over
+/// again (the raw material is still sitting in `ontology_misses`), and without that clause it would
+/// be flushed back to open -- which means every run wipes out a human's veto once more.
 pub async fn save_proposals(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1626,7 +1709,8 @@ pub async fn save_proposals(
     Ok(())
 }
 
-/// 还等着人看的提案。新的排前面——旧的那批已经被看过好几眼了。
+/// Proposals still waiting for a human to look at them. Newest first -- the old batch has already
+/// been looked at several times over.
 pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredProposal>> {
     Ok(sqlx::query_as(
         "SELECT section, key, payload FROM ontology_proposals
@@ -1638,11 +1722,11 @@ pub async fn open_proposals(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<StoredP
     .await?)
 }
 
-/// 一条提案被采纳或拒绝了。
+/// A proposal was adopted or rejected.
 ///
-/// **改状态而不是删行**：采纳发生过、拒绝也发生过。跟 `fact_adoptions`、
-/// `entity_retypes` 同一条路。拒绝留痕还有个当下就用得着的作用——下一轮
-/// Suggest 不会把它刷回待看。
+/// **Change the status, do not delete the row**: the adoption happened, and so did the rejection.
+/// The same path as `fact_adoptions` and `entity_retypes`. Leaving a trace of the rejection also
+/// has an immediately useful effect -- the next Suggest round will not flush it back to pending.
 pub async fn decide_proposal(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1666,8 +1750,9 @@ pub async fn decide_proposal(
     Ok(())
 }
 
-/// 还有多少条等着看。0003 的缺口：关掉自动扩展开关之后没有「自上次以来有 N 条」
-/// 的提醒，信号在面板里但没人主动看——有了这张表，提醒就是这一句。
+/// How many are still waiting to be looked at. The gap in 0003: once the automatic-extension switch
+/// is off there is no "N since last time" reminder, so the signal is in the panel but nobody goes
+/// looking -- with this table, the reminder is this one query.
 pub async fn open_proposal_count(pool: &PgPool, kb_id: Uuid) -> AppResult<i64> {
     let (n,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM ontology_proposals WHERE kb_id = $1 AND status = 'open'",
@@ -1678,17 +1763,20 @@ pub async fn open_proposal_count(pool: &PgPool, kb_id: Uuid) -> AppResult<i64> {
     Ok(n)
 }
 
-/// 主语的类型合不合这个关系声明的 domain。沿继承链往上找。
+/// Whether the subject's type fits the domain this relation declares. Searches up the inheritance
+/// chain.
 ///
-/// **只回答，不动数据。** 0001 已经判过：签名是提示不是闸门，
-/// 「用可能错的声明驱动自动动作风险高」。而实体类型本身也是模型判出来的
-/// （实测里 Elon Musk 被判成 `researcher`），拿它去翻转事实方向，
-/// 是两层不确定叠在一起还静默改写。所以这里的结果只用来落一条信号。
+/// **It only answers; it does not touch data.** 0001 already ruled on this: a signature is a hint,
+/// not a gate, and "driving automatic actions off a possibly-wrong declaration is risky". And the
+/// entity type is itself something the model decided (in a real run Elon Musk came out as
+/// `researcher`), so using it to flip the direction of a fact is two layers of uncertainty stacked
+/// on top of each other and then rewritten silently. So the result here is only used to record a
+/// signal.
 ///
-/// 三种回答，别混成两种：
-/// - `Some(true)`  合
-/// - `Some(false)` 不合——**这才是信号**
-/// - `None`        没得判（关系没声明 domain，或实体还没有类型）
+/// Three answers, do not collapse them into two:
+/// - `Some(true)`  fits
+/// - `Some(false)` does not fit -- **this is the signal**
+/// - `None`        nothing to judge (relation declares no domain, or the entity has no type yet)
 pub async fn subject_fits_domain(
     pool: &PgPool,
     relation_type_id: Uuid,
@@ -1715,17 +1803,20 @@ pub async fn subject_fits_domain(
     Ok((declared > 0).then_some(ok > 0))
 }
 
-/// 这些类的全部祖先（不含自己）。沿 `subClassOf` 上溯，多继承与菱形都走得通。
+/// All the ancestors of these classes (not including themselves). Walks up `subClassOf`; multiple
+/// inheritance and diamonds both work.
 ///
-/// 给按块检索的候选补地板用：向量检索偏爱字面出现在正文里的叶子类，
-/// 泛化基类排得很后（实测 `person` 在 976 个类里排第 359），于是提示词里
-/// 没有它们——实体无处落脚，关系签名也退化成 `*`。祖先是本体自己声明的
-/// 泛化关系，拿它补比维护一张「通用类」清单可靠。
+/// Used to put a floor under the per-chunk retrieval candidates: vector retrieval favours the leaf
+/// classes that appear literally in the text, and generalised base classes rank far down (in a real
+/// run `person` came 359th out of 976 classes), so they are missing from the prompt -- the entity
+/// has nowhere to land, and the relation signature degrades to `*`. Ancestors are the
+/// generalisation relationships the ontology declares itself, so filling in from them is more
+/// reliable than maintaining a list of "generic classes".
 pub async fn ancestors_of(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Uuid>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // 递归项里 UNION 去重，菱形继承不会把同一个祖先展开两次
+    // UNION in the recursive term dedupes, so diamond inheritance never expands one ancestor twice
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         "WITH RECURSIVE up(id) AS (
              SELECT unnest($1::uuid[])
@@ -1740,11 +1831,14 @@ pub async fn ancestors_of(pool: &PgPool, ids: &[Uuid]) -> AppResult<Vec<Uuid>> {
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 同 [`subject_fits_domain`]，但类型**从库里的实体读**，不靠调用方手上那份。
+/// Same as [`subject_fits_domain`], but the type is **read from the entity in the database**, not
+/// taken from the copy the caller is holding.
 ///
-/// 抽取器手上的 `entity_type_of` 只覆盖模型在这一块里声明过的实体；宾语常常
-/// 是别处已经存在的实体，这一块没重新声明它的类型，于是查不到、判不了。
-/// 而消解已经把它连到了库里那一行——那里有类型，用它才判得全。
+/// The extractor's `entity_type_of` only covers the entities the model declared in this chunk; the
+/// object is often an entity that already exists elsewhere, and this chunk did not re-declare its
+/// type, so there is nothing to look up and nothing to judge. Resolution, however, has already
+/// linked it to that row in the database -- the type is there, and only using it gives a complete
+/// judgement.
 pub async fn entity_fits_domain(
     pool: &PgPool,
     relation_type_id: Uuid,
@@ -1768,32 +1862,38 @@ pub async fn entity_fits_domain(
     Ok((declared > 0).then_some(ok > 0))
 }
 
-/// 一条 (主语, 谓词, 宾语) 对着谓词的 domain 签名该怎么落。
+/// How a (subject, predicate, object) triple should land against the predicate's domain signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// 谓词没声明 domain——没有判据，照原样落
+    /// The predicate declares no domain -- nothing to judge against, land it as-is
     Unchecked,
-    /// 主语符合
+    /// The subject fits
     Keep,
-    /// 主语不符合、宾语符合：按签名对调主宾
+    /// Subject does not fit, object does: swap subject and object to match the signature
     Swap,
-    /// 两边都不符合：这个关系不适用于这对实体，谓词该留空
+    /// Neither side fits: this relation does not apply to this pair of entities, so the predicate
+    /// should be left empty
     Neither,
 }
 
-/// **三条写谓词的路共用的那一道判断**（#190 / #196）：抽取落新事实、采纳把谓词
-/// 挂回旧事实、合并换掉主语——从前只有抽取查，另外两条各自绕了过去。
+/// **The one check shared by all three paths that write a predicate** (#190 / #196): extraction
+/// landing a new fact, adoption hanging a predicate back onto an old fact, and a merge swapping out
+/// the subject -- it used to be checked by extraction only, and the other two each went around it.
 ///
-/// 判据刻意窄（0012）：只看签名，只在**正向违反而反向成立**时对调，两个方向都
-/// 对不上就留空谓词。参数顺序不是关于世界的断言，是这个 key 的编码约定，所以本体
-/// 在这一处是执法的；哪些类型能参与仍是引导，不在这里裁。
+/// The test is deliberately narrow (0012): it looks at the signature alone, swaps only when the
+/// **forward direction is violated and the reverse holds**, and leaves the predicate empty when
+/// neither direction lines up. Argument order is not an assertion about the world, it is this key's
+/// encoding convention, which is why the ontology is enforced at this one point; which types may
+/// take part is still guidance, and is not adjudicated here.
 ///
-/// **range 也算进来**（#222）。从前只看 domain：`headOf` 的 domain 是 Agent，
-/// schema.org 里 Project 也是 Organization 也是 Agent，于是 `Project Aurora head_of
-/// Li Ting` 主语过关就 Keep，宾语是个人、range 要 Organization 这件事没人看。
-/// 现在两端各看各的：正向两端都不违反才 Keep；否则反过来两端都不违反才 Swap。
-/// 没判出类型的实体在 range 这一端不算违反（"不知道"不是"不符合"，与
-/// `signature_breaks` 同一条纪律）；domain 那一端沿用旧规矩，那是 0012 定下的
+/// **range counts too** (#222). This used to look at domain only: `headOf` has domain Agent, and in
+/// schema.org a Project is an Organization and therefore an Agent as well, so `Project Aurora
+/// head_of Li Ting` passed on the subject and got Keep, while nobody looked at the object being a
+/// person when range wants an Organization. Now each end is checked on its own: Keep only if
+/// neither end is violated in the forward direction; otherwise Swap only if neither end is violated
+/// the other way round. An entity whose type was not decided does not count as a violation on the
+/// range end ("don't know" is not "does not fit", the same discipline as `signature_breaks`); the
+/// domain end keeps the old rule, which is what 0012 laid down
 pub async fn judge_direction(
     pool: &PgPool,
     relation_type_id: Uuid,
@@ -1816,9 +1916,9 @@ pub async fn judge_direction(
     Ok(Fit::Neither)
 }
 
-/// [`entity_fits_domain`] 的 range 版。多一条规矩：实体还没判出类型 → None，
-/// 不当违反——range 这一端是新加的判据（#222），不该让未分类实体的事实因此
-/// 丢掉谓词
+/// The range version of [`entity_fits_domain`]. One extra rule: an entity whose type has not been
+/// decided yet → None, and that does not count as a violation -- the range end is a newly added
+/// test (#222), and it should not cost facts about unclassified entities their predicate
 pub async fn entity_fits_range(
     pool: &PgPool,
     relation_type_id: Uuid,
@@ -1843,13 +1943,14 @@ pub async fn entity_fits_range(
     Ok((declared > 0 && typed).then_some(ok > 0))
 }
 
-/// 把 `owl:inverseOf` / `rdfs:subPropertyOf` 从 IRI 解析成 id。
+/// Resolve `owl:inverseOf` / `rdfs:subPropertyOf` from IRIs into ids.
 ///
-/// **必须是第二遍。** 这两条指的是另一个关系类型，而 id 要等全部插完才有——
-/// 一遍过的写法只能处理「父属性恰好排在前面」的文件，而 RDF 三元组没有顺序。
+/// **This has to be a second pass.** Both of these point at another relation type, and the ids only
+/// exist once everything has been inserted -- a single-pass version can only handle files where
+/// "the super-property happens to come first", and RDF triples have no order.
 ///
-/// 按 IRI 配对而不是按 key：key 会因为撞名加后缀（`part_of_2`），
-/// 而 IRI 是这份本体里的身份。
+/// Paired by IRI rather than by key: a key can pick up a suffix because of a name collision
+/// (`part_of_2`), whereas the IRI is the identity within this ontology.
 pub async fn link_property_axioms_bulk(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1863,8 +1964,9 @@ pub async fn link_property_axioms_bulk(
             if src.is_empty() {
                 return AppResult::Ok(0);
             }
-            // 目标 IRI 在这个库里找不到就跳过这一条——**部分导入是常态**
-            // （引用了外部词汇表里的属性），一条连不上不该让整次导入失败
+            // If the target IRI cannot be found in this KB, skip that one -- **partial imports are
+            // the norm** (properties from external vocabularies get referenced), and one link that
+            // cannot be made should not fail the whole import
             let sql = format!(
                 "UPDATE relation_types r SET {column} = t.id
                    FROM UNNEST($2::text[], $3::text[]) AS p(src, dst)

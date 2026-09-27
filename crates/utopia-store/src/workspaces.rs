@@ -16,7 +16,7 @@ pub async fn list_for_user(pool: &PgPool, user_id: Uuid) -> AppResult<Vec<Worksp
     Ok(rows)
 }
 
-/// 在用户所属组织内新建工作区，创建者为 owner。
+/// Creates a workspace inside the organisation the user belongs to; the creator is the owner.
 pub async fn create(
     pool: &PgPool,
     org_id: Uuid,
@@ -49,7 +49,7 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Workspace> {
         .ok_or(AppError::NotFound)
 }
 
-/// 取用户在工作区中的角色；非成员返回 None。
+/// The user's role in the workspace; returns None for a non-member.
 pub async fn role_of(pool: &PgPool, user_id: Uuid, workspace_id: Uuid) -> AppResult<Option<Role>> {
     let role: Option<(String,)> =
         sqlx::query_as("SELECT role FROM memberships WHERE user_id = $1 AND workspace_id = $2")
@@ -60,7 +60,7 @@ pub async fn role_of(pool: &PgPool, user_id: Uuid, workspace_id: Uuid) -> AppRes
     Ok(role.and_then(|(r,)| Role::parse(&r)))
 }
 
-/// 权限检查：非成员 → NotFound（不泄露存在性）；角色不足 → Forbidden。
+/// Permission check: non-member → NotFound (does not leak existence); role too low → Forbidden.
 pub async fn require_role(
     pool: &PgPool,
     user_id: Uuid,

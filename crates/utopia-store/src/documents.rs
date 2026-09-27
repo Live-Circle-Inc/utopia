@@ -54,29 +54,33 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Document>> {
     Ok(rows)
 }
 
-/// 文库一页，**带筛选与统计**。
+/// One page of the library, **with filters and stats**.
 ///
-/// 从前是 `SELECT * FROM documents WHERE kb_id = $1` 不带上限、前端客户端分页。
-/// 27 篇没事，两万篇会把整张表打进浏览器；而客户端筛选还有个更隐蔽的毛病——
-/// 它只筛得到已经拿下来的那些。
+/// This used to be `SELECT * FROM documents WHERE kb_id = $1` with no limit and pagination on
+/// the client. 27 documents is fine; twenty thousand shoves the whole table into the browser.
+/// And client-side filtering has a subtler flaw on top of that -- it can only filter the ones
+/// that have already been fetched.
 ///
-/// 统计单独算，而且**只按来源作用域算，不受名字/状态筛选影响**：
-/// 「这个来源里有几篇可抽」是那两个批量按钮的作用范围，跟你此刻在搜什么无关。
+/// The stats are computed separately, and **computed over the source scope only, unaffected
+/// by the name/status filters**: "how many documents in this source can be extracted" is the
+/// reach of those two bulk buttons, and has nothing to do with what you are searching for at
+/// this moment.
 #[allow(clippy::too_many_arguments)]
 pub async fn page(
     pool: &PgPool,
     kb_id: Uuid,
-    // None = 全部；Some(None) = 只看没有来源的；Some(Some(id)) = 某个来源
+    // None = everything; Some(None) = only those with no source; Some(Some(id)) = one source
     source: Option<Option<Uuid>>,
     q: Option<&str>,
     graph_status: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> AppResult<DocumentPage> {
-    // 三个筛选都写成「参数为空就不生效」，一条 SQL 覆盖全部组合。
-    // `$2 = 'any'` 那一支是「不按来源筛」，`'none'` 是「只看没有来源的」——
-    // 用两个哨兵字符串而不是两个可空参数，因为 NULL 在这里有歧义：
-    // 它既可能是「不筛」，也可能是「筛出 source_id IS NULL 的」
+    // All three filters are written as "an empty parameter has no effect", so one SQL
+    // statement covers every combination. The `$2 = 'any'` branch is "do not filter by
+    // source", `'none'` is "only those with no source" -- two sentinel strings rather than
+    // two nullable parameters, because NULL is ambiguous here: it could mean "do not filter"
+    // and it could equally mean "filter for source_id IS NULL"
     const WHERE: &str = "WHERE kb_id = $1
            AND ($2 = 'any'
                 OR ($2 = 'none' AND source_id IS NULL)
@@ -109,7 +113,8 @@ pub async fn page(
         .fetch_one(pool)
         .await?;
 
-    // 统计只按来源作用域算：那两个批量按钮作用于整个来源，不是你搜出来的那几条
+    // The stats are computed over the source scope only: those two bulk buttons act on the
+    // whole source, not on the few rows your search turned up
     let stats: (i64, i64, i64) = sqlx::query_as(
         "SELECT
            count(*) FILTER (WHERE status = 'ready'),
@@ -135,7 +140,8 @@ pub async fn page(
     })
 }
 
-/// 这个来源（或整库）里抽取失败的文档 id。**一键重试要的就是这份名单**。
+/// The ids of the documents whose extraction failed in this source (or the whole KB). **This
+/// is exactly the list that one-click retry needs**.
 pub async fn failed_ids(
     pool: &PgPool,
     kb_id: Uuid,
@@ -167,8 +173,9 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Document> {
         .ok_or(AppError::NotFound)
 }
 
-/// 按 kb 收窄的取文档。**id 由模型给出时只能走这一支**：`get` 只按 id 查，
-/// 一个别的库的 id 照样查得到。
+/// Fetch a document narrowed by kb. **When the id comes from the model, this is the only
+/// branch to take**: `get` looks up by id alone, so an id from a different KB is found just
+/// as happily.
 pub async fn find_in_kb(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Option<Document>> {
     Ok(
         sqlx::query_as("SELECT * FROM documents WHERE id = $1 AND kb_id = $2")
@@ -179,7 +186,7 @@ pub async fn find_in_kb(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Optio
     )
 }
 
-/// 按来源内逻辑身份查文档（同步三路判定用）。
+/// Look up a document by its logical identity within a source (for the three-way sync test).
 pub async fn find_by_external_key(
     pool: &PgPool,
     source_id: Uuid,
@@ -194,7 +201,7 @@ pub async fn find_by_external_key(
     )
 }
 
-/// 按来源 + 内容哈希查文档（改名/移动识别用）。
+/// Look up a document by source + content hash (for recognising renames/moves).
 pub async fn find_by_source_sha(
     pool: &PgPool,
     source_id: Uuid,
@@ -209,7 +216,8 @@ pub async fn find_by_source_sha(
     )
 }
 
-/// 迁移前的历史文档（无 external_key）按文件名认领——0008 之前建的行的一次性兜底。
+/// Legacy documents from before the migration (no external_key) are claimed by filename -- a
+/// one-off backstop for rows created before 0008.
 pub async fn find_legacy_by_filename(
     pool: &PgPool,
     source_id: Uuid,
@@ -225,7 +233,7 @@ pub async fn find_legacy_by_filename(
     .await?)
 }
 
-/// 给历史文档补上逻辑身份。
+/// Give a legacy document its logical identity.
 pub async fn adopt_external_key(pool: &PgPool, id: Uuid, external_key: &str) -> AppResult<()> {
     sqlx::query("UPDATE documents SET external_key = $2, updated_at = now() WHERE id = $1")
         .bind(id)
@@ -235,7 +243,8 @@ pub async fn adopt_external_key(pool: &PgPool, id: Uuid, external_key: &str) -> 
     Ok(())
 }
 
-/// 变更：原地替换文档内容（新 sha），状态回 pending 待重跑管道。
+/// Change: replace the document's content in place (new sha), with the status back to pending
+/// for the pipeline to rerun.
 #[allow(clippy::too_many_arguments)]
 pub async fn replace_content(
     pool: &PgPool,
@@ -264,7 +273,8 @@ pub async fn replace_content(
     Ok(())
 }
 
-/// 移动/改名：同内容换了路径，只更新身份，不重跑管道。
+/// Move/rename: same content at a different path, so only the identity is updated and the
+/// pipeline does not rerun.
 pub async fn update_location(
     pool: &PgPool,
     id: Uuid,
@@ -283,7 +293,7 @@ pub async fn update_location(
     Ok(())
 }
 
-/// 记录一个内容版本（版本号自增）。
+/// Record one content version (the version number auto-increments).
 pub async fn record_version(
     pool: &PgPool,
     document_id: Uuid,
@@ -305,9 +315,11 @@ pub async fn record_version(
     Ok(())
 }
 
-/// 全集对账（仅适用于能看到来源完整现状的类型，如 url 的配置列表）：
-/// 本轮见到的 key 清除 missing 标记，没见到的打上标记。
-/// rss（滑动窗口）与 custom 的增量响应（?since=）不可用此函数——缺席≠删除。
+/// Full-set reconciliation (only for the source types whose complete present state is
+/// visible, such as a url's configured list): keys seen this round have their missing mark
+/// cleared, keys not seen get marked.
+/// Unusable for rss (a sliding window) or for custom's incremental responses (?since=) --
+/// absence ≠ deletion.
 pub async fn reconcile_missing(
     pool: &PgPool,
     source_id: Uuid,
@@ -326,7 +338,7 @@ pub async fn reconcile_missing(
     Ok(())
 }
 
-/// 本轮出现的条目清除 missing 标记（条目失而复得）。
+/// Clear the missing mark on items that turned up this round (an item lost and found again).
 pub async fn clear_missing_keys(pool: &PgPool, source_id: Uuid, keys: &[String]) -> AppResult<()> {
     sqlx::query(
         "UPDATE documents SET missing_since = NULL, updated_at = now()
@@ -339,7 +351,8 @@ pub async fn clear_missing_keys(pool: &PgPool, source_id: Uuid, keys: &[String])
     Ok(())
 }
 
-/// 显式墓碑（custom 响应的 deleted[]）：来源声明删除才打标，绝不因缺席推断。
+/// Explicit tombstones (the deleted[] of a custom response): mark only when the source
+/// declares a deletion, never infer one from absence.
 pub async fn mark_missing_keys(pool: &PgPool, source_id: Uuid, keys: &[String]) -> AppResult<u64> {
     let res = sqlx::query(
         "UPDATE documents SET missing_since = now(), updated_at = now()
@@ -352,7 +365,7 @@ pub async fn mark_missing_keys(pool: &PgPool, source_id: Uuid, keys: &[String]) 
     Ok(res.rows_affected())
 }
 
-/// 该来源下所有已标记 missing 的文档 id（批量清理用）。
+/// The ids of every document under this source already marked missing (for bulk cleanup).
 pub async fn list_missing(pool: &PgPool, source_id: Uuid) -> AppResult<Vec<Uuid>> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM documents WHERE source_id = $1 AND missing_since IS NOT NULL",
@@ -407,13 +420,18 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// 重建文档分块（事务内，幂等）。返回 (chunk_id, text) 供全文索引。
+/// Rebuild a document's chunks (inside a transaction, idempotent). Returns (chunk_id, text)
+/// for the full-text index.
 ///
-/// 认领式增量：新块先按文本内容在现行块里找同款——找到即"认领"（原行只更新
-/// 序号/偏移/版本，身份延续：embedding、extracted_at、证据链接全部原地保鲜，
-/// 未变段落不重抽也不会被误标"证据过期"）；没同款的才新建。落选的旧块软删除
-/// （superseded_at 打标）而非物理删除——fact_evidence 引用不断链、旧版可回放，
-/// embedding 清空（旧版不参与检索，向量是存储大头不留）。
+/// Claim-based incrementalism: a new chunk first looks among the live chunks for one with the
+/// same text -- finding one is a "claim" (the existing row only updates its
+/// seq/offsets/version, and identity carries over: embedding, extracted_at and evidence links
+/// all stay fresh in place, so an unchanged paragraph is neither re-extracted nor wrongly
+/// marked "evidence stale"); only chunks with no match are created anew. Old chunks left
+/// unclaimed are soft-deleted (marked with superseded_at) rather than physically deleted --
+/// fact_evidence references keep their chain and old versions can be replayed -- with the
+/// embedding cleared (old versions take no part in retrieval, and vectors are the bulk of the
+/// storage, so they are not kept).
 pub async fn replace_chunks(
     pool: &PgPool,
     kb_id: Uuid,
@@ -428,7 +446,8 @@ pub async fn replace_chunks(
     .fetch_one(&mut *tx)
     .await?;
 
-    // 认领池：现行块按文本分组（同文重复块按多重集配对，各认领各的）
+    // The claim pool: live chunks grouped by text (duplicate chunks with identical text are
+    // paired up as a multiset, each claiming its own)
     let old: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT id, text FROM chunks WHERE document_id = $1 AND superseded_at IS NULL",
     )
@@ -441,8 +460,9 @@ pub async fn replace_chunks(
         claim_pool.entry(text).or_default().push(id);
     }
 
-    // 第一阶段：认领（原行更新）与待插清单——新块必须等软删跑完再插，
-    // 否则"落选"判定会把本轮刚插入的新块一并软删
+    // Phase one: the claims (updating existing rows) and the to-insert list -- new chunks
+    // must wait for the soft delete to run before being inserted, otherwise the "unclaimed"
+    // test would soft-delete the new chunks this very round just inserted
     let mut adopted: Vec<Uuid> = Vec::new();
     let mut to_insert: Vec<(Uuid, &ChunkPiece)> = Vec::new();
     let mut out = Vec::with_capacity(pieces.len());
@@ -469,7 +489,7 @@ pub async fn replace_chunks(
         }
     }
 
-    // 第二阶段：落选旧块（新版里没有同款文本）→ 软删
+    // Phase two: old chunks left unclaimed (no matching text in the new version) → soft delete
     sqlx::query(
         "UPDATE chunks SET superseded_at = now(), embedding = NULL
          WHERE document_id = $1 AND superseded_at IS NULL AND NOT (id = ANY($2))",
@@ -479,7 +499,7 @@ pub async fn replace_chunks(
     .execute(&mut *tx)
     .await?;
 
-    // 第三阶段：插入新块
+    // Phase three: insert the new chunks
     for (id, piece) in to_insert {
         sqlx::query(
             "INSERT INTO chunks
@@ -501,7 +521,8 @@ pub async fn replace_chunks(
     Ok(out)
 }
 
-/// 抽取完成一个分块即打标（认领的块携带标记跳过重抽；也让中断的抽取可续跑）。
+/// Mark a chunk the moment its extraction finishes (a claimed chunk carries the mark and
+/// skips re-extraction; it also lets an interrupted extraction resume).
 pub async fn mark_chunk_extracted(pool: &PgPool, chunk_id: Uuid) -> AppResult<()> {
     sqlx::query("UPDATE chunks SET extracted_at = now() WHERE id = $1")
         .bind(chunk_id)
@@ -510,11 +531,14 @@ pub async fn mark_chunk_extracted(pool: &PgPool, chunk_id: Uuid) -> AppResult<()
     Ok(())
 }
 
-/// 单篇排队重抽（手动 Extract = 强制全量）：清增量标记、解雇在跑的任务、置
-/// queued、建抽取任务——与 `queue_extraction` 同一套语义，只是作用于一篇。返回 job id。
+/// Queue one document for re-extraction (a manual Extract = a forced full run): clear the
+/// incremental marks, fire the job that is running, set queued, create the extract job -- the
+/// same semantics as `queue_extraction`, only acting on a single document. Returns the job id.
 ///
-/// 整体一个事务。分开做时任一步失败都会留下半截状态：清了标记却没换 epoch，
-/// 旧任务察觉不到自己已被顶替；或者置了 queued 却没建成任务，文档就此无人接手。
+/// All of it one transaction. Done separately, a failure at any step leaves half-finished
+/// state: the marks cleared but the epoch not swapped, so the old job never notices it has
+/// been superseded; or the status set to queued with no job created, so nobody ever takes the
+/// document up.
 pub async fn queue_extraction_one(pool: &PgPool, document_id: Uuid) -> AppResult<i64> {
     let mut tx = pool.begin().await?;
     sqlx::query(
@@ -524,7 +548,8 @@ pub async fn queue_extraction_one(pool: &PgPool, document_id: Uuid) -> AppResult
     .bind(document_id)
     .execute(&mut *tx)
     .await?;
-    // 未开跑的旧任务顺手删掉：连点两次 Extract 不该攒出两个任务同抽一篇
+    // Old jobs that have not started are deleted while we are at it: clicking Extract twice
+    // should not accumulate two jobs extracting the same document
     sqlx::query(
         "DELETE FROM jobs WHERE kind = 'extract_document' AND status = 'queued'
            AND payload->>'document_id' = $1",
@@ -552,7 +577,7 @@ pub async fn queue_extraction_one(pool: &PgPool, document_id: Uuid) -> AppResult
     Ok(job_id)
 }
 
-/// 文档查看器：全部分块（按顺序）。
+/// The document viewer: every chunk, in order.
 pub async fn chunks_full(
     pool: &PgPool,
     document_id: Uuid,
@@ -567,7 +592,8 @@ pub async fn chunks_full(
     Ok(rows)
 }
 
-/// 抽取用分块：文本 + 摄入阶段已算好的 embedding（消解 v2 复用，零额外 embed 调用）。
+/// Chunks for extraction: the text plus the embedding already computed during ingestion
+/// (reused by resolution v2, for zero extra embed calls).
 #[derive(Debug, sqlx::FromRow)]
 pub struct ChunkForExtract {
     pub id: Uuid,
@@ -580,7 +606,8 @@ pub async fn chunks_for_extraction(
     pool: &PgPool,
     document_id: Uuid,
 ) -> AppResult<Vec<ChunkForExtract>> {
-    // 只取未抽取的分块：认领的未变段落携带 extracted_at 跳过（增量抽取 + 断点续抽）
+    // Only take chunks that have not been extracted: claimed, unchanged paragraphs carry
+    // extracted_at and are skipped (incremental extraction + resuming where it broke off)
     let rows = sqlx::query_as(
         "SELECT id, seq, text, embedding FROM chunks
          WHERE document_id = $1 AND superseded_at IS NULL AND extracted_at IS NULL
@@ -592,7 +619,8 @@ pub async fn chunks_for_extraction(
     Ok(rows)
 }
 
-/// 推进抽取状态（顺带清空上一轮的失败原因——重跑即翻篇）。
+/// Advance the extraction status (clearing the previous round's failure reason along the way
+/// -- a rerun turns the page).
 pub async fn set_graph_status(pool: &PgPool, id: Uuid, status: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE documents SET graph_status = $2, graph_error = NULL, updated_at = now()
@@ -605,7 +633,7 @@ pub async fn set_graph_status(pool: &PgPool, id: Uuid, status: &str) -> AppResul
     Ok(())
 }
 
-/// 该文档尚未 embedding 的分块（id + 文本）。
+/// The chunks of this document that have no embedding yet (id + text).
 pub async fn chunks_pending_embedding(
     pool: &PgPool,
     document_id: Uuid,
@@ -633,7 +661,7 @@ pub async fn set_embeddings(pool: &PgPool, items: &[(Uuid, Vec<f32>)]) -> AppRes
     Ok(())
 }
 
-/// 向量近邻检索（余弦距离，顺扫；P1 规模足够）。
+/// Vector nearest-neighbour search (cosine distance, sequential scan; enough at P1 scale).
 pub async fn vector_search(
     pool: &PgPool,
     kb_id: Uuid,
@@ -656,7 +684,7 @@ pub async fn vector_search(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 按 id 集合取分块（带文档名），保持传入顺序。
+/// Fetch chunks by a set of ids (with the document name), keeping the order they came in.
 pub async fn chunks_by_ids(pool: &PgPool, kb_id: Uuid, ids: &[Uuid]) -> AppResult<Vec<ChunkView>> {
     let rows: Vec<ChunkView> = sqlx::query_as(
         "SELECT c.id, c.document_id, c.seq, c.text, d.filename
@@ -667,13 +695,14 @@ pub async fn chunks_by_ids(pool: &PgPool, kb_id: Uuid, ids: &[Uuid]) -> AppResul
     .bind(ids)
     .fetch_all(pool)
     .await?;
-    // 恢复 RRF 排名顺序
+    // Restore the RRF ranking order
     let mut by_id: std::collections::HashMap<Uuid, ChunkView> =
         rows.into_iter().map(|c| (c.id, c)).collect();
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
-/// 一篇文档的现行分块（带文档名），按 seq 排。kb_id 进 WHERE 而不是查回来再比。
+/// The live chunks of one document (with the document name), ordered by seq. kb_id goes into
+/// the WHERE clause rather than being read back and compared afterwards.
 pub async fn chunks_in_document(
     pool: &PgPool,
     kb_id: Uuid,
@@ -691,15 +720,19 @@ pub async fn chunks_in_document(
     .await?)
 }
 
-/// 批量排队全量重抽：ready 文档清增量标记 → graph_status=queued → 建抽取任务，
-/// 返回待抽文档 id。`source_id` 给定则限定该来源，否则整库。
+/// Bulk-queue a full re-extraction: ready documents have their incremental marks cleared →
+/// graph_status=queued → an extract job created, returning the ids of the documents to be
+/// extracted. If `source_id` is given it is confined to that source, otherwise the whole KB.
 ///
-/// 正在抽取的文档一并重排——epoch 自增即"解雇"在跑的那个任务（见
-/// `extract_epoch`），不必跳过、也不会两个 worker 同抽一篇。
-/// 尚未开跑的 extract 任务顺手删掉（payload 用文本比较：历史脏 payload 无法转 uuid）。
+/// Documents currently being extracted are requeued along with the rest -- bumping the epoch
+/// is what "fires" the job that is running (see `extract_epoch`), so there is no need to skip
+/// them and no chance of two workers extracting the same document.
+/// Extract jobs that have not started yet are deleted while we are at it (the payload is
+/// compared as text: historical dirty payloads cannot be cast to uuid).
 ///
-/// 建任务与置状态同事务：分开做时，中途出错会留下一批 graph_status=queued
-/// 却没有任务的文档——不会有 worker 来接，界面上永远停在"排队中"。
+/// Creating the jobs and setting the status share one transaction: done separately, an error
+/// part-way leaves a batch of documents at graph_status=queued with no job -- no worker will
+/// come for them, and the UI sits at "queued" forever.
 pub async fn queue_extraction(
     pool: &PgPool,
     kb_id: Uuid,
@@ -743,7 +776,8 @@ pub async fn queue_extraction(
     .bind(&ids)
     .execute(&mut *tx)
     .await?;
-    // payload 形状与 jobs::enqueue(json!({"document_id": id})) 一致：uuid 序列化为字符串
+    // The payload shape matches jobs::enqueue(json!({"document_id": id})): a uuid serialised
+    // as a string
     sqlx::query(
         "INSERT INTO jobs (kind, payload)
          SELECT 'extract_document', jsonb_build_object('document_id', id::text)
@@ -756,7 +790,8 @@ pub async fn queue_extraction(
     Ok(ids)
 }
 
-/// 抽取失败：状态与原因一起落库，界面才有东西可展示。
+/// Extraction failed: the status and the reason land in the database together, so the UI has
+/// something to show.
 pub async fn set_graph_failed(pool: &PgPool, id: Uuid, error: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE documents SET graph_status = 'failed', graph_error = $2, updated_at = now()
@@ -769,10 +804,13 @@ pub async fn set_graph_failed(pool: &PgPool, id: Uuid, error: &str) -> AppResult
     Ok(())
 }
 
-/// 抽取任务的所有权凭证：每次"开始新一轮抽取"自增。
+/// The ownership token of an extraction job: incremented on every "start a new round of
+/// extraction".
 ///
-/// 单靠 graph_status 认领无效——旧任务回读时，接手的新任务可能已把状态写回
-/// extracting，旧任务会误判自己仍在岗。epoch 单调递增，旧任务一比即知已被接管。
+/// Claiming by graph_status alone does not work -- by the time the old job reads it back, the
+/// new job that took over may already have written the status back to extracting, and the old
+/// job will wrongly judge itself still on duty. The epoch rises monotonically, so one
+/// comparison tells the old job it has been taken over.
 pub async fn extract_epoch(pool: &PgPool, id: Uuid) -> AppResult<i32> {
     let (epoch,): (i32,) = sqlx::query_as("SELECT extract_epoch FROM documents WHERE id = $1")
         .bind(id)
@@ -781,10 +819,12 @@ pub async fn extract_epoch(pool: &PgPool, id: Uuid) -> AppResult<i32> {
     Ok(epoch)
 }
 
-/// 这个库还有没有在排队或正在跑的抽取。
+/// Whether this KB still has extractions queued or running.
 ///
-/// 冷启动自动扩本体要等一批文档都抽完再动手：只看第一篇的话，
-/// 先到的那篇的词汇会独占本体。最后一篇跑完的任务负责触发。
+/// Cold-start automatic ontology expansion has to wait until a whole batch of documents has
+/// finished extracting before it acts: go by the first document alone and the vocabulary of
+/// whichever one arrived first monopolises the ontology. The job that finishes last is the one
+/// responsible for triggering it.
 pub async fn extraction_idle(pool: &PgPool, kb_id: Uuid) -> AppResult<bool> {
     let (pending,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM documents
@@ -796,10 +836,10 @@ pub async fn extraction_idle(pool: &PgPool, kb_id: Uuid) -> AppResult<bool> {
     Ok(pending == 0)
 }
 
-/// 全库分块，按文档分组，供检索索引重建用。
+/// Every chunk in the database, grouped by document, for rebuilding the search index.
 ///
-/// **一次全取**：这条只在启动发现索引落空时跑，那时候要的正是全部；
-/// 而它跑完之后就再也不跑了。
+/// **Fetched all in one go**: this only runs when startup finds the index empty, and at that
+/// point all of it is precisely what is wanted; once it has run, it never runs again.
 pub async fn all_chunks_for_index(pool: &PgPool) -> AppResult<Vec<(Uuid, Uuid, Uuid, String)>> {
     Ok(sqlx::query_as(
         "SELECT kb_id, document_id, id, text FROM chunks
@@ -810,7 +850,8 @@ pub async fn all_chunks_for_index(pool: &PgPool) -> AppResult<Vec<(Uuid, Uuid, U
     .await?)
 }
 
-/// 库里一共有多少条在用的分块。启动时拿它跟索引对账。
+/// How many live chunks the database holds in total. Used at startup to reconcile against the
+/// index.
 pub async fn live_chunk_count(pool: &PgPool) -> AppResult<i64> {
     Ok(
         sqlx::query_scalar("SELECT count(*) FROM chunks WHERE superseded_at IS NULL")

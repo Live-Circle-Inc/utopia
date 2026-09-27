@@ -1,5 +1,7 @@
-//! 内置文档（Charter）的内存索引：启动时从打包 markdown 建，进程生命周期内只读。
-//! 协议中立——chat 的 search_docs 工具臂与将来的 MCP 工具面共用这一个入口。
+//! In-memory index over the built-in docs (the Charter): built from the bundled markdown at
+//! startup, read-only for the life of the process.
+//! Protocol-neutral -- chat's search_docs tool arm and the future MCP tool surface share this one
+//! entry point.
 
 use anyhow::Context;
 use tantivy::collector::TopDocs;
@@ -12,7 +14,8 @@ use tantivy::{Index, IndexReader, TantivyDocument, Term};
 
 const JIEBA: &str = "jieba";
 
-/// 一节文档（按 h2 切分；anchor 与前端 Docs 页的标题锚点同法生成）。
+/// One section of a doc (split at h2; the anchor is generated the same way as the heading
+/// anchors on the frontend Docs page).
 #[derive(Debug, Clone)]
 pub struct DocsSection {
     pub slug: String,
@@ -44,7 +47,8 @@ impl DocsIndex {
         let f_heading = schema_builder.add_text_field("heading", STORED);
         let f_anchor = schema_builder.add_text_field("anchor", STORED);
         let f_body = schema_builder.add_text_field("body", STORED);
-        // 检索域 = 节标题 + 正文（标题词权重靠重复出现自然获得）
+        // Search field = section heading + body (heading terms earn their weight naturally, by
+        // appearing twice)
         let f_text = schema_builder.add_text_field(
             "text",
             TextOptions::default().set_indexing_options(text_indexing),
@@ -73,7 +77,7 @@ impl DocsIndex {
         let analyzer = index
             .tokenizers()
             .get(JIEBA)
-            .context("jieba tokenizer 未注册")?;
+            .context("jieba tokenizer is not registered")?;
         Ok(Self {
             reader,
             analyzer,
@@ -86,7 +90,8 @@ impl DocsIndex {
         })
     }
 
-    /// BM25 检索。切词方式与 SearchIndex 一致（手工 OR 组合，避开 CJK 短语查询陷阱）。
+    /// BM25 search. Tokenizes the same way SearchIndex does (a hand-built OR combination, which
+    /// sidesteps the CJK phrase-query trap).
     pub fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<DocsSection>> {
         let mut analyzer = self.analyzer.clone();
         let mut stream = analyzer.token_stream(query);

@@ -29,16 +29,18 @@ import { useKbEvents } from "../useKbEvents";
 import { usePageTitle } from "../useTitle";
 
 const TABS = [
-  // 图谱是门面，排第一；两种查询方式（Search/Ask）随后
+  // The graph is the shop window, so it comes first; the two ways of querying (Search/Ask) follow
   { to: "/kb/$kbId/graph", label: S.nav.graph, Icon: Waypoints },
   { to: "/kb/$kbId/search", label: S.nav.search, Icon: SearchIcon },
   { to: "/kb/$kbId/chat", label: S.nav.ask, Icon: MessagesSquare },
   { to: "/kb/$kbId/library", label: S.nav.library, Icon: LibraryIcon },
   { to: "/kb/$kbId/review", label: S.review.title, Icon: ListChecks },
   { to: "/kb/$kbId/ontology", label: S.ontology.title, Icon: Shapes },
-  // 本体说「世界上有什么」，数据映射说「这个数在库里怎么算」——挨着放
+  // The ontology says "what there is in the world", data mappings say "how this number is
+  // worked out in the database" -- so they go next to each other
   { to: "/kb/$kbId/mappings", label: S.mapping.title, Icon: Database },
-  // 库设置与其它 tab 同为"当前知识库作用域"，并列于内容导航
+  // KB settings is scoped to "the current knowledge base" just like the other tabs, so it sits
+  // alongside them in the content navigation
   { to: "/kb/$kbId/settings", label: S.nav.settings, Icon: SettingsIcon },
 ] as const;
 
@@ -53,18 +55,20 @@ export function Shell() {
     staleTime: Infinity,
   });
   const { kb, kbs, setKb } = useKb();
-  // 标题跟随当前 tab：`Graph · Utopia`；文档查看页归入 Library
+  // The title follows the current tab: `Graph · Utopia`; the document viewer counts as Library
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const tabLabel =
     TABS.find((t) => pathname.startsWith(t.to))?.label ??
     (pathname.startsWith("/doc/") ? S.nav.library : undefined);
   usePageTitle(S.app.name, tabLabel);
-  // 全局唯一的 KB 事件流连接：文档/审核状态实时刷新（替轮询）
+  // The one global KB event stream connection: document / review status refresh live (in place
+  // of polling)
   useKbEvents(kb?.id);
-  // 告警流是全局的：角标跨库，而系统级告警根本没有库
+  // The alert stream is global: the badge spans KBs, and system-level alerts have no KB at all
   useAlertEvents();
 
-  // 未登录就去登录页。**副作用要在 effect 里**，理由见下面 401 那一支
+  // Not logged in goes to the login page. **Side effects belong in an effect**; the reason is in
+  // the 401 branch below
   const unauthorized =
     me.isError && me.error instanceof ApiError && me.error.status === 401;
   useEffect(() => {
@@ -80,10 +84,11 @@ export function Shell() {
   }
 
   if (me.isError) {
-    // **跳转在 effect 里做，不在渲染里。** 渲染期间调 `navigate` 是在别人渲染
-    // 的过程中改路由器的状态，React 会常驻一条「Cannot update a component
-    // while rendering a different component」的警告。今天不出错，但它是
-    // 「渲染顺序依赖」的味道——改布局时最容易在这种地方变成真 bug
+    // **The redirect is done in an effect, not during render.** Calling `navigate` during
+    // render means changing the router's state in the middle of somebody else's render, and
+    // React keeps a permanent "Cannot update a component while rendering a different component"
+    // warning up. It does not break today, but it has the smell of "depends on render order" --
+    // and that is the kind of place most likely to turn into a real bug when the layout changes
     if (me.error instanceof ApiError && me.error.status === 401) {
       return null;
     }
@@ -92,16 +97,20 @@ export function Shell() {
 
   return (
     <div className="h-screen flex flex-col overflow-hidden u-arrive">
-      {/* 顶栏：品牌 + 工作区 + 用户（Vercel 式） */}
-      {/* z-40：backdrop-filter 使顶栏与 tab 条各自成 stacking context，
-          不提权则后者按 DOM 序盖住顶栏内的弹出面板 */}
+      {/* Top bar: brand + workspace + user (Vercel style) */}
+      {/* z-40: backdrop-filter makes the top bar and the tab strip each their own stacking
+          context, and without raising this the latter covers the popover panels inside the top
+          bar by DOM order */}
       <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center gap-4 px-5">
-        {/* 字标：逐字母淡入，hover 浮出 ↗，点击去官网 */}
+        {/* Wordmark: letters fade in one by one, ↗ floats out on hover, a click goes to the
+            website */}
         <Wordmark className="text-[17px]" />
-        {/* 面包屑唯一一级：知识库。Workspace 已从概念层折叠为部署级隐形管道
-            （settings/members 仍经它走 API，如 organizations 之于单租户）。 */}
+        {/* The one and only breadcrumb level: the knowledge base. Workspace has been folded
+            from a concept down to an invisible deployment-level pipe (settings/members still go
+            through it for the API, the way organizations do for a single tenant). */}
         <span className="text-neutral-700">/</span>
-        {/* 纯切换器：建库是管理动作，入口在 System settings › Knowledge bases */}
+        {/* A pure switcher: creating a KB is an admin action, whose entry point is in System
+            settings › Knowledge bases */}
         <Dropdown
           className="w-40"
           size="sm"
@@ -111,14 +120,18 @@ export function Shell() {
           onChange={setKb}
           options={kbs.map((k) => ({ value: k.id, label: k.name }))}
         />
-        {/* 三组：项目入口 / 告警 / 身份。**组间 gap-3，组内 gap-1.5**——
-            间距由结构表达，而不是给某一个元素补一次性的 ml。
-            此前用户菜单挂着一个 ml-1.5（当初它紧挨 GitHub 胶囊时调的），
-            铃铛插进两者之间以后就成了左 6px 右 12px */}
+        {/* Three groups: project links / alerts / identity. **gap-3 between groups, gap-1.5
+            within a group** -- spacing is expressed by structure, not by patching one element
+            with a one-off ml.
+            The user menu used to carry an ml-1.5 (set back when it sat right up against the
+            GitHub pill), and once the bell was inserted between the two it became 6px on the
+            left and 12px on the right */}
         <div className="ml-auto flex items-center gap-3">
-          {/* 项目入口：Docs + [GitHub·版本] 胶囊（版本取自后端 health，与部署一致）。
-              版本并入 GitHub 胶囊：两个等高元素，视觉平衡。
-              这两个是一对，所以彼此贴得比组间近 */}
+          {/* Project links: Docs + the [GitHub·version] pill (the version comes from the
+              backend health endpoint, so it matches the deployment).
+              The version is folded into the GitHub pill: two elements of equal height, visually
+              balanced.
+              These two are a pair, so they sit closer together than the gap between groups */}
           <div className="flex items-center gap-1.5">
             <Link
               to="/docs"
@@ -141,15 +154,16 @@ export function Shell() {
               )}
             </a>
           </div>
-          {/* 告警角标：跨库的未读数。失败此前只留在日志与 jobs.last_error 里，
-              界面上一份文档也不会变颜色（0005） */}
+          {/* Alert badge: the unread count across KBs. Failures used to stay only in the logs
+              and in jobs.last_error, and not one document in the interface would change colour
+              (0005) */}
           <AlertBell />
-          {/* 用户菜单：个人信息 / 系统管理（仅管理员）/ 登出 */}
+          {/* User menu: profile / system administration (admins only) / log out */}
           <UserMenu user={me.data} />
         </div>
       </header>
 
-      {/* Tab 导航条：图标 + 文字，激活态下划线（Vercel 式） */}
+      {/* Tab navigation strip: icon + text, underline on the active state (Vercel style) */}
       <nav className="glass-strong border-x-0 border-t-0 shrink-0 flex items-stretch gap-1 px-4">
         {TABS.map(({ to, label, Icon }) => (
           <Link

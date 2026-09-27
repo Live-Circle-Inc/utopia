@@ -1,50 +1,56 @@
 #!/usr/bin/env node
-// 从一份语料里挑出几个条目，做成一份新语料。
+// Picks a few articles out of one corpus and makes a new corpus out of them.
 //
-// 存在的理由是 `wiki-history` 跑不完：219 篇快照约 7000 块，按实测速率要六到七
-// 小时，还会撞上端点的每分钟 token 配额。而**它回答的两个问题对语料的要求不一样**：
+// The reason this exists is that `wiki-history` never finishes: 219 snapshots are roughly 7000
+// chunks, which at the measured rate takes six to seven hours, and it also runs into the
+// endpoint's per-minute token quota. And **the two questions it answers place different demands
+// on the corpus**:
 //
-// - 「违反率归零站不站得住」是统计题。60 块出 149 条可校验事实，零违反的
-//   置信上界按三倍律是 `3/n`，几百块就已经结论性了，再多跑不增加信息。
-// - 「图会不会真的改主意」是结构题，统计帮不上忙。它要的是**整条快照链按
-//   `doc_time` 顺序进去**，因为 `supersedes` 只在同一条目的相邻快照之间发生。
+// - "does the violation rate dropping to zero hold up" is a statistics question. 60 chunks yield
+//   149 checkable facts, and by the rule of three the confidence upper bound for zero violations
+//   is `3/n`, so a few hundred chunks is already conclusive; running more adds no information.
+// - "will the graph genuinely change its mind" is a structural question, and statistics cannot
+//   help. What it needs is **the whole snapshot chain going in in `doc_time` order**, because
+//   `supersedes` only happens between adjacent snapshots of the same article.
 //
-// 所以切法是**整条目取，不切块**：随机抽块能满足第一个问题，会把第二个问题
-// 直接废掉。挑几个互相咬合的条目，比多跑几千块有用。
+// So the way to slice is **whole articles, never chunks**: random chunk sampling satisfies the
+// first question and destroys the second outright. A handful of articles that interlock with each
+// other is worth more than a few thousand extra chunks.
 //
-// 输出按 `doc_time` 升序排列。灌入顺序就是认知生长的顺序，乱序进去的图
-// 在溯源时态那根轴上是没有意义的。
+// The output is sorted ascending by `doc_time`. The load order *is* the order in which knowledge
+// grows, and a graph loaded out of order is meaningless along the provenance-time axis.
 //
-// 用法：node scripts/bench/subset-corpus.mjs <语料.json> <条目,条目,…> > 新语料.json
+// Usage: node scripts/bench/subset-corpus.mjs <corpus.json> <article,article,...> > new-corpus.json
 //
-// 例（2023 年 11 月 OpenAI 那场风波，七个共享实体的条目）：
+// Example (the November 2023 OpenAI affair, seven articles that share entities):
 //   node scripts/bench/subset-corpus.mjs scripts/bench/corpora/wiki-history.json \
 //     openai,removal-of-sam-altman-from-openai,sam-altman,ilya-sutskever,\
 //     mira-murati,greg-brockman,emmett-shear \
 //     > scripts/bench/corpora/wiki-nov2023.json
 //
-// 不带条目参数就只列出源语料有哪些条目、各多少快照，不输出语料。
+// With no article argument it only lists which articles the source corpus has and how many
+// snapshots each one has, and emits no corpus.
 
 import fs from "node:fs";
 
 const [, , src, titlesRaw] = process.argv;
 if (!src) {
-  console.error("用法: subset-corpus.mjs <语料.json> [条目,条目,…]");
-  console.error("      不给条目则只列出源语料的条目清单");
+  console.error("usage: subset-corpus.mjs <corpus.json> [article,article,...]");
+  console.error("       with no articles it only lists the source corpus's articles");
   process.exit(2);
 }
 
 const corpus = JSON.parse(fs.readFileSync(src, "utf8"));
 if (!Array.isArray(corpus.docs)) {
-  console.error(`${src} 里没有 docs 数组，不像是一份语料`);
+  console.error(`${src} has no docs array, this does not look like a corpus`);
   process.exit(2);
 }
 
-/// 文件名形如 `openai@2023-11-19.txt`，`@` 之前是条目。
-/// 当前版语料（fetch-ai-timeline）没有 `@`，整个文件名就是条目。
+/// Filenames look like `openai@2023-11-19.txt`; everything before the `@` is the article.
+/// Current-revision corpora (fetch-ai-timeline) have no `@`, so the whole filename is the article.
 const titleOf = (filename) => filename.replace(/@.*$/, "").replace(/\.txt$/, "");
 
-// 条目清单：快照数与体量。给挑之前看用
+// The article list: snapshot count and size. For looking at before you pick
 const groups = new Map();
 for (const [filename, text] of corpus.docs) {
   const t = titleOf(filename);
@@ -60,29 +66,30 @@ if (!titlesRaw) {
   for (const [t, g] of rows) {
     const pct = ((100 * g.chars) / total).toFixed(1).padStart(5);
     console.error(
-      `${String(g.n).padStart(4)} 张  ${String(Math.round(g.chars / 1000)).padStart(6)}k  ${pct}%  ${t}`,
+      `${String(g.n).padStart(4)} snaps  ${String(Math.round(g.chars / 1000)).padStart(6)}k  ${pct}%  ${t}`,
     );
   }
-  console.error(`\n共 ${rows.length} 个条目，${corpus.docs.length} 张快照，${(total / 1e6).toFixed(2)}M 字符`);
+  console.error(`\n${rows.length} articles, ${corpus.docs.length} snapshots, ${(total / 1e6).toFixed(2)}M characters in total`);
   process.exit(0);
 }
 
 const wanted = new Set(titlesRaw.split(",").map((t) => t.trim()).filter(Boolean));
 
-// **认不出的条目名要报错，不能静默产出一份小语料。** 打错一个字就少一个条目，
-// 而少了的那个条目正是共享实体的来源，图会散成互不相连的星团——
-// 而这在结果里看起来只是"效果没那么好"，查不到根上。
+// **An unrecognised article name has to be an error; it must not silently produce a small corpus.**
+// One typo means one article fewer, and the article that went missing is exactly where the shared
+// entities came from, so the graph falls apart into mutually disconnected clusters --
+// and in the results that just looks like "it did not work as well", with no way to trace it back.
 const unknown = [...wanted].filter((t) => !groups.has(t));
 if (unknown.length) {
-  console.error(`源语料里没有这些条目：${unknown.join(", ")}`);
-  console.error(`不带条目参数重跑一次可以看到全部条目名。`);
+  console.error(`the source corpus does not have these articles: ${unknown.join(", ")}`);
+  console.error(`re-run with no article argument to see all the article names.`);
   process.exit(2);
 }
 
 const docs = corpus.docs
   .filter(([filename]) => wanted.has(titleOf(filename)))
-  // 按 doc_time 升序。第三个元素缺席时（当前版语料）退回文件名排序，
-  // 至少是确定的
+  // Ascending by doc_time. When the third element is absent (current-revision corpora) fall back
+  // to sorting by filename, which is at least deterministic
   .sort((a, b) => String(a[2] ?? a[0]).localeCompare(String(b[2] ?? b[0])));
 
 const chars = docs.reduce((s, d) => s + d[1].length, 0);
@@ -91,9 +98,9 @@ process.stdout.write(
   JSON.stringify({
     name: `${corpus.name}-subset`,
     note:
-      `${corpus.name} 的子集，条目：${[...wanted].join("、")}。` +
-      `整条目取并按 doc_time 升序，因为 supersedes 只在同一条目的相邻快照之间发生。` +
-      (corpus.note ? ` 源语料说明：${corpus.note}` : ""),
+      `A subset of ${corpus.name}, articles: ${[...wanted].join(", ")}. ` +
+      `Taken whole-article and sorted ascending by doc_time, because supersedes only happens between adjacent snapshots of the same article. ` +
+      (corpus.note ? ` Source corpus notes: ${corpus.note}` : ""),
     source: corpus.source,
     license: corpus.license,
     sampling: corpus.sampling,
@@ -102,9 +109,9 @@ process.stdout.write(
   }),
 );
 
-// 统计走 stderr，这样 stdout 可以直接重定向成语料文件
+// The stats go to stderr so that stdout can be redirected straight into a corpus file
 console.error(
-  `${docs.length} 张快照，${Math.round(chars / 1000)}k 字符，` +
-    // 1200 字符预算、150 重叠，见 utopia-ingest 的 chunk_text
-    `约 ${Math.round(chars / 1050)} 块`,
+  `${docs.length} snapshots, ${Math.round(chars / 1000)}k characters, ` +
+    // 1200-character budget, 150 overlap; see chunk_text in utopia-ingest
+    `~${Math.round(chars / 1050)} chunks`,
 );

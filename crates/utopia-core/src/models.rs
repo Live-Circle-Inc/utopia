@@ -17,12 +17,12 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub display_name: String,
-    /// 系统管理员（部署的首个注册用户）
+    /// Deployment administrator (the first user to register on this deployment)
     pub is_admin: bool,
     pub created_at: DateTime<Utc>,
 }
 
-/// 工作区成员视图（成员管理页用）。
+/// Workspace member view (used by the member management page).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MemberView {
     pub user_id: Uuid,
@@ -32,7 +32,7 @@ pub struct MemberView {
     pub is_admin: bool,
 }
 
-/// 部署内用户列表（添加成员的选人器用）。
+/// Users in this deployment (used by the person picker when adding members).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct OrgUser {
     pub id: Uuid,
@@ -49,7 +49,7 @@ pub struct Workspace {
     pub created_at: DateTime<Utc>,
 }
 
-/// 成员角色，按权限从高到低排序。数据库中存小写文本。
+/// Member roles, ordered by permission, highest first. Stored in the database as lowercase text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -94,23 +94,24 @@ pub struct Document {
     pub error: Option<String>,
     pub doc_time: Option<DateTime<Utc>>,
     pub doc_time_source: String,
-    /// 图谱抽取状态：none → queued → extracting → done | failed
+    /// Graph extraction status: none → queued → extracting → done | failed
     pub graph_status: String,
-    /// 抽取失败原因（失败时才有）。与 error 分列——那列归解析管道，
-    /// set_status 会清空它，两者共用一列会互相抹掉。
+    /// Why extraction failed (only when it did). A column apart from error -- that one belongs to
+    /// the parse pipeline and set_status wipes it; sharing one column has them erase each other.
     pub graph_error: Option<String>,
     pub text_len: i32,
     pub chunk_count: i32,
     pub tags: Vec<String>,
-    /// 来源内的逻辑身份（相对路径 / url / rss guid / api external_id）；上传为 NULL
+    /// Logical identity inside the source (relative path / url / rss guid / api external_id);
+    /// NULL for uploads
     pub external_key: Option<String>,
-    /// watch_folder 同步时发现源文件已消失（默认保留文档，仅标记）
+    /// watch_folder sync found the source file gone (document kept by default, only flagged)
     pub missing_since: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// 摄入来源（"来源即文件夹"：容器 + 定时同步）。
+/// An ingestion source ("a source is a folder": a container + scheduled sync).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Source {
     pub id: Uuid,
@@ -118,32 +119,36 @@ pub struct Source {
     /// upload | watch_folder | url | rss | api
     pub kind: String,
     pub name: String,
-    /// kind 专属配置：watch_folder {path} / url {urls:[..]} / rss {feed_url}
+    /// kind-specific config: watch_folder {path} / url {urls:[..]} / rss {feed_url}
     pub config: serde_json::Value,
-    /// lucide 图标名（NULL 时前端按 kind 取默认）
+    /// lucide icon name (when NULL the frontend picks a default from kind)
     pub icon: Option<String>,
-    /// NULL = 仅手动同步（与 sync_cron 互斥）
+    /// NULL = manual sync only (mutually exclusive with sync_cron)
     pub sync_interval_minutes: Option<i32>,
-    /// 标准 5 段 cron（服务器本地时区；与 sync_interval_minutes 互斥）
+    /// Standard 5-field cron (server local timezone; mutually exclusive with sync_interval_minutes)
     pub sync_cron: Option<String>,
     pub last_sync_at: Option<DateTime<Utc>>,
     /// never | queued | running | ok | failed
     pub last_sync_status: String,
     pub last_sync_error: Option<String>,
     pub last_sync_added: i32,
-    /// api 来源的推送密钥（明文；查看走 Editor 权限的专用端点，列表响应不带）
+    /// Push secret for api sources (plaintext; read through a dedicated Editor-gated endpoint,
+    /// never included in list responses)
     #[serde(skip_serializing)]
     pub ingest_token: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-/// 来源配置里**用来鉴权**的那几个键。凭据只进不出：列表与创建 / 更新的响应都剔掉，
-/// 更新时客户端没传或传空串就保留库里的原值，审计里也不落。
+/// The keys in a source's config that **are used to authenticate**. Credentials go in but never
+/// come out: list responses and create / update responses strip them, on update a client that sends
+/// nothing or an empty string keeps the value already in the database, and they never land in the
+/// audit log.
 ///
-/// **一张表，四处共用。** 此前那条规矩只对 `auth_header` 一个键成立，而对象存储、
-/// WebDAV、Notion 各自的密钥原样发给了每一个 Viewer（#246）。加连接器时**先加这里**，
-/// 再写读它的代码。`username` / `account_name` / `access_key_id` 这类是身份标识，
-/// 单独拿到鉴不了权，留着让界面显示得出「这是哪个账号」。
+/// **One table, four consumers.** That rule used to hold for exactly one key, `auth_header`, while
+/// the object-store, WebDAV and Notion secrets each went out verbatim to every single Viewer
+/// (#246). When you add a connector, **add it here first**, then write the code that reads it.
+/// Things like `username` / `account_name` / `access_key_id` are identity labels: on their own they
+/// authenticate nothing, and they stay so the UI can show "which account is this".
 pub const SOURCE_SECRET_KEYS: &[&str] = &[
     "auth_header",
     "token",
@@ -154,7 +159,7 @@ pub const SOURCE_SECRET_KEYS: &[&str] = &[
 ];
 
 impl Source {
-    /// 剔掉凭据后的这条来源——任何要回给客户端的 `Source` 都从这里过
+    /// This source minus its credentials -- every `Source` going back to a client passes here
     pub fn without_secrets(mut self) -> Self {
         if let Some(obj) = self.config.as_object_mut() {
             for key in SOURCE_SECRET_KEYS {
@@ -165,13 +170,15 @@ impl Source {
     }
 }
 
-/// 来源的种类。**一处定义，三处消费**：创建时的白名单、同步时的分派（按枚举穷举匹配，
-/// 加一种就得决定它怎么同步）、前端的下拉框（`web/src/sourceKinds.ts`，由
-/// `utopia-store` 的测试对表）。
+/// The kinds of source. **Defined once, consumed in three places**: the allow-list at creation
+/// time, the dispatch at sync time (an exhaustive match on the enum, so adding one forces you to
+/// decide how it syncs), and the frontend's dropdown (`web/src/sourceKinds.ts`, checked against
+/// this by a test in `utopia-store`).
 ///
-/// 此前后端两张手写清单各自演进：五种连接器加了同步分支、进了界面，却没进创建的
-/// 白名单，界面上选得到、建的时候报「kind must be one of…」（#247）。变体顺序就是
-/// 对话框里的顺序；字符串形式由 strum 按 snake_case 生成，不再手写
+/// Two hand-written lists on the backend used to drift apart on their own: five connectors got
+/// sync branches and made it into the UI, but never into the creation allow-list, so you could
+/// pick them in the UI and creating one answered "kind must be one of…" (#247). Variant order is
+/// the order in the dialog; the string form is generated by strum as snake_case, no longer by hand
 #[derive(
     Debug,
     Clone,
@@ -197,9 +204,9 @@ pub enum SourceKind {
     Notion,
     Api,
     Custom,
-    /// 每个库自带的记忆来源，不可建不可删（0015）
+    /// The memory source every knowledge base comes with; cannot be created or deleted (0015)
     Memory,
-    /// 老数据里 `sources.kind` 的默认值，没有对应的界面
+    /// The default for `sources.kind` in old data; it has no UI of its own
     Upload,
 }
 
@@ -216,7 +223,7 @@ impl SourceKind {
         <Self as strum::IntoEnumIterator>::iter()
     }
 
-    /// 人能从界面建的：`memory` 与 `upload` 之外的全部
+    /// The ones a human can create from the UI: everything but `memory` and `upload`
     pub fn creatable_by_hand(self) -> bool {
         !matches!(self, Self::Memory | Self::Upload)
     }
@@ -226,7 +233,7 @@ impl SourceKind {
     }
 }
 
-/// 来源同步运行记录（渠道审计历史）。
+/// A source sync run (the channel's audit history).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct SyncRun {
     pub id: Uuid,
@@ -239,14 +246,15 @@ pub struct SyncRun {
     pub error: Option<String>,
 }
 
-/// 分块的抽取产物视图（文档查看器右栏：这个 chunk 抽出了什么）。
+/// What extraction produced from a chunk (document viewer right column: what this chunk yielded).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ChunkFactView {
     pub chunk_id: Uuid,
     pub fact_id: Uuid,
     pub subject_id: Uuid,
     pub subject: String,
-    /// 本体没认下这条关系时回落到原文说法；两者都拿不出时为 None（更早的历史数据长这样）
+    /// Falls back to the source's own wording when the ontology did not recognise the relation;
+    /// None when neither can be produced (that is what older historical data looks like)
     pub predicate: Option<String>,
     pub inferred: bool,
     pub object_id: Option<Uuid>,
@@ -256,7 +264,7 @@ pub struct ChunkFactView {
     pub confidence: f32,
 }
 
-/// 来源列表视图（带文档数）。
+/// Source list view (with document counts).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct SourceView {
     pub id: Uuid,
@@ -271,11 +279,11 @@ pub struct SourceView {
     pub last_sync_error: Option<String>,
     pub last_sync_added: i32,
     pub doc_count: i64,
-    /// 已标记"不在来源中"的文档数（url 全集对账 / custom 墓碑产生）
+    /// Documents already marked "not in source" (url full-set reconciliation / custom tombstones)
     pub missing_count: i64,
 }
 
-/// 审计事件视图（带操作人显示名；删号后为 NULL）。纯审计展示用。
+/// Audit event view (with actor display name; NULL once the account is deleted). Audit display only.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct AuditEventView {
     pub id: Uuid,
@@ -283,14 +291,16 @@ pub struct AuditEventView {
     pub target_kind: String,
     pub target_id: Option<Uuid>,
     pub detail: serde_json::Value,
-    /// NULL = 引擎自动（裁决器合并、一致性检查、推理物化……）。界面靠它把
-    /// 「没有人」和「人已被移除」分开：后者 actor_id 还在，只是查不到显示名
+    /// NULL = the engine acted by itself (adjudicator merges, consistency checks, materialized
+    /// inference...). The UI uses it to tell "nobody" apart from "the person was removed": the
+    /// latter still has an actor_id, it just cannot resolve a display name
     pub actor_id: Option<Uuid>,
     pub actor_name: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-/// 账户层"我的知识库"行信息（成员行可空：open 库凭部署身份进入，无矩阵记录）。
+/// A row for the account-level "my knowledge bases" list (the membership row may be absent: an
+/// open base is entered on deployment identity, with no matrix record).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MyKbInfo {
     pub kb_id: Uuid,
@@ -301,7 +311,7 @@ pub struct MyKbInfo {
     pub member_count: i64,
 }
 
-/// Chat 会话行（左栏列表）。
+/// A Chat conversation row (the left-column list).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConversationView {
     pub id: Uuid,
@@ -311,7 +321,7 @@ pub struct ConversationView {
     pub message_count: i64,
 }
 
-/// Chat 消息（含落库的行动轨迹与引用，历史回放用）。
+/// A Chat message (including the persisted action trail and citations, for replaying history).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConversationMessage {
     pub id: Uuid,
@@ -322,7 +332,7 @@ pub struct ConversationMessage {
     pub created_at: DateTime<Utc>,
 }
 
-/// 检索结果用的分块视图（带文档信息）。
+/// The chunk view search results use (with document information).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ChunkView {
     pub id: Uuid,
@@ -538,22 +548,23 @@ pub struct EntityType {
     pub key: String,
     pub label: String,
     pub color: String,
-    /// 图谱节点形状：circle | square
+    /// Graph node shape: circle | square
     pub shape: String,
     pub builtin: bool,
-    /// subClassOf 层级（公理推理 P4 点亮，编辑器先维护数据）
-    /// 全部父类（subClassOf 可以有多个：FOAF 的 Person 同时是 Agent 与 SpatialThing）
+    /// subClassOf hierarchy (axiom reasoning lights it up in P4; the editor maintains data first)
+    /// All parent classes (subClassOf can be multiple: FOAF's Person is both Agent and SpatialThing)
     pub parents: Vec<Uuid>,
-    /// 左栏画树时挂在哪一支下。不参与语义，只管展示
+    /// Which branch it hangs under when the left column draws the tree. No semantics, display only
     pub primary_parent: Option<Uuid>,
-    /// OWL 导入的全局身份。手工建的类为 NULL；重导入按它匹配，不按 key——
-    /// 上游改一次 rdfs:label 派生的 key 就变了，按 key 匹配会把同一个类当新类建
+    /// Global identity from an OWL import. NULL for hand-built classes; re-imports match on this,
+    /// not on key -- change rdfs:label upstream once and the derived key changes with it, so key
+    /// matching would build the same class again as a new one
     pub iri: Option<String>,
-    /// 语义指引：注入抽取 prompt（什么算这个类，举例）
+    /// Semantic guidance: goes into the extraction prompt (what counts as this class, examples)
     pub description: String,
 }
 
-/// 本体编辑器：某个类下的实体实例行（详情区实例列表用）。
+/// Ontology editor: an entity instance row under some class (for the detail pane's instance list).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityInstance {
     pub id: Uuid,
@@ -561,7 +572,7 @@ pub struct EntityInstance {
     pub fact_count: i64,
 }
 
-/// 本体编辑器视图：类型 + 使用量（删除保护与 UX 提示用）。
+/// Ontology editor view: type + usage count (for delete protection and UX hints).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityTypeView {
     pub id: Uuid,
@@ -570,12 +581,13 @@ pub struct EntityTypeView {
     pub color: String,
     pub shape: String,
     pub builtin: bool,
-    /// 全部父类（subClassOf 可以有多个：FOAF 的 Person 同时是 Agent 与 SpatialThing）
+    /// All parent classes (subClassOf can be multiple: FOAF's Person is both Agent and SpatialThing)
     pub parents: Vec<Uuid>,
-    /// 左栏画树时挂在哪一支下。不参与语义，只管展示
+    /// Which branch it hangs under when the left column draws the tree. No semantics, display only
     pub primary_parent: Option<Uuid>,
-    /// 与这个类互斥的类：**声明「不可能同时是」**。一致性检查据此报出
-    /// 不可满足的类——一个类继承了两个互斥的祖先，就永远不可能有实例（0002）
+    /// The classes disjoint with this one: **a declaration of "cannot be both at once"**. The
+    /// consistency check uses it to report unsatisfiable classes -- inherit from two disjoint
+    /// ancestors and the class can never have an instance (0002)
     pub disjoint: Vec<Uuid>,
     pub description: String,
     pub usage: i64,
@@ -589,32 +601,35 @@ pub struct RelationTypeView {
     pub temporal: String,
     pub functional: bool,
     pub inverse_functional: bool,
-    /// 其余四条 OWL 公理。**推理机的判据全在这里**（0002）——它们从前只能
-    /// 靠导入 OWL 带进来，在界面上建本体的人永远开不了那台机器
+    /// The other four OWL axioms. **Every test the reasoner makes is in here** (0002) -- they used
+    /// to arrive only by importing OWL, so anyone building an ontology in the UI could never switch
+    /// that machine on
     pub is_transitive: bool,
     pub is_symmetric: bool,
     pub is_asymmetric: bool,
     pub is_irreflexive: bool,
-    /// 指向另一个关系的两条。**必须回给界面**——下拉框要显示当前选的是谁，
-    /// 否则每次打开表单都是空的，编辑一次就把已声明的抹掉了
+    /// The two that point at another relation. **Must be sent back to the UI** -- the dropdown has
+    /// to show what is currently selected, otherwise the form opens empty every time and one edit
+    /// wipes out what was declared
     pub inverse_of: Option<Uuid>,
     pub sub_property_of: Option<Uuid>,
     pub builtin: bool,
     pub description: String,
-    /// relation（宾语是实体）| attribute（宾语是字面值）
+    /// relation (the object is an entity) | attribute (the object is a literal value)
     pub kind: String,
-    /// 可以当主语的类。attribute 至少一个；relation 可空（未声明 = 不限）
+    /// Classes that may be the subject. At least one for an attribute; may be empty for a
+    /// relation (undeclared = unrestricted)
     pub domains: Vec<Uuid>,
-    /// 可以当宾语的类。**只对 relation 有意义**——attribute 的值域是字面量类型，
-    /// 落在 datatype 上
+    /// Classes that may be the object. **Only meaningful for a relation** -- an attribute's range
+    /// is a literal type, which lands in datatype
     pub ranges: Vec<Uuid>,
-    /// attribute 专用：text | number | date | bool
+    /// attribute only: text | number | date | bool
     pub datatype: Option<String>,
     pub unit: Option<String>,
     pub usage: i64,
 }
 
-/// 抽取未匹配统计（本体扩展建议的信号源）。
+/// Unmatched-extraction counts (the signal behind ontology extension suggestions).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct OntologyMiss {
     pub kind: String,
@@ -623,24 +638,28 @@ pub struct OntologyMiss {
     pub count: i32,
 }
 
-/// 一个待认领的表层谓词：原文这么说过，但本体里没有对应关系，事实降级成了
-/// related_to。与 `OntologyMiss` 的纯计数不同，它连着具体事实——所以采纳时
-/// 能说清"将重新归类 57 条"，并真的去改。
+/// A surface predicate waiting to be claimed: the text said it, the ontology has no relation for
+/// it, and the fact was downgraded to related_to. Unlike `OntologyMiss`, which is a plain count,
+/// this one is attached to concrete facts -- so on adoption it can say "57 facts will be
+/// reclassified" and actually go and change them.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ProposedPredicate {
     pub form: String,
-    /// 有多少条 live 的 related_to 事实由这个说法而来
+    /// How many live related_to facts came out of this wording
     pub fact_count: i64,
-    /// 出现在多少篇文档里。只在一篇里出现过的是那篇文档的用词，不是这个
-    /// 组织的词汇——自动扩展据此设门槛，人工提案只作参考不拦
+    /// How many documents it appears in. Something that showed up in only one document is that
+    /// document's wording, not this organisation's vocabulary -- auto-extension sets its threshold
+    /// on this, while for a manual proposal it is a hint only and never blocks
     pub doc_count: i64,
-    /// 一条样例（"Dino Crisis (Steam) → GeForce NOW"），让人一眼判断这是什么关系
+    /// One example ("Dino Crisis (Steam) → GeForce NOW"), so a reader can tell at a glance what
+    /// relation this is
     pub example: Option<String>,
 }
 
-/// 一次 OWL 导入的记录。原文按内容寻址存在 blob 里，这行只是账。
-/// `summary` 记下那次投影做了什么，包括**暂未投影**的公理——将来补上消费者
-/// 时据此知道哪些导入值得重跑。
+/// The record of one OWL import. The file itself is stored content-addressed in blob; this row is
+/// only the ledger entry. `summary` notes what that projection did, including the axioms that were
+/// **not projected yet** -- when a consumer for those is added later, this is how you know which
+/// imports are worth re-running.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct OntologyImportView {
     pub id: Uuid,
@@ -652,8 +671,9 @@ pub struct OntologyImportView {
     pub imported_by_name: Option<String>,
 }
 
-/// 一个模型的并发上限。约束来自供应商的速率限制，那是按 (base_url, model) 算的——
-/// 本地 Ollama 与托管 API 用同一个数字本来就不对。
+/// One model's concurrency ceiling. The constraint comes from the provider's rate limit, and that
+/// is counted per (base_url, model) -- a local Ollama and a hosted API sharing one number was never
+/// right to begin with.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ModelLimit {
     pub base_url: String,
@@ -661,20 +681,22 @@ pub struct ModelLimit {
     pub max_concurrent: i32,
 }
 
-/// 一个待认领的实体类型：模型提议过、本体没有、实体因此降级成了 concept。
-/// 与 `ProposedPredicate` 对称——它连着具体实体，所以采纳时能说清"将重新归类
-/// 43 个"并真的去改，而不是只建一个空类。
+/// An entity type waiting to be claimed: the model proposed it, the ontology does not have it, and
+/// the entities were downgraded to concept as a result. The mirror of `ProposedPredicate` -- it is
+/// attached to concrete entities, so on adoption it can say "43 will be reclassified" and actually
+/// go and change them, instead of only creating an empty class.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ProposedType {
     pub form: String,
     pub entity_count: i64,
-    /// 一个样例名字，让人一眼判断这是什么类
+    /// One example name, so a reader can tell at a glance what class this is
     pub example: Option<String>,
 }
 
-/// 抽取丢弃信号：事实抽出来了却没能落地，以及为什么。
-/// 与 `OntologyMiss` 分开——那个说"你的本体缺这些"（读者是本体维护者），
-/// 这个说"这些事实没落地"（读者是上传文档的人）。
+/// Extraction drop signals: facts that were extracted but never landed, and why.
+/// Kept apart from `OntologyMiss` -- that one says "your ontology is missing these" (its reader
+/// maintains the ontology), this one says "these facts did not land" (its reader uploaded the
+/// document).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ExtractionDrop {
     pub document_id: Uuid,
@@ -692,23 +714,25 @@ pub struct RelationType {
     pub label: String,
     /// state | event | eternal
     pub temporal: String,
-    /// 主语侧唯一：同一时刻一个主语至多一个宾语
+    /// Unique on the subject side: at any one moment a subject has at most one object
     pub functional: bool,
-    /// 宾语侧唯一：同一时刻一个宾语至多一个主语（如一个项目只有一个 leads 它的人）
+    /// Unique on the object side: at any one moment an object has at most one subject (a project
+    /// has only one person who leads it)
     pub inverse_functional: bool,
     pub builtin: bool,
-    /// 语义指引：注入抽取 prompt
+    /// Semantic guidance: goes into the extraction prompt
     pub description: String,
-    /// OWL 导入的全局身份；手工建的为 NULL。重导入按它匹配，不按 key——
-    /// 上游改一次 rdfs:label 派生的 key 就变了，按 key 匹配会把同一个当成新的
+    /// Global identity from an OWL import; NULL for hand-built ones. Re-imports match on this, not
+    /// on key -- change rdfs:label upstream once and the derived key moves with it, so key matching
+    /// would take the same thing for a new one
     pub iri: Option<String>,
-    /// relation（宾语是实体）| attribute（宾语是字面值，走 facts.object_value）
+    /// relation (object is an entity) | attribute (object is a literal, via facts.object_value)
     pub kind: String,
-    /// 可以当主语的类（多值：OWL 里一个属性有多个 rdfs:domain 是常态）
+    /// Classes that may be the subject (multi-valued: several rdfs:domain per property is normal)
     pub domains: Vec<Uuid>,
-    /// 可以当宾语的类。只对 relation 有意义
+    /// Classes that may be the object. Only meaningful for a relation
     pub ranges: Vec<Uuid>,
-    /// attribute 专用：text | number | date | bool
+    /// attribute only: text | number | date | bool
     pub datatype: Option<String>,
     pub unit: Option<String>,
 }
@@ -717,8 +741,8 @@ pub struct RelationType {
 pub struct Entity {
     pub id: Uuid,
     pub kb_id: Uuid,
-    /// `None` = 还没判出来。见 `docs/decisions/0009`——它不是一个类，
-    /// 是「抽取器抽到了东西，但本体里没有对应的类」这个状态
+    /// `None` = not decided yet. See `docs/decisions/0009` -- it is not a class, it is the state
+    /// "the extractor found something, but the ontology has no class for it"
     pub type_id: Option<Uuid>,
     pub canonical_name: String,
     pub aliases: Vec<String>,
@@ -727,124 +751,141 @@ pub struct Entity {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 图渲染节点。
+/// A node as the graph renders it.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct GraphNode {
     pub id: Uuid,
     pub name: String,
-    /// 类型 key。**可能没有**（0009：没判出来就是 NULL），
-    /// 前端据此显示"未分类"而不是编一个名字
+    /// Type key. **May be absent** (0009: undecided means NULL), which is how the frontend knows
+    /// to show "untyped" instead of inventing a name
     pub type_key: Option<String>,
     pub type_label: Option<String>,
     pub color: String,
-    /// 类型形状：circle | square
+    /// Type shape: circle | square
     pub shape: String,
     pub degree: i64,
-    /// 同名并存时的展示消歧后缀（如所属组织名）
+    /// The disambiguating suffix shown when two names coexist (the owning organisation, say)
     pub disambiguator: Option<String>,
 }
 
-/// 图渲染边（= 一条 live 事实）。
+/// An edge as the graph renders it (= one live fact).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct GraphEdge {
     pub id: Uuid,
     pub source: Uuid,
     pub target: Uuid,
-    /// 本体里没有对应关系时回落到原文说法（见 `facts.predicate_id`）。
-    /// 两个来源都拿不出时为 None——那是 add_evidence 记录原文说法之前的老数据
+    /// Falls back to the source's wording when the ontology has no matching relation (see
+    /// `facts.predicate_id`). None when neither source can supply one -- that is data from before
+    /// add_evidence started recording the source wording
     pub predicate: Option<String>,
     pub label: Option<String>,
-    /// true = 这条边的名字来自原文，不是本体认下的关系。界面要显示得看得出区别
+    /// true = this edge's name comes from the text, not from a relation the ontology recognised.
+    /// The UI has to show it in a way that makes the difference visible
     pub inferred: bool,
-    /// true = 这条边是**推出来的**，不是任何人断言的（R1，住在 `derived_facts`）。
+    /// true = this edge was **derived**, not asserted by anyone (R1, it lives in `derived_facts`).
     ///
-    /// **与 `inferred` 不是一回事**，尽管两个词很近：那一位说的是「名字来自原文
-    /// 而不是本体」，这一位说的是「这条边根本不是谁说的，是引擎推的」
+    /// **Not the same thing as `inferred`**, however close the two words sound: that one says "the
+    /// name comes from the text rather than the ontology", this one says "nobody stated this edge
+    /// at all, the engine derived it"
     pub derived: bool,
-    /// 推它出来的那条规则（`transitive` / `symmetric` / `inverse` / `sub_property`）；
-    /// 断言的边为 None。
+    /// The rule that derived it (`transitive` / `symmetric` / `inverse` / `sub_property`); None
+    /// for asserted edges.
     ///
-    /// **界面需要分辨 `inverse`**：`A works_at B` 与它推出的 `B employs A` 是
-    /// 同一件事的两种说法，画成两条边只是把冗余画了两遍；而 `sub_property`
-    /// 推出的是另一条粒度不同的事实，该各画各的
+    /// **The UI needs to single out `inverse`**: `A works_at B` and the `B employs A` derived from
+    /// it are two ways of saying the same thing, and drawing two edges only draws the redundancy
+    /// twice; whereas `sub_property` derives a different fact at a different granularity, and each
+    /// of those deserves its own edge
     pub rule: Option<String>,
-    /// 推它出来用到的前提事实（按证明顺序）。断言的边为空。
+    /// The premise facts used to derive it (in proof order). Empty for asserted edges.
     ///
-    /// **界面并边要靠它认准来源。** 只按「同一对节点」找，会把 `contains`
-    /// 挂到恰好也连着那两点的 `allied_with` 上——那条说法属于 `part_of`，
-    /// 挂错的结果看着完全正常，正是最难发现的那种
+    /// **The UI needs this to pin down the origin when it merges edges.** Matching on "the same
+    /// pair of nodes" alone will hang `contains` off the `allied_with` that happens to join those
+    /// two points as well -- that statement belongs to `part_of`, and the result of attaching it
+    /// wrongly looks perfectly normal, which is exactly the hardest kind to spot
     pub premises: Vec<Uuid>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     pub confidence: f32,
-    /// 有争议（0017 §3）：有一条 open 的公理违规或时态冲突指着它。整条边画成
-    /// 警戒色——环在节点上、边还是灰的，余光分不出来
+    /// Disputed (0017 §3): an open axiom violation or temporal conflict points at it. The whole
+    /// edge is drawn in the warning colour -- a ring on the node with the edge still grey is
+    /// something you cannot make out from the corner of your eye
     pub contested: bool,
-    /// 幽灵边（0017 §3）：一条**没有落地**的派生——推出来了却撞上断言。`id` 是那条
-    /// `derived_contradiction` 违规的 id，不是任何事实；`derived` 同时为 true，
-    /// 所以它跟着派生开关走
+    /// Ghost edge (0017 §3): a derivation that **did not land** -- derived, then blocked by an
+    /// assertion. `id` is the id of that `derived_contradiction` violation, not of any fact;
+    /// `derived` is true as well, so it follows the derived toggle
     pub blocked: bool,
 }
 
-/// 实体详情页的事实行（时间线）。
+/// A fact row on the entity detail page (the timeline).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityFact {
     pub id: Uuid,
-    /// out = 该实体为主语；in = 为宾语
+    /// out = this entity is the subject; in = it is the object
     pub direction: String,
-    /// 本体没认下这条关系时回落到原文说法；两者都拿不出时为 None（更早的历史数据长这样）
+    /// Falls back to the source's own wording when the ontology did not recognise the relation;
+    /// None when neither can be produced (that is what older historical data looks like)
     pub predicate_key: Option<String>,
     pub predicate_label: Option<String>,
-    /// true = 这条事实的名字来自原文，不是本体认下的关系。界面要显示得看得出区别
+    /// true = this fact's name comes from the text, not from a relation the ontology recognised.
+    /// The UI has to show it in a way that makes the difference visible
     pub inferred: bool,
-    /// 关系的时态类别（point/state/eternal）。没有谓词就无从谈起，为 None
+    /// The relation's temporal class (point/state/eternal). No predicate, nothing to ask, so None
     pub temporal: Option<String>,
     pub other_id: Option<Uuid>,
     pub other_name: Option<String>,
-    /// 字面值宾语（属性事实/问数映射）：{"value":…,"unit":…} 或 {"summary":…}
+    /// Literal-valued object (attribute facts / Ask mappings): {"value":…,"unit":…} or {"summary":…}
     pub object_value: Option<serde_json::Value>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    /// 精度描述的是这条事实**有的那些日期**的粒度。两端都没有日期时为 None——
-    /// 从前这里是 NOT NULL DEFAULT day，于是没日期的事实也自称精确到日（见 `facts.valid_from_precision`）
-    /// 起始端的粒度：year | month | day。没有 valid_from 时为 None
+    /// Precision describes the granularity of **the dates this fact actually has**. None when
+    /// neither end has a date -- this used to be NOT NULL DEFAULT day, so facts with no dates claimed
+    /// day precision too (see `facts.valid_from_precision`)
+    /// Granularity of the start: year | month | day. None when there is no valid_from
     pub valid_from_precision: Option<String>,
-    /// 结束端的粒度，外加一个 `unknown`——**原文说它结束了，但没说哪天**。
-    /// `valid_to` 与它都为 None 才是「仍在持续」（见 `facts.valid_to_precision`）
+    /// Granularity of the end, plus one extra value `unknown` -- **the text says it ended, but not
+    /// on what day**. Only when `valid_to` and this are both None does it mean "still ongoing"
+    /// (see `facts.valid_to_precision`)
     pub valid_to_precision: Option<String>,
     pub confidence: f32,
     pub evidence_count: i64,
-    /// 证据全部停留在来源文档的旧版（未被现行内容确认；不代表事实失效）
+    /// All the evidence sits on older versions of the source documents (not confirmed by the
+    /// current content; this does not mean the fact is void)
     pub stale: bool,
-    /// 修正行（supersedes 链上）：区间闭合来自引擎对账/人工裁决而非抽取原文
+    /// A correction row (on the supersedes chain): the interval was closed by engine
+    /// reconciliation or a human decision, not by the extracted text
     pub corrected: bool,
-    /// 证据集合里最新的文档时间——开放事实的"最后确认时间"（时效性透明化）
+    /// The newest document time in the evidence set -- an open fact's "last confirmed at"
+    /// (making staleness visible)
     pub last_evidence_time: Option<DateTime<Utc>>,
-    /// 有争议（0017 §3）：`{ kind, ref_id, derived? }`——哪一种（违规的 kind，或
-    /// `temporal_conflict`）、Review 里那一项的 id、派生撞断言时推出来的那句话。
-    /// 一条只报最新的一处；行**不压暗**，断言仍然活着
+    /// Disputed (0017 §3): `{ kind, ref_id, derived? }` -- which kind (the violation's kind, or
+    /// `temporal_conflict`), the id of that item in Review, and the derived statement when a
+    /// derivation collides with an assertion. Only the most recent one is reported per fact; the
+    /// row is **not dimmed**, the assertion is still alive
     pub contested: Option<serde_json::Value>,
 }
 
-/// 实体的一次认知变更（记录时间轴上的事件，与 EntityFact 的有效时间轴正交）。
+/// One change in what we believe about an entity (an event on the record timeline, orthogonal to
+/// EntityFact's validity timeline).
 ///
-/// 账本 append-only，所以"我们曾经怎么认为"全部留存：一条事实行最多产出两个
-/// 事件——写入（asserted / corrected）与作废（rejected，仅当没有后继修正行时；
-/// 有后继的话这次死亡已由那条 corrected 解释，不重复记）。
+/// The ledger is append-only, so everything we ever believed is kept: one fact row yields at most
+/// two events -- the write (asserted / corrected) and the invalidation (rejected, and only when no
+/// later correction row exists; if one does, that corrected row already explains this death and we
+/// do not record it twice).
 ///
-/// **不是每个事件都来自一条事实。** 改类（`retyped` / `retype_reverted`）来自
-/// `entity_retypes`：它没有谓词、没有对方、没有方向，那几个字段因此可空。
-/// 从前这里只有事实事件，于是「改了类」在实体历史里完全不显形——0001 P3a 记着
-/// 「可撤销不等于会被撤销」，错了不会自己冒出来。
+/// **Not every event comes from a fact.** A retype (`retyped` / `retype_reverted`) comes from
+/// `entity_retypes`: it has no predicate, no counterpart and no direction, which is why those
+/// fields are nullable. This used to hold fact events only, so "the type changed" left no trace at
+/// all in an entity's history -- 0001 P3a notes that "revocable does not mean it will be revoked",
+/// and a mistake does not surface on its own.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityHistoryEvent {
-    /// 事实事件才有。改类事件为 None
+    /// Only on fact events. None for retype events
     pub fact_id: Option<Uuid>,
-    /// 事件发生的记录时刻（写入 = recorded_at，作废 = invalidated_at，
-    /// 改类 = entity_retypes.created_at / reverted_at）
+    /// The record-time moment the event happened (write = recorded_at, invalidation =
+    /// invalidated_at, retype = entity_retypes.created_at / reverted_at)
     pub at: DateTime<Utc>,
-    /// asserted（首次断言）| corrected（区间被修正）| rejected（认知被推翻）
-    /// | merged（并进了另一条断言）| retyped（改了类）| retype_reverted（改类被撤销）
+    /// asserted (first assertion) | corrected (interval corrected) | rejected (belief overturned)
+    /// | merged (merged into another assertion) | retyped (type changed) | retype_reverted (undone)
     pub kind: String,
     pub direction: Option<String>,
     pub predicate_label: Option<String>,
@@ -852,53 +893,62 @@ pub struct EntityHistoryEvent {
     pub object_value: Option<serde_json::Value>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    /// 精度描述的是这条事实**有的那些日期**的粒度。两端都没有日期时为 None——
-    /// 从前这里是 NOT NULL DEFAULT day，于是没日期的事实也自称精确到日（见 `facts.valid_from_precision`）
-    /// 起始端的粒度：year | month | day。没有 valid_from 时为 None
+    /// Precision describes the granularity of **the dates this fact actually has**. None when
+    /// neither end has a date -- this used to be NOT NULL DEFAULT day, so facts with no dates claimed
+    /// day precision too (see `facts.valid_from_precision`)
+    /// Granularity of the start: year | month | day. None when there is no valid_from
     pub valid_from_precision: Option<String>,
-    /// 结束端的粒度，外加一个 `unknown`——**原文说它结束了，但没说哪天**。
-    /// `valid_to` 与它都为 None 才是「仍在持续」（见 `facts.valid_to_precision`）
+    /// Granularity of the end, plus one extra value `unknown` -- **the text says it ended, but not
+    /// on what day**. Only when `valid_to` and this are both None does it mean "still ongoing"
+    /// (see `facts.valid_to_precision`)
     pub valid_to_precision: Option<String>,
     pub confidence: Option<f32>,
-    /// 人工操作者；NULL = 引擎自动（抽取写入 / 时态对账闭合 / 高置信改类）
+    /// The human who acted; NULL = the engine did it by itself (an extraction write / a temporal
+    /// reconciliation closing an interval / a high-confidence retype)
     pub actor_name: Option<String>,
-    /// 触发本次变更的审计动作（fact.close / conflict.close_old / fact.reject …）
+    /// The audit action that caused this change (fact.close / conflict.close_old / fact.reject …)
     pub action: Option<String>,
     pub document_id: Option<Uuid>,
     pub filename: Option<String>,
     pub quote: Option<String>,
-    /// 改类事件的两端。起点可空——0009 之后「从没有类到有类」是最常见的一次改类
+    /// The two ends of a retype event. The origin may be absent -- since 0009, "from no class to
+    /// a class" is the most common retype of all
     pub from_type_label: Option<String>,
     pub to_type_label: Option<String>,
 }
 
-/// 一段**记录时间**窗口里，整个库上发生的认知变更。
+/// The changes of belief across the whole knowledge base inside a window of **record time**.
 ///
-/// 跟 `EntityHistoryEvent` 是同一批事件，两处不同：
-/// 1. 开窗在**认知轴**上（recorded_at / invalidated_at），不锁定单个实体——
-///    "上季度有什么变了"这种问题没有一个先验的实体可问；
-/// 2. 主宾都写全（`direction` 是"以某实体为中心"才有的概念，这里没有中心）。
+/// The same set of events as `EntityHistoryEvent`, differing in two places:
+/// 1. the window is opened on the **belief axis** (recorded_at / invalidated_at) and is not pinned
+///    to a single entity -- a question like "what changed last quarter" has no entity to ask about
+///    up front;
+/// 2. subject and object are both written out (`direction` is a notion that only exists when some
+///    entity is the centre, and here there is no centre).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct GraphChange {
     pub fact_id: Uuid,
-    /// 事件落在认知轴上的时刻（写入 = recorded_at，作废 = invalidated_at）
+    /// Where the event falls on the belief axis (write = recorded_at, void = invalidated_at)
     pub at: DateTime<Utc>,
-    /// asserted（新断言）| corrected（订正了前一条）| rejected（被推翻）| merged（并入他条）
+    /// asserted (new assertion) | corrected (fixed the previous one) | rejected (overturned) |
+    /// merged (folded into another)
     pub kind: String,
     pub subject_id: Uuid,
     pub subject_name: String,
     pub predicate_label: Option<String>,
     pub object_name: Option<String>,
     pub object_value: Option<serde_json::Value>,
-    /// 这条断言说的是**世界轴**上的哪一段——与 `at` 正交，别读混
+    /// Which span of the **world axis** this assertion states -- orthogonal to `at`, don't mix them up
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    /// 精度描述的是这条事实**有的那些日期**的粒度。两端都没有日期时为 None——
-    /// 从前这里是 NOT NULL DEFAULT day，于是没日期的事实也自称精确到日（见 `facts.valid_from_precision`）
-    /// 起始端的粒度：year | month | day。没有 valid_from 时为 None
+    /// Precision describes the granularity of **the dates this fact actually has**. None when
+    /// neither end has a date -- this used to be NOT NULL DEFAULT day, so facts with no dates claimed
+    /// day precision too (see `facts.valid_from_precision`)
+    /// Granularity of the start: year | month | day. None when there is no valid_from
     pub valid_from_precision: Option<String>,
-    /// 结束端的粒度，外加一个 `unknown`——**原文说它结束了，但没说哪天**。
-    /// `valid_to` 与它都为 None 才是「仍在持续」（见 `facts.valid_to_precision`）
+    /// Granularity of the end, plus one extra value `unknown` -- **the text says it ended, but not
+    /// on what day**. Only when `valid_to` and this are both None does it mean "still ongoing"
+    /// (see `facts.valid_to_precision`)
     pub valid_to_precision: Option<String>,
     pub confidence: f32,
     pub document_id: Option<Uuid>,
@@ -906,12 +956,13 @@ pub struct GraphChange {
     pub quote: Option<String>,
 }
 
-/// 消解审核项的一侧实体摘要。
+/// The entity summary for one side of a resolution review item.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewSide {
     pub id: Uuid,
     pub name: String,
-    /// 没判出类型时为 None（0009）。颜色另有缺省值——它是画布必须拿到的
+    /// None when no type was decided (0009). Colour has a default of its own -- the canvas cannot
+    /// do without it
     pub type_label: Option<String>,
     pub color: String,
     pub disambiguator: Option<String>,
@@ -919,33 +970,33 @@ pub struct ReviewSide {
     pub top_facts: Vec<String>,
 }
 
-/// 消解审核项：疑似同一实体的灰区对。
+/// A resolution review item: a grey-area pair that may be the same entity.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewItem {
     pub id: Uuid,
     pub score: f32,
     pub reason: Option<String>,
-    /// adjudicating = 等 LLM 裁决；human = 等人工终审
+    /// adjudicating = waiting on the LLM's verdict; human = waiting on a person's final call
     pub stage: String,
     pub created_at: DateTime<Utc>,
     pub left: ReviewSide,
     pub right: ReviewSide,
 }
 
-/// 合并日志行（审核页历史区）。
+/// A merge log row (the history section of the Review page).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MergeLogView {
     pub id: Uuid,
     pub source_name: String,
     pub target_name: String,
-    /// NULL = LLM 自动合并
+    /// NULL = merged automatically by the LLM
     pub merged_by_name: Option<String>,
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub reverted_at: Option<DateTime<Utc>>,
 }
 
-/// 低置信事实审核行。
+/// A low-confidence fact review row.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct FactReviewItem {
     pub id: Uuid,
@@ -959,24 +1010,27 @@ pub struct FactReviewItem {
     pub quote: Option<String>,
 }
 
-/// 事实的证据（引句 + 原文定位）。
+/// The evidence for a fact (the quote + where it sits in the source).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EvidenceView {
-    /// 模型在这一块里实际用的谓词说法。词表外谓词被降级成 related_to 后，
-    /// 事实行上只剩"有关联"——原意只在这里
+    /// The predicate wording the model actually used in this chunk. Once an out-of-vocabulary
+    /// predicate is downgraded to related_to, all that is left on the fact row is "related to" --
+    /// the original meaning lives only here
     pub proposed_predicate: Option<String>,
     pub quote: Option<String>,
     pub chunk_id: Uuid,
     pub document_id: Uuid,
     pub filename: String,
     pub seq: i32,
-    /// 证据出自文档的第几版
+    /// Which version of the document this evidence came from
     pub doc_version: i32,
-    /// 文档已有更新的版本（证据停留在旧版；不代表事实失效）
+    /// A newer version of the document exists (the evidence sits on the old one; this does not
+    /// make the fact void)
     pub stale: bool,
 }
 
-/// 时态冲突（S3 自动闭合拿不准的那些）：旧事实 vs 新事实，Review 页人裁。
+/// A temporal conflict (the ones S3's automatic closing was not sure about): old fact vs new
+/// fact, decided by a human on the Review page.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConflictView {
     pub id: Uuid,
@@ -984,7 +1038,8 @@ pub struct ConflictView {
     pub reason: String,
     pub created_at: DateTime<Utc>,
     pub predicate_label: String,
-    /// 双方完整三元组：主语侧冲突变的是宾语，宾语侧冲突变的是主语
+    /// The full triple on both sides: in a subject-side conflict the object is what changed, in
+    /// an object-side conflict the subject is
     pub old_fact_id: Uuid,
     pub old_subject: String,
     pub old_object: Option<String>,
@@ -996,7 +1051,7 @@ pub struct ConflictView {
     pub new_confidence: f32,
 }
 
-/// 文档查看器用的分块视图。
+/// The chunk view the document viewer uses.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ChunkFull {
     pub id: Uuid,
@@ -1009,34 +1064,41 @@ pub struct KnowledgeBase {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
-    /// `knowledge` | `memory`（Agent 记忆空间）
+    /// `knowledge` | `memory` (an agent's memory space)
     pub kind: String,
     pub description: Option<String>,
-    /// open = 全员按部署角色；restricted = 仅 kb_members 名单可见
+    /// open = everyone, by their deployment role; restricted = visible only to the kb_members list
     pub visibility: String,
-    /// 部署的公共默认空间（第一个建的库）：永远 open、不可删除
+    /// The deployment's shared default space (the first base created): always open, undeletable
     pub is_default: bool,
-    /// 抽取遇到本体外的说法时，是否允许系统自动把它补进本体并改写等它的事实。
-    /// 缺省开——新库的十个默认关系不是任何人选的，等人手工补齐之前图基本没法用。
-    /// 关掉不影响"留意"：未匹配统计照常累积、照常可见，只是变成你点一下的提案。
+    /// Whether the system may add a wording to the ontology by itself when extraction meets one
+    /// the ontology does not have, and rewrite the facts that were waiting on it.
+    /// On by default -- nobody chose the ten seed relations a new base starts with, and until
+    /// someone fills the gaps by hand the graph is barely usable.
+    /// Turning it off does not affect noticing: the unmatched counts accumulate and stay visible
+    /// as before, they just become a proposal you click.
     pub auto_extend_ontology: bool,
-    /// 内置本体按哪种语言播种，以及新的类/关系描述写成哪种语言（`en` | `zh`）。
-    /// **跟语料走，不跟界面走**——description 的读者是正在读这些文档的模型。
-    /// 见 docs/decisions/0004。
-    /// 是否把推出来的事实写进账本（R1）。**缺省关**——这一步往图里加东西，
-    /// 而 0001 判据 2 说「本体是引导不是执法」：声明可能是错的，不该在用户
-    /// 没表态时就按它改图
+    /// Which language the built-in ontology is seeded in, and which language new class / relation
+    /// descriptions are written in (`en` | `zh`).
+    /// **Follow the corpus, not the interface** -- the reader of a description is the model while
+    /// it reads those documents.
+    /// See docs/decisions/0004.
+    /// Whether derived facts are written into the ledger (R1). **Off by default** -- this step adds
+    /// things to the graph, and 0001 criterion 2 says "the ontology guides, it does not enforce":
+    /// a declaration can be wrong, and the graph should not be changed by it while the user has
+    /// said nothing
     pub materialize_inferences: bool,
-    /// 多久重推一次（分钟）。见 `knowledge_bases.inference_interval_minutes`
+    /// How often to re-derive (minutes). See `knowledge_bases.inference_interval_minutes`
     pub inference_interval_minutes: i32,
-    /// 上次推完的时间。**答的是「上次看过没有」，不是「上次改过没有」**
+    /// When the last derivation run finished. **It answers "when did we last look", not "when did
+    /// we last change something"**
     pub last_inference_at: Option<DateTime<Utc>>,
     pub ontology_lang: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// KB 成员矩阵行（库 Settings 的 Members 区）。
+/// A row of the KB membership matrix (the Members section of a base's Settings).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct KbMemberView {
     pub user_id: Uuid,
@@ -1046,138 +1108,154 @@ pub struct KbMemberView {
     pub role: String,
 }
 
-/// 问数数据源列表视图：连接串不下发（凭据只进不出），只露 host:port/db 摘要。
+/// The data source list view for Ask: the connection string is never sent down (credentials go
+/// in but never come out), only a host:port/db summary is exposed.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct DataSourceView {
     pub id: Uuid,
     pub name: String,
     pub engine: String,
-    /// 连接摘要（host:port/db，无凭据）
+    /// Connection summary (host:port/db, no credentials)
     pub summary: String,
     pub created_at: DateTime<Utc>,
     pub last_test_at: Option<DateTime<Utc>>,
     pub last_test_ok: Option<bool>,
 }
 
-/// 向量检索出来的一个候选本体行（类 / 关系 / 属性）。
+/// One candidate ontology row that vector search turned up (class / relation / attribute).
 ///
-/// `distance` 是余弦距离，越小越近。原样带给调用方而不是先折成"相似度"：
-/// 阈值该定在哪由消费者按自己的数据定，这里不替它归一化。
+/// `distance` is cosine distance: the smaller, the closer. It is handed to the caller as-is rather
+/// than folded into a "similarity" first -- where the threshold belongs is for the consumer to
+/// decide against its own data, and we do not normalise on its behalf.
 #[derive(Debug, Clone, Serialize)]
 pub struct TypeCandidate {
     pub id: Uuid,
     pub key: String,
     pub label: String,
     pub description: String,
-    /// 关系行才有：`relation` 或 `attribute`
+    /// Only on relation rows: `relation` or `attribute`
     pub kind: Option<String>,
     pub distance: f32,
 }
 
-/// 一个被记下来、但本体里没有对应属性的**字面值**说法。
+/// A **literal-valued** wording that got recorded but has no matching attribute in the ontology.
 ///
-/// 跟 [`ProposedPredicate`] 是一对：那个是宾语指向实体的（"收购"），
-/// 这个是宾语是字面值的（"成立日期 = 2015"）。两者不能混——提案要产出的东西
-/// 不一样（关系 vs 属性），而混起来的后果具体：一条 `founding_date` 会变成
-/// 一条指向「2015」这个假实体的边。
+/// A pair with [`ProposedPredicate`]: that one is for objects pointing at an entity ("acquired"),
+/// this one for objects that are literal values ("founding date = 2015"). The two must not be
+/// mixed -- a proposal produces a different thing in each case (relation vs attribute), and the
+/// consequence of mixing them is concrete: one `founding_date` would turn into an edge pointing
+/// at a fake entity called "2015".
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ProposedAttribute {
     pub form: String,
     pub fact_count: i64,
     pub doc_count: i64,
-    /// 一条样例值（`"2015"`、`1200`），让人一眼看出这是什么类型的数
+    /// One example value (`"2015"`, `1200`), so a reader can see at a glance what sort of number
+    /// this is
     pub example: Option<String>,
-    /// 这个说法**实际挂在哪些类上**（主语的类型）。
+    /// Which classes this wording **is actually attached to** (the subject's types).
     ///
-    /// 属性必须声明 domain，而 domain 猜错的代价是硬的：主语类型对不上
-    /// 就整条丢弃（`attr_domain_mismatch`）。所以不问模型，直接从数据里取——
-    /// 事实已经在那儿了，它们的主语是什么类是事实，不是判断
+    /// An attribute must declare a domain, and guessing the domain wrong costs hard: a subject
+    /// whose type does not match gets the whole item dropped (`attr_domain_mismatch`). So we do
+    /// not ask the model, we read it straight out of the data -- the facts are already there, and
+    /// what class their subjects are is a fact, not a judgement
     pub domain_keys: Vec<String>,
 }
 
-/// 一条口径改动之前的样子。
+/// What one definition looked like before a change to it.
 ///
-/// **存整版快照而不是差异**（0006）：读的时候要回答的是「当时是什么」，
-/// 而差异得从头重放才答得出来。`before` 是改动前那一行的 `to_jsonb`，
-/// 去掉了 id 与 kb_id。
+/// **A whole-version snapshot, not a diff** (0006): what a read has to answer is "what was it at
+/// the time", and a diff can only answer that by replaying from the beginning. `before` is the
+/// `to_jsonb` of that row before the change, with id and kb_id taken out.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MappingRevision {
     pub id: Uuid,
     pub before: serde_json::Value,
-    /// 改的人。**裸外键 + 用户软删除**，所以归因不会因为人离职而丢；
-    /// 真被硬删过才会是 NULL
+    /// Who changed it. **A bare foreign key + soft-deleted users**, so attribution is not lost
+    /// when someone leaves; it is only NULL if the row really was hard-deleted
     pub changed_by_name: Option<String>,
     pub changed_at: DateTime<Utc>,
 }
 
-/// 语义层的一条映射：业务概念 → 数据资产定义（见 `docs/decisions/0011`）。
+/// One mapping in the semantic layer: a business concept → a data asset definition (see
+/// `docs/decisions/0011`).
 ///
-/// **字段是列，不是 JSON 里的键。** 从前它是一条 `mapped_to` 事实，
-/// 这几样全塞在 `object_value` 里——于是「哪些概念映射到了 orders 这张表」
-/// 要扒 JSON，而「同一个概念同一个源只该有一条」这条约束数据库管不到。
+/// **These fields are columns, not keys inside JSON.** This used to be a `mapped_to` fact with all
+/// of it crammed into `object_value` -- so "which concepts map to the orders table" meant digging
+/// through JSON, and the constraint "one row per concept per source" was out of the database's
+/// reach.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConceptMapping {
     pub id: Uuid,
     pub concept_id: Uuid,
-    /// 概念的名字。读的一侧总要它（问数 prompt、Review 列表），
-    /// 每次再查一遍实体表是白跑
+    /// The concept's name. The read side always wants it (the Ask prompt, the Review list), and
+    /// looking it up in the entity table every time is a wasted trip
     pub concept_name: String,
-    /// 挂载的数据源。同一个概念在不同源上可以有不同定义，这是有意支持的
+    /// The mounted data source. The same concept may be defined differently on different sources,
+    /// which is supported on purpose
     pub source: String,
     pub table_name: Option<String>,
     pub expr: Option<String>,
     pub sql: Option<String>,
     pub unit: Option<String>,
     pub summary: Option<String>,
-    /// 派生指标（「转化率 = 成交数 / 访问数」）：算出来的，不是表里的列
+    /// A derived metric ("conversion rate = orders / visits"): computed, not a column in a table
     pub derived: bool,
     /// proposed | confirmed | rejected
     ///
-    /// **状态而不是置信度。** 从前借事实的 confidence 表达「提议 0.6 / 确认 1.0」，
-    /// 那是把二值状态编码成浮点数，还顺带让它落进「低置信事实」那一档
+    /// **A state, not a confidence.** This used to borrow a fact's confidence to say "proposed
+    /// 0.6 / confirmed 1.0", which encodes a two-valued state as a float and, on the way, drops it
+    /// into the "low-confidence facts" queue
     pub status: String,
 }
 
-/// 一处公理违规，配好展示所需的三元组文本（见 `axiom_violations`）。
+/// One axiom violation, with the triple text needed to display it (see `axiom_violations`).
 ///
-/// **两条事实都展开成 主-谓-宾 文本**：Review 页要让人一眼看出矛盾在哪，
-/// 而两个 UUID 看不出任何东西。自反那一类两条相同——它就是一条事实。
+/// **Both facts are expanded into subject-predicate-object text**: the Review page has to let
+/// someone see at a glance where the contradiction is, and two UUIDs show nothing at all. For the
+/// reflexive kind the two are identical -- it is a single fact.
 #[derive(Debug, Clone, Serialize)]
 pub struct AxiomViolation {
     pub id: Uuid,
     /// self_loop | asymmetry | cycle | functional | signature | derived_contradiction
     pub kind: String,
-    /// 判据来自哪条关系。人若判「公理写错了」，从这里进本体去改
+    /// Which relation the test came from. If a human decides "the axiom is wrong", this is the
+    /// way into the ontology to change it
     pub predicate: Option<String>,
     pub left_fact: Uuid,
     pub left_text: String,
     pub right_fact: Uuid,
     pub right_text: String,
-    /// 环的长度（含首尾）。其余三类为 0——前端据此决定要不要显示「查看路径」
+    /// Cycle length (ends included). 0 for the other three kinds -- the frontend uses it to decide
+    /// whether to show "view the path"
     pub path_len: i32,
     pub detected_at: chrono::DateTime<chrono::Utc>,
-    /// `derived_contradiction` 独有（0017）：推出来的那条三元组——它没有落库，
-    /// 只能在这里写出来。字段见 `reasoning::run`。其余种类是 `{}`
+    /// `derived_contradiction` only (0017): the triple that was derived -- it never landed in the
+    /// database, so here is the only place it can be written out. Fields in `reasoning::run`. `{}`
+    /// for every other kind
     pub detail: serde_json::Value,
-    /// 审核线索（0017 §2）：`stale`（旧断言没写结束日期）、`duplicate`（有同名
-    /// 实体）、`unsure`（抽取置信度低）。只给一条，没有就空
+    /// A review hint (0017 §2): `stale` (the old assertion has no end date), `duplicate` (there is
+    /// an entity with the same name), `unsure` (extracted with low confidence). Only one is given,
+    /// and none means empty
     pub hint: Option<String>,
-    /// 环上的每一条事实，按顺序（其余种类为空）。**逐条给 id**：撤事实要说撤哪条，
-    /// 而环上哪条错了只有人看了才知道（#202）
+    /// Every fact on the cycle, in order (empty for the other kinds). **An id for each**:
+    /// retracting a fact means saying which one, and which fact on the cycle is the wrong one is
+    /// something only a human can tell after looking (#202)
     pub path: Vec<ViolationFact>,
 }
 
-/// 违规里的一条事实：id 与三元组文本
+/// One fact within a violation: its id and its triple text
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViolationFact {
     pub id: Uuid,
     pub text: String,
 }
 
-/// 本体自己的一处自相矛盾（见 `ontology_defects`）。
+/// A place where the ontology contradicts itself (see `ontology_defects`).
 ///
-/// **与 [`AxiomViolation`] 不是一回事**：那个说「事实与定义抵触」，这个说
-/// 「定义自己站不住」。后者更根本——一个自相矛盾的本体会让前者的结论全部可疑。
+/// **Not the same thing as [`AxiomViolation`]**: that one says "a fact clashes with a definition",
+/// this one says "the definition does not stand up by itself". The latter is the more fundamental
+/// of the two -- a self-contradictory ontology makes every conclusion of the former suspect.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct OntologyDefect {
     pub id: Uuid,
@@ -1185,21 +1263,23 @@ pub struct OntologyDefect {
     /// | disjoint_with_ancestor | inherits_disjoint | inverse_of_itself
     /// | inverse_not_mutual | sub_property_cycle | rules_disagree
     pub kind: String,
-    /// `rules_disagree` 独有（0017）：哪两条规则、撞在哪条公理上、几对、几个例子
+    /// `rules_disagree` only (0017): which two rules, which axiom they collide on, how many pairs,
+    /// and a few examples
     pub detail: serde_json::Value,
-    /// 出问题那个对象的标签（类或谓词）。查不到就是它已经被删了
+    /// The label of the object at fault (class or predicate). Not found means it has been deleted
     pub subject_label: Option<String>,
-    /// 另一方：互斥的那个类
+    /// The other party: the class it is disjoint with
     pub other_label: Option<String>,
-    /// 环上类的标签，按顺序
+    /// Labels of the classes on the cycle, in order
     pub path_labels: Vec<String>,
     pub detected_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// 一条推出来的事实，连同它的证明（实体面板的「推出来的」那一档）。
+/// One derived fact together with its proof (the "Derived" tab on the entity panel).
 ///
-/// **`premises` 是这一档存在的理由**：不给出前提的话，一条派生边跟一条普通的边
-/// 在界面上看不出区别，而那正是「推理污染知识」的样子。
+/// **`premises` is the reason that tab exists**: without the premises, a derived edge and an
+/// ordinary one look no different in the UI, and that is exactly what "inference polluting
+/// knowledge" looks like.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct DerivedFactView {
     pub id: Uuid,
@@ -1208,20 +1288,22 @@ pub struct DerivedFactView {
     pub object_id: Uuid,
     pub object: String,
     pub predicate: String,
-    /// transitive | symmetric——靠哪条规则推的
+    /// transitive | symmetric -- which rule derived it
     pub rule: String,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     pub confidence: f32,
     pub derived_at: DateTime<Utc>,
-    /// 直接前提，按推导顺序展开成三元组文本
+    /// The immediate premises, expanded into triple text in derivation order
     pub premises: Vec<String>,
 }
 
-/// 一条**没有落地**的派生（0017 §3）：推出来了，撞上一条断言，拦在图外。
+/// A derivation that **did not land** (0017 §3): derived, then it hit an assertion and was kept
+/// out of the graph.
 ///
-/// 它没有 id——落库的才有。这里用那条 `derived_contradiction` 违规的 id 指它，
-/// 面板上的「没落地的」一档与图上的幽灵边都靠这个 id 对上 Review 里的卡片。
+/// It has no id -- only what lands in the database gets one. Here the id of that
+/// `derived_contradiction` violation stands in for it, and both the "Did not land" tab on the
+/// panel and the ghost edges on the graph use that id to match up with the card in Review.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct BlockedDerivation {
     pub violation_id: Uuid,
@@ -1231,21 +1313,22 @@ pub struct BlockedDerivation {
     pub object: String,
     pub predicate: String,
     pub rule: String,
-    /// 声明所在的谓词
+    /// The predicate the declaration sits on
     pub via_label: String,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
-    /// 挡住它的那条断言，与它的三元组文本
+    /// The assertion that blocked it, and that assertion's triple text
     pub against_fact: Uuid,
     pub against_text: String,
-    /// 前提事实 id，按推导顺序——证明链从这里展开
+    /// Premise fact ids, in derivation order -- the proof chain unfolds from here
     pub premises: Vec<Uuid>,
 }
 
-/// 证明的一步：一条断言前提，连同它的证据（0002 R2）。
+/// One step of a proof: an asserted premise together with its evidence (0002 R2).
 ///
-/// 前提一律是断言（`fact_derivations` 不记派生），所以证明是一条链而不是一棵树：
-/// 派生 → 按 `seq` 排好的断言 → 每条断言的原句。叶子就是 chunk。
+/// Premises are always assertions (`fact_derivations` does not record derivations), so a proof is
+/// a chain and not a tree: derivation → assertions ordered by `seq` → the sentence behind each
+/// assertion. The leaves are chunks.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProofStep {
     pub seq: i32,
@@ -1253,40 +1336,46 @@ pub struct ProofStep {
     pub subject_id: Uuid,
     pub subject: String,
     pub predicate_id: Option<Uuid>,
-    /// 本体里的关系名；空谓词事实（0010）不参与推导，这里理论上恒有值，
-    /// 留 Option 是不在读路径上撒谎
+    /// The relation's name in the ontology; empty-predicate facts (0010) take no part in
+    /// derivation, so in theory this always has a value -- it stays an Option so the read path
+    /// does not lie
     pub predicate: Option<String>,
     pub object_id: Option<Uuid>,
     pub object: Option<String>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     pub confidence: f32,
-    /// 这条前提后来被撤了。派生随之失效，但证明还要读得出「当时靠的是什么」
+    /// This premise was retracted later. The derivation falls with it, but the proof still has to
+    /// read out "what it rested on at the time"
     pub retracted: bool,
     pub evidence: Vec<EvidenceView>,
 }
 
-/// 一条派生事实的完整证明：它本身，加上按顺序展开到原句的前提。
+/// The complete proof of one derived fact: the fact itself, plus its premises expanded in order
+/// down to the source sentences.
 #[derive(Debug, Clone, Serialize)]
 pub struct Proof {
     pub derived: DerivedFactView,
     pub steps: Vec<ProofStep>,
 }
 
-/// 审核队列各档的**真实条数**。
+/// The **real count** for each queue in Review.
 ///
-/// 与列表分开取是有意的：列表有上限（一页十条），数数没有。从前左栏读的是
-/// 数组长度，而接口固定只回 100 条——一个有 164 条待办的库，界面写着 100，
-/// 清完还会再冒出来。
-/// 等人点头的一条事实（0015）。`quote` 是那句记忆的全文——确认界面要把原句和
-/// 三元组并排显示，只列三元组等于要人凭空判断它对不对。
+/// Fetching these separately from the lists is deliberate: a list has a cap (ten per page), a
+/// count does not. The left column used to read the array's length while the endpoint always
+/// returned at most 100 -- a base with 164 items to work through showed 100, and more kept
+/// appearing after you had cleared them.
+/// One fact waiting for a human nod (0015). `quote` is the full text of that memory -- the
+/// confirmation UI has to show the original sentence next to the triple, and listing only the
+/// triple amounts to asking someone to judge it out of thin air.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct PendingFactView {
     pub id: Uuid,
     pub subject_id: Uuid,
     pub subject_name: String,
     pub predicate_id: Option<Uuid>,
-    /// 本体里的关系名；为空时前端显示 `proposed_predicate`（斜体，标明是原话）
+    /// The relation's name in the ontology; when empty the frontend shows `proposed_predicate`
+    /// (in italics, marked as the source's own words)
     pub predicate_label: Option<String>,
     pub proposed_predicate: Option<String>,
     pub object_id: Option<Uuid>,
@@ -1306,7 +1395,8 @@ pub struct PendingFactView {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, sqlx::FromRow)]
 pub struct ReviewCounts {
-    /// 记忆抽出、等人点头的事实（0015）。排第一：它是人自己说的话
+    /// Facts extracted from memories, waiting for a human nod (0015). First in the list: these are
+    /// the person's own words
     pub pending: i64,
     pub duplicates: i64,
     pub conflicts: i64,
@@ -1318,67 +1408,71 @@ pub struct ReviewCounts {
     pub merges: i64,
 }
 
-/// 一个关系声明了哪些 OWL 公理。
+/// Which OWL axioms a relation declares.
 ///
-/// **打包成一个东西传，不是一串参数。** 它们本来就是同一族——推理机
-/// （0002）拿它们当判据，界面上也该并排出现；散成参数表里的六个 bool，
-/// 调用点迟早传错顺序，而 `bool` 之间编译器帮不上忙。
+/// **Passed as one thing, not as a string of parameters.** They were one family to begin with --
+/// the reasoner (0002) uses them as its tests, and they should appear side by side in the UI too;
+/// spread out as six bools in a parameter list, some call site will eventually pass them in the
+/// wrong order, and between `bool`s the compiler cannot help.
 ///
-/// 后两位不是 bool：`inverseOf` 与 `subPropertyOf` 指向**另一个关系**，
-/// 界面上是下拉框而不是复选框。形状不同不改变它们属于这一族——推理机
-/// 的四种规则源正是这六位里的两条加上这两条（0002）。
+/// The last two are not bools: `inverseOf` and `subPropertyOf` point at **another relation**, and
+/// in the UI they are dropdowns rather than checkboxes. A different shape does not stop them
+/// belonging to this family -- the reasoner's four rule sources are exactly two of the six above
+/// plus these two (0002).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationAxioms {
-    /// 主语侧唯一（一个人一个出生地）
+    /// Unique on the subject side (one person, one birthplace)
     pub functional: bool,
-    /// 宾语侧唯一（一个项目一个 leader）
+    /// Unique on the object side (one project, one leader)
     pub inverse_functional: bool,
     /// A→B ∧ B→C ⟹ A→C
     pub transitive: bool,
     /// A→B ⟹ B→A
     pub symmetric: bool,
-    /// A→B ⟹ 不存在 B→A
+    /// A→B ⟹ no B→A exists
     pub asymmetric: bool,
-    /// 不存在 A→A
+    /// No A→A exists
     pub irreflexive: bool,
-    /// `p⁻¹ = q`：`A p B ⟹ B q A`。**单向存，双向用**——载入公理时归一化
-    /// （`reasoning::axioms`），所以只需在一侧声明，反向那条自动成立
+    /// `p⁻¹ = q`: `A p B ⟹ B q A`. **Stored one way, used both ways** -- axioms are normalised as
+    /// they load (`reasoning::axioms`), so declaring it on one side is enough and the reverse holds
+    /// by itself
     pub inverse_of: Option<Uuid>,
-    /// `p ⊑ q`：`A p B ⟹ A q B`。断言了具体的，通用的也成立
+    /// `p ⊑ q`: `A p B ⟹ A q B`. Assert the specific one and the general one holds too
     pub sub_property_of: Option<Uuid>,
 }
 
-/// 文库的一页，连同这一页之外的统计。
+/// One page of the library, together with counts that reach past this page.
 ///
-/// **统计不受名字/状态筛选影响**：`ready` / `extracting` / `failed` 说的是这个
-/// 来源里有多少，那是批量按钮的作用范围，跟你此刻在搜什么无关。
+/// **The counts are not affected by the name / status filter**: `ready` / `extracting` / `failed`
+/// say how many there are in this source, which is the reach of the bulk buttons and has nothing
+/// to do with what you happen to be searching for right now.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentPage {
     pub docs: Vec<Document>,
-    /// 命中筛选的总数（分页器用它）
+    /// The total matching the filter (the paginator uses it)
     pub total: i64,
     pub ready: i64,
     pub extracting: i64,
     pub failed: i64,
 }
 
-/// 一枚个人访问令牌的元信息（0014）。**永远不含明文**——
-/// 明文只在 `tokens::issue` 返回的那一次存在，库里只有哈希。
+/// The metadata of one personal access token (0014). **Never contains the plaintext** -- the
+/// plaintext exists only in the one value `tokens::issue` returns; the database holds a hash.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TokenView {
     pub id: Uuid,
     pub name: String,
-    /// 给人认的那一小截（`utp_pat_ab12`）。够对上配置文件里那一串，
-    /// 又不足以复原
+    /// The short piece a human recognises it by (`utp_pat_ab12`). Enough to match the string in a
+    /// config file, not enough to reconstruct it
     pub token_prefix: String,
-    /// read | write。**上限不是授权**：有效权限 = 这个人的角色 ∩ 这个 scope
+    /// read | write. **A ceiling is not a grant**: effective rights = this person's role ∩ this scope
     pub scope: String,
-    /// None = 这个人能进的全部库
+    /// None = every base this person can get into
     pub kb_ids: Option<Vec<Uuid>>,
     pub expires_at: Option<DateTime<Utc>>,
-    /// 「这把还在用吗」。撤之前要答得出，否则没人敢撤
+    /// "Is this one still in use?" You have to be able to answer before revoking, or nobody dares
     pub last_used_at: Option<DateTime<Utc>>,
-    /// **撤销打戳不删行**：撤过这件事本身要留痕
+    /// **Revoking stamps the row, it does not delete it**: a revocation itself has to leave a trace
     pub revoked_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

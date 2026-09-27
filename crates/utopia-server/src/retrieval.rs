@@ -1,5 +1,5 @@
-//! 混合检索：BM25（Tantivy）+ 向量（pgvector）→ RRF 融合。
-//! embedding 未配置或请求失败时静默降级为纯 BM25。
+//! Hybrid retrieval: BM25 (Tantivy) + vectors (pgvector) → fused with RRF.
+//! When embedding is unconfigured or the request fails, degrade silently to BM25 alone.
 
 use crate::llm_util;
 use crate::state::AppState;
@@ -25,7 +25,7 @@ pub async fn hybrid(
         .map_err(utopia_core::AppError::Other)?;
     lists.push(bm25.into_iter().map(|h| h.chunk_id).collect());
 
-    // 向量（可选通道）
+    // Vectors (the optional channel)
     let settings = utopia_store::settings::get(&state.pool, workspace_id).await?;
     if let Some(client) = settings.as_ref().and_then(llm_util::embed_client) {
         match client.embed(&[query.to_string()]).await {
@@ -40,7 +40,7 @@ pub async fn hybrid(
                 lists.push(ids.into_iter().map(|id| id.to_string()).collect());
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "查询 embedding 失败，降级为纯 BM25"),
+            Err(e) => tracing::warn!(error = %e, "embedding the query failed, degrading to BM25"),
         }
     }
 

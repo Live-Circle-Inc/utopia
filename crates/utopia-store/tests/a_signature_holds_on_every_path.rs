@@ -1,14 +1,21 @@
-//! 关系的签名（domain / range）在**三条写路径**上都得算数（#190 / #196）。
+//! A relation's signature (domain / range) has to count on **all three write paths**
+//! (#190 / #196).
 //!
-//! 抽取写入时按 #138 掰正方向或留空谓词，但写谓词的路不止一条：**采纳**把谓词挂回
-//! 旧事实，**合并**换掉主语的类型。守卫只装在抽取上，另外两条各自绕过去——实测采纳
-//! 把违反率从 0 抬到 12.3%。这里守三件事：
+//! Extraction straightens the direction or leaves the predicate empty per #138 when it writes,
+//! but more than one path writes a predicate: **adoption** hangs a predicate back onto an old
+//! fact, and **merging** swaps out the subject's type. The guard was only installed on
+//! extraction, and the other two each went around it -- measured, adoption pushed the violation
+//! rate from 0 up to 12.3%. Three things are guarded here:
 //!
-//! 1. 采纳走同一道判断：主语不合宾语合 → 对调着挂；两边都不合 → 不挂，事实留在空谓词上。
-//! 2. 合并之后，被换了主语的事实若违反签名 → `axiom_violations` 里多一条 `signature`。
-//! 3. 一致性检查（R0）也能量出签名违规，事实撤了它就被清掉。
+//! 1. Adoption goes through the same judgement: subject does not fit but object does → hang it
+//!    swapped; neither side fits → do not hang it, and the fact stays with an empty predicate.
+//! 2. After a merge, if the fact whose subject was swapped breaks the signature → one more
+//!    `signature` row in `axiom_violations`.
+//! 3. The consistency check (R0) can measure signature violations too, and retracting the fact
+//!    clears it.
 //!
-//! 没有 `UTOPIA_DATABASE_URL` 时跳过而不是失败。自建自拆，绝不碰已有的库。
+//! Skipped rather than failed when there is no `UTOPIA_DATABASE_URL`. It builds its own fixture
+//! and tears it down, and never touches an existing database.
 
 use sqlx::PgPool;
 use utopia_store::graph::Adopted;
@@ -19,7 +26,7 @@ struct Fixture {
     kb: Uuid,
     company: Uuid,
     person: Uuid,
-    /// schema.org 的 `employee (organization → person)`
+    /// schema.org's `employee (organization → person)`
     employee: Uuid,
     acme: Uuid,
     alice: Uuid,
@@ -135,7 +142,8 @@ async fn seed(pool: &PgPool) -> anyhow::Result<Fixture> {
     })
 }
 
-/// 一条没有谓词、证据里留着原文说法 `employee` 的事实——采纳要改写的正是这种
+/// A fact with no predicate whose evidence keeps the original wording `employee` -- exactly
+/// the kind adoption is meant to rewrite
 async fn surfaced_fact(
     pool: &PgPool,
     f: &Fixture,
@@ -199,12 +207,14 @@ async fn adoption_and_merge_respect_the_signature() -> anyhow::Result<()> {
     let f = seed(&pool).await?;
 
     let run = async {
-        // 模型写的是 "Alice is an employee of Acme" —— 主语 person 违反 domain、宾语 company 符合
+        // The model wrote "Alice is an employee of Acme" -- the person subject breaks the
+        // domain, the company object fits
         let reversed = surfaced_fact(&pool, &f, f.alice, f.acme).await?;
-        // "Bob is an employee of Alice" —— 两边都是 person，这个关系压根不适用
+        // "Bob is an employee of Alice" -- both sides are person, so this relation simply does
+        // not apply
         let hopeless = surfaced_fact(&pool, &f, f.bob, f.alice).await?;
 
-        // 1. 采纳：一条对调着挂上，一条不挂
+        // 1. Adoption: one gets hung on swapped, the other does not get hung at all
         let Adopted {
             moved, left_off, ..
         } = utopia_store::graph::adopt_proposed_predicates(
@@ -236,7 +246,8 @@ async fn adoption_and_merge_respect_the_signature() -> anyhow::Result<()> {
         assert!(old_gone, "the reversed row was superseded, not left beside the corrected one");
         assert!(open_signature_breaks(&pool, f.kb).await?.is_empty());
 
-        // 2. 合并：把 Acme 并进 Bob（person），Acme employee Alice 的主语变成 person
+        // 2. Merge: fold Acme into Bob (a person), so the subject of Acme employee Alice
+        //    becomes a person
         utopia_store::resolution::merge_entities(&pool, f.kb, f.acme, f.bob, None, "test")
             .await?;
         let edges = live_employee_edges(&pool, &f).await?;
@@ -254,7 +265,7 @@ async fn adoption_and_merge_respect_the_signature() -> anyhow::Result<()> {
             "a merge that breaks the signature must show up as an open violation"
         );
 
-        // 3. 一致性检查量得出它，撤了事实就清掉
+        // 3. The consistency check measures it, and retracting the fact clears it
         let report = utopia_store::reasoning::run(&pool, f.kb).await?;
         assert_eq!(report.found, 1);
         assert_eq!(report.inserted, 0, "already recorded by the merge; the check must not duplicate it");
@@ -267,7 +278,8 @@ async fn adoption_and_merge_respect_the_signature() -> anyhow::Result<()> {
         assert_eq!(report.cleared, 1, "a retracted fact takes its violation with it");
         assert!(open_signature_breaks(&pool, f.kb).await?.is_empty());
 
-        // 未分类的实体不算违反：类型是 NULL 的主语没有东西可比
+        // An unclassified entity is not a violation: a subject whose type is NULL has nothing
+        // to compare against
         let untyped = Uuid::now_v7();
         sqlx::query("INSERT INTO entities (id, kb_id, canonical_name) VALUES ($1, $2, 'Nobody')")
             .bind(untyped)

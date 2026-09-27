@@ -1,9 +1,10 @@
-//! Trino（旧名 Presto）：REST 协议 `POST /v1/statement`，然后沿 `nextUri` 一页页取。
-//! 一个引擎顶起整个湖仓——Iceberg / Delta / Hive / Hudi 都是它的 catalog，
-//! 换格式不换协议。Starburst 同协议。
+//! Trino (formerly Presto): a REST protocol -- `POST /v1/statement`, then fetch page by page
+//! along `nextUri`. One engine carries the whole lakehouse -- Iceberg / Delta / Hive / Hudi are
+//! all just catalogs to it, so changing format does not change protocol. Starburst speaks the
+//! same protocol.
 //!
-//! 没有会话可设只读：超时靠 `X-Trino-Session: query_max_execution_time`，
-//! 只读靠 `guard_sql_for`。
+//! There is no session to set read-only on: the timeout rides on
+//! `X-Trino-Session: query_max_execution_time`, read-only comes from `guard_sql_for`.
 
 use super::conn::TrinoConn;
 use super::{
@@ -72,7 +73,8 @@ impl TrinoEngine {
         Ok(h)
     }
 
-    /// 提交并沿 nextUri 收完：列在第一个带 columns 的页上，数据分页累积
+    /// Submit, then collect to the end along nextUri: the columns are on the first page that
+    /// carries a columns field, the data accumulates across pages
     async fn run(&self, sql: &str) -> anyhow::Result<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
         let client = super::http()?;
         let headers = self.headers()?;
@@ -161,7 +163,7 @@ impl QueryEngine for TrinoEngine {
     }
 }
 
-/// information_schema 的一行 → SchemaColumn（值可能是 null，comment 常是）
+/// One information_schema row → SchemaColumn (values can be null, and comment usually is)
 pub(crate) fn schema_row(row: Vec<serde_json::Value>) -> SchemaColumn {
     let text = |i: usize| -> String {
         row.get(i)

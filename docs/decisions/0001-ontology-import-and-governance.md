@@ -116,7 +116,7 @@ since moved to `scripts/bench/` (0012); these numbers are real but no longer com
 16. **Domain and range are a type signature in the prompt**: `works_at (person → organization)`. It
     corrects "Alice works_at Seattle" at generation time. Only classes laid out in the prompt are
     named, a side with none selected falls back to `*`, and the signature uses keys, never labels: a
-    Chinese KB's label 「人物」 would teach the model a type that does not exist.
+    Chinese KB's label "人物" would teach the model a type that does not exist.
 17. **Preview before commit.** Upload → dry run (new / updated / not projected counts, which relations
     turn on conflict detection through `functional`, how many classes lack `rdfs:comment`) → confirm.
     A key collision between two IRIs is reported and left to the user; a local row without an IRI

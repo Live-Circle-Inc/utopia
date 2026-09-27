@@ -1,5 +1,6 @@
-/* 账户层壳：Profile / Administration 的宿主。
-   与 KB 无关，所以没有 KB 切换器、没有 tab 导航——只有字标、返回、用户菜单。 */
+/* The account-level shell: host of Profile / Administration.
+   Has nothing to do with a KB, so no KB switcher and no tab navigation -- only the
+   wordmark, back, and the user menu. */
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import { usePageTitle } from "../useTitle";
@@ -14,7 +15,7 @@ export function AccountShell() {
   const navigate = useNavigate();
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, staleTime: Infinity });
-  // 标题：`Utopia | Persona`——账户区整体一个名字，不逐页细分
+  // Title: `Utopia | Persona` -- one name for the whole account area, not split up page by page
   usePageTitle(S.app.name, S.account.titleTag);
 
   if (me.isPending) {
@@ -38,7 +39,8 @@ export function AccountShell() {
 
   return (
     <div className="h-screen flex flex-col overflow-hidden u-arrive">
-      {/* 顶栏与 Docs 页同构：分区字标（点击回城）+ 返回 + GitHub·版本 + 用户 */}
+      {/* Top bar built like the Docs page: section wordmark (click to go home) + back
+          + GitHub · version + user */}
       <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center px-5">
         <SectionMark text={S.account.brand} title={S.docs.backTitle} />
         <div className="ml-auto flex items-center gap-1.5">
@@ -65,9 +67,9 @@ export function AccountShell() {
       </header>
 
       <div className="flex-1 min-h-0 flex">
-        {/* 账户导航栏（仅两项，管理员多一项） */}
+        {/* The account nav rail (only two entries; admins get one more) */}
         <aside className={`${RAIL_CLS} p-3 space-y-0.5`}>
-          {/* exact：/account 是 /account/kbs 的前缀，默认前缀匹配会双亮 */}
+          {/* exact: /account prefixes /account/kbs, so the default prefix match lights up both */}
           <Link
             to="/account"
             activeOptions={{ exact: true }}

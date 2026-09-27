@@ -1,8 +1,11 @@
-/* 等人点头的事实（docs/decisions/0015）。
-   一句 remember 抽出的三元组先进待确认队列，不上图；人在这里点头它才进账本。
-   **原句在上，三元组在下**：只列三元组等于要人凭空判断它对不对——
-   实测里 `Acme --?--> 深圳` 那条，人一看原句就知道该拒。
-   两处共用同一行组件：Review 页的「待确认」一档，与 Chat 里跟在 remember 步骤后面的那张卡。 */
+/* Facts waiting for a human nod (docs/decisions/0015).
+   The triples one remember extracts land in the pending queue first, not on the graph; only
+   once a human nods here do they go into the ledger.
+   **Original sentence on top, triple underneath**: listing only the triple asks people to
+   judge it out of thin air -- in practice, for that `Acme --?--> Shenzhen` row, one look at
+   the original sentence was enough to know it should be rejected.
+   Two places share this one row component: the "pending" bucket on the Review page, and the
+   card that follows the remember step in Chat. */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type PendingFactItem } from "../api";
 import { S } from "../i18n";
@@ -12,8 +15,9 @@ function ym(iso: string | null): string | null {
   return iso ? iso.slice(0, 7) : null;
 }
 
-/** 记忆落库时正文前面带着 `[YYYY-MM-DD HH:MM] `（`memory::append_episode` 加的时间戳）。
- *  卡片上要的是那句话本身，时间戳是索引用的，剥掉 */
+/** A persisted memory carries `[YYYY-MM-DD HH:MM] ` in front of the body (the timestamp
+ *  `memory::append_episode` adds).
+ *  The card wants the sentence itself; the timestamp is there for indexing, so strip it */
 function sentence(quote: string): string {
   return quote.replace(/^\[\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?\]\s*/, "");
 }
@@ -27,9 +31,11 @@ function objectText(f: PendingFactItem): string {
   return v.unit ? `${val} ${v.unit}` : val;
 }
 
-/** 点头是写图的动作，Editor 起步——与服务端 `require_kb(Role::Editor)` 同一口径。
- *  Viewer 看得见提议、看不见按钮：按钮亮着却点不动，等于让人猜自己有没有权限。
- *  查询键与 Library 页共用（`kbOne`），不多打一次接口 */
+/** Nodding writes to the graph, so it starts at Editor -- the same bar as the server's
+ *  `require_kb(Role::Editor)`.
+ *  A Viewer sees the proposals but not the buttons: a button that is lit but dead to the
+ *  click amounts to making people guess whether they have permission.
+ *  The query key is shared with the Library page (`kbOne`), so this costs no extra call */
 export function useCanDecide(kbId: string | undefined): boolean {
   const kbDetail = useQuery({
     queryKey: ["kbOne", kbId],
@@ -57,7 +63,7 @@ export function PendingFactRow({
   const range = from || to ? `${from ?? "…"} → ${to ?? S.review.ongoing}` : null;
   return (
     <div className="glass rounded-xl p-4">
-      {/* 原句先出。它是人自己说的，判断的依据就是它 */}
+      {/* Original sentence first. They said it themselves, and it is what the call rests on */}
       <p className="text-xs text-neutral-400 italic">“{sentence(fact.quote)}”</p>
       <div className="mt-2.5 flex items-center gap-2 flex-wrap">
         <span className="text-sm font-medium text-white">{fact.subject_name}</span>
@@ -66,7 +72,8 @@ export function PendingFactRow({
           {fact.predicate_label ? (
             <span>{fact.predicate_label}</span>
           ) : (
-            /* 本体里没有这个关系：显示原话，斜体标明它不是词表里的词（0010） */
+            /* The ontology has no such relation: show the raw wording, in italics to mark
+               that it is not a term from the vocabulary (0010) */
             <span
               className="italic text-neutral-600"
               title={S.review.pendingNoPredicate}
@@ -111,9 +118,11 @@ export function PendingFactRow({
   );
 }
 
-/** 跟在 remember 步骤后面的确认卡。
- *  抽取是异步的，卡片在任务完成时才长出来（SSE `pending` 事件让查询失效重取）；
- *  回放旧会话时同样按 chunk 取——还有没点头的就照样显示，都处理完了就不占地方。 */
+/** The confirmation card that follows the remember step.
+ *  Extraction is async, so the card only grows in when the job finishes (the SSE `pending`
+ *  event invalidates the query and it refetches);
+ *  replaying an old session fetches per chunk the same way -- anything not yet nodded at
+ *  still shows, and once it is all dealt with the card takes up no room. */
 export function NodCard({ kbId, chunkId }: { kbId: string; chunkId: string }) {
   const queryClient = useQueryClient();
   const canDecide = useCanDecide(kbId);

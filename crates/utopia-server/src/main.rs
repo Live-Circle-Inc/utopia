@@ -35,7 +35,8 @@ use utopia_core::config::AppConfig;
 use utopia_search::SearchIndex;
 use uuid::Uuid;
 
-/// 记忆那条路带着「谁说的」（0015）；别的任务没有这个字段，读到 None 本就该如此
+/// The memory path carries "who said it" (0015); other jobs have no such field, so getting None
+/// here is exactly as it should be
 fn payload_proposed_by(payload: &serde_json::Value) -> Option<Uuid> {
     payload
         .get("proposed_by")
@@ -48,7 +49,7 @@ fn payload_document_id(payload: &serde_json::Value) -> anyhow::Result<Uuid> {
         .get("document_id")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("payload 缺少 document_id"))
+        .ok_or_else(|| anyhow::anyhow!("payload is missing document_id"))
 }
 
 #[tokio::main]
@@ -62,9 +63,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = AppConfig::load()?;
 
-    // 迁移要建表建触发器，运行时不需要那些权限。两者分开，应用才能用一个
-    // 只读写业务表、对台账只增不改的受限角色连库。迁移池用完立即释放，
-    // 那个高权限连接不在运行期常驻。
+    // Migrations create tables and triggers; the runtime does not need those privileges. Keeping
+    // the two apart is what lets the app connect with a restricted role that only reads and writes
+    // business tables and can only append to the ledger. The migration pool is released the moment
+    // it is done, so that high-privilege connection does not sit around at runtime.
     let migration_url = cfg.migration_url().to_string();
     let separate_migration_role = cfg.migration_url_override().is_some();
     {
@@ -73,46 +75,53 @@ async fn main() -> anyhow::Result<()> {
         mig_pool.close().await;
     }
     if separate_migration_role {
-        tracing::info!("数据库迁移完成（迁移身份与运行身份分离）");
+        tracing::info!("database migrations complete (migration role separate from runtime role)");
     } else {
-        tracing::info!("数据库迁移完成");
+        tracing::info!("database migrations complete");
     }
 
     let pool = utopia_store::db::connect(&cfg.database_url, cfg.db_max_connections).await?;
 
     let index_dir = std::path::Path::new(&cfg.data_dir).join("index");
     let search = Arc::new(SearchIndex::open(&index_dir)?);
-    tracing::info!("全文索引就绪: {}", index_dir.display());
+    tracing::info!("full-text index ready: {}", index_dir.display());
 
-    // **索引落空就自己重建，不给按钮。**
+    // **If the index comes up empty, rebuild it ourselves -- no button.**
     //
-    // 索引是独立于数据库的一份文件：换机器、卷没挂上、目录损坏，任何一样都会让它
-    // 落空。而落空之后检索只会静默回零——界面上看不出任何异样，用户会以为是
-    // 「确实没有匹配」。这种失败不该靠人先意识到再去点一个按钮。
+    // The index is a file independent of the database: a new machine, a volume that did not get
+    // mounted, a corrupted directory -- any one of those leaves it empty. And once it is empty,
+    // retrieval just silently returns nothing -- nothing looks out of place in the UI, and the
+    // user assumes there "really are no matches". That kind of failure should not depend on a
+    // human noticing first and then going to click a button.
     //
-    // 判据是「库里有分块而索引空着」，不是「数目对不对得上」：后者在正常运行中
-    // 也会短暂不等（一篇文档正在索引），拿它当判据会让每次启动都重建一遍。
+    // The test is "there are chunks in the database while the index is empty", not "do the counts
+    // match": the latter is briefly unequal during normal operation too (a document is being
+    // indexed), and using it as the test would rebuild on every single startup.
     reindex_if_empty(&pool, &search).await;
 
-    // JWT 密钥：环境变量优先（轮换、多实例显式对齐走这条），否则用库里那条；
-    // 库里也没有就现生成一条存进去。生成放在这里而不是 store 里，是因为
-    // OsRng 已经随 argon2 在 server 的依赖里，store 不必为此多一个依赖。
-    // 空串按未设置处理：compose 里写 ${UTOPIA_JWT_SECRET:-} 时环境变量是存在但为空的，
-    // 照字面读会得到 Some("")——一个所有部署都相同的空密钥，比默认值更糟。
+    // JWT secret: the environment variable wins (rotation and explicitly aligning several
+    // instances go through this path), otherwise the one in the database; if the database has none
+    // either, generate one now and store it. Generation lives here rather than in store because
+    // OsRng is already among the server's dependencies via argon2, so store needs no extra
+    // dependency for it.
+    // An empty string is treated as unset: with ${UTOPIA_JWT_SECRET:-} in compose the environment
+    // variable exists but is empty, and read literally that yields Some("") -- an empty secret
+    // identical across every deployment, which is worse than a default value.
     let jwt_secret = match cfg.jwt_secret.clone().filter(|s| !s.trim().is_empty()) {
         Some(s) => s,
         None => {
             let secret =
                 utopia_store::access::ensure_jwt_secret(&pool, &auth::generate_jwt_secret())
                     .await?;
-            tracing::info!("JWT 密钥取自部署设置（未显式配置 UTOPIA_JWT_SECRET）");
+            tracing::info!("JWT secret taken from deployment settings (UTOPIA_JWT_SECRET unset)");
             secret
         }
     };
 
     let state = AppState::new(pool.clone(), &cfg, search, jwt_secret);
 
-    // worker 并发数：系统设置持久化，启动时装载；运行中经同一 AtomicUsize 热调
+    // Worker concurrency: persisted in the system settings and loaded at startup; tuned live at
+    // runtime through this same AtomicUsize
     let n = utopia_store::access::worker_concurrency(&pool)
         .await
         .unwrap_or(32);
@@ -121,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    // 任务分发：新任务类型在这里注册
+    // Job dispatch: new job kinds get registered here
     let worker_state = state.clone();
     tokio::spawn(utopia_store::jobs::run_worker(
         pool,
@@ -129,11 +138,13 @@ async fn main() -> anyhow::Result<()> {
         move |job| {
             let st = worker_state.clone();
             async move {
-                // 任务失败时看一眼是不是模型端点连不上——那是系统级故障，
-                // 而现在它只会留在 jobs.last_error 里，没有任何界面看得到
+                // When a job fails, take a look at whether the model endpoint is unreachable --
+                // that is a system-level failure, and right now it only ends up in
+                // jobs.last_error, where no UI can see it
                 //
-                // 没救的失败在这里挂上标记，队列据此不再退避重试（#195）：
-                // 判据在这一侧，因为 `utopia-store` 看不见 LLM 的错误类型
+                // Hopeless failures get tagged here so the queue stops retrying with backoff
+                // (#195): the test lives on this side, because `utopia-store` cannot see the
+                // LLM's error types
                 let result = dispatch(&st, &job)
                     .await
                     .map_err(|e| match alerting::hopeless(&e) {
@@ -150,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
 
     alerting::spawn_retention_sweep(state.clone());
 
-    // 定时摄入调度器：每分钟扫一次到期来源，入队同步任务
+    // Scheduled ingestion scheduler: scan for due sources once a minute, enqueue sync jobs
     let sched_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -169,27 +180,32 @@ async fn main() -> anyhow::Result<()> {
                                 )
                                 .await
                                 {
-                                    tracing::warn!(source_id = %s.id, error = %e, "同步任务入队失败");
+                                    tracing::warn!(source_id = %s.id, error = %e, "failed to enqueue the sync job");
                                 }
                             }
                             Ok(false) => {}
-                            Err(e) => tracing::warn!(source_id = %s.id, error = %e, "标记入队失败"),
+                            Err(e) => {
+                                tracing::warn!(source_id = %s.id, error = %e, "failed to mark as enqueued")
+                            }
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "扫描到期来源失败"),
+                Err(e) => tracing::warn!(error = %e, "failed to scan for due sources"),
             }
         }
     });
 
-    // 定时推理调度器（0002 R1）。
+    // Scheduled inference scheduler (0002 R1).
     //
-    // **必须定时，不能只靠手点**：事实是持续变的——每篇文档抽取都在加边——而
-    // 派生只在跑的那一刻算。不定时的话，下一篇文档进来之后图上的派生就是缺的，
-    // 而这种缺失界面上看不出来（不是错，是新链没推）。
+    // **It has to be scheduled, it cannot rely on a manual click**: facts change continuously --
+    // every document extraction is adding edges -- while derivations are only computed at the
+    // moment they run. Without a schedule, the derivations in the graph are missing as soon as
+    // the next document comes in, and that gap is invisible in the UI (nothing is wrong, the new
+    // chains simply were not derived).
     //
-    // 与来源同步共用一个节拍：每分钟扫一遍，到期的入队。真正的推导在任务里跑，
-    // 不在这个循环里——一个大库全量重推可能要几秒，卡在调度循环里会拖住别的库
+    // It shares one tick with source sync: scan once a minute, enqueue whatever is due. The real
+    // derivation runs inside the job, not in this loop -- a full re-derivation of a large KB can
+    // take seconds, and stalling the scheduling loop would hold up the other KBs
     let infer_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -206,49 +222,52 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            tracing::warn!(kb_id = %kb_id, error = %e, "推理任务入队失败");
+                            tracing::warn!(kb_id = %kb_id, error = %e, "inference enqueue failed");
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "扫描到期推理失败"),
+                Err(e) => tracing::warn!(error = %e, "failed to scan for due inferences"),
             }
         }
     });
 
     let app = api::router(state, &cfg);
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    tracing::info!("Utopia 服务启动于 http://{}", cfg.bind_addr);
+    tracing::info!("Utopia server listening on http://{}", cfg.bind_addr);
 
-    // 浏览器可能把 localhost 解析为 ::1（IPv6）——配置为 IPv4 地址时补一个同端口的
-    // IPv6 回环监听，避免「找不到 localhost」。绑定失败（端口被占/无 IPv6）仅告警。
+    // A browser may resolve localhost to ::1 (IPv6) -- when configured with an IPv4 address, add
+    // an IPv6 loopback listener on the same port to avoid "cannot find localhost". A failed bind
+    // (port taken / no IPv6) only warns.
     if let Ok(addr) = cfg.bind_addr.parse::<std::net::SocketAddrV4>() {
         let v6_addr = format!("[::1]:{}", addr.port());
         match tokio::net::TcpListener::bind(&v6_addr).await {
             Ok(v6_listener) => {
-                tracing::info!("同时监听 http://{v6_addr}");
+                tracing::info!("also listening on http://{v6_addr}");
                 let app_v6 = app.clone();
                 tokio::spawn(async move {
                     let svc = app_v6.into_make_service_with_connect_info::<std::net::SocketAddr>();
                     if let Err(e) = axum::serve(v6_listener, svc).await {
-                        tracing::warn!(error = %e, "IPv6 监听退出");
+                        tracing::warn!(error = %e, "IPv6 listener exited");
                     }
                 });
             }
-            Err(e) => tracing::warn!(error = %e, "IPv6 回环绑定失败（不影响 IPv4）"),
+            Err(e) => tracing::warn!(error = %e, "IPv6 loopback bind failed (IPv4 unaffected)"),
         }
     }
 
-    // with_connect_info：审计需要真实的 TCP 对端地址。直连部署时它是唯一真值——
-    // X-Forwarded-For 那些头此时并不存在，且本就不可轻信。
+    // with_connect_info: auditing needs the real TCP peer address. In a direct-connection
+    // deployment it is the only truth there is -- headers like X-Forwarded-For do not exist at
+    // that point, and were never to be trusted lightly anyway.
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     axum::serve(listener, svc).await?;
     Ok(())
 }
 
-/// 索引空着而库里有东西 → 从库里重建一遍。
+/// The index is empty while the database has content → rebuild it from the database.
 ///
-/// 失败只告警不阻断启动：检索退化成「暂时搜不到」，而整个服务起不来是更坏的
-/// 结果。日志里那一行说清了发生什么，下次重启还会再试。
+/// Failure only warns, it does not block startup: retrieval degrades to "cannot search for the
+/// moment", whereas the whole service failing to come up is the worse outcome. That one line in
+/// the log says what happened, and the next restart will try again.
 async fn reindex_if_empty(pool: &sqlx::PgPool, search: &SearchIndex) {
     if !search.is_empty() {
         return;
@@ -256,30 +275,33 @@ async fn reindex_if_empty(pool: &sqlx::PgPool, search: &SearchIndex) {
     let total = match utopia_store::documents::live_chunk_count(pool).await {
         Ok(n) => n,
         Err(e) => {
-            tracing::warn!(error = %e, "数不出分块数，跳过索引重建");
+            tracing::warn!(error = %e, "cannot count chunks, skipping index rebuild");
             return;
         }
     };
     if total == 0 {
         return;
     }
-    tracing::info!(chunks = total, "全文索引是空的，从库里重建");
+    tracing::info!(
+        chunks = total,
+        "full-text index is empty, rebuilding from the database"
+    );
     let rows = match utopia_store::documents::all_chunks_for_index(pool).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "读分块失败，索引未重建");
+            tracing::warn!(error = %e, "failed to read chunks, index not rebuilt");
             return;
         }
     };
-    // 按文档攒批再写：`reindex_document` 一次替换一篇文档的全部分块，
-    // 逐条调会把前一条刚写的删掉
+    // Batch by document before writing: `reindex_document` replaces all the chunks of one
+    // document at once, so calling it chunk by chunk would delete what the previous call wrote
     let mut current: Option<(uuid::Uuid, uuid::Uuid)> = None;
     let mut batch: Vec<(String, String)> = Vec::new();
     let mut done = 0usize;
     let flush = |key: Option<(uuid::Uuid, uuid::Uuid)>, batch: &mut Vec<(String, String)>| {
         if let Some((kb, doc)) = key {
             if let Err(e) = search.reindex_document(&kb.to_string(), &doc.to_string(), batch) {
-                tracing::warn!(error = %e, document = %doc, "重建索引时有一篇没写进去");
+                tracing::warn!(error = %e, document = %doc, "one document did not get indexed");
             }
         }
         batch.clear();
@@ -292,19 +314,20 @@ async fn reindex_if_empty(pool: &sqlx::PgPool, search: &SearchIndex) {
         batch.push((chunk_id.to_string(), text));
         done += 1;
     }
-    // `reindex_document` 自己 commit，所以这里不必再提交一次
+    // `reindex_document` commits on its own, so there is no need to commit again here
     flush(current, &mut batch);
-    tracing::info!(chunks = done, "全文索引重建完成");
+    tracing::info!(chunks = done, "full-text index rebuild complete");
 }
 ///
-/// 任务分发：新任务类型在这里注册。
+/// Job dispatch: new job kinds get registered here.
 ///
-/// 单拎成函数而不是内联在闭包里，是为了让失败**有一个统一的出口**——
-/// 上面那层要在每次失败时看一眼错误链，内联的话每个分支都得自己记得。
+/// Pulled out into its own function rather than inlined in the closure so that failure **has one
+/// single exit** -- the layer above wants to inspect the error chain on every failure, and
+/// inlined, every arm would have to remember to do it itself.
 async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow::Result<()> {
     match job.kind.as_str() {
         "noop" => {
-            tracing::info!(job_id = job.id, "noop 任务执行成功");
+            tracing::info!(job_id = job.id, "noop job executed successfully");
             Ok(())
         }
         "process_document" => {
@@ -321,23 +344,26 @@ async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow
                 .get("kb_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 kb_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing kb_id"))?;
             mappings::explore_mappings(st, kb_id).await
         }
-        // 定时重推（0002 R1）。**先记时间再推**——推导抛错时也不该让这个库
-        // 在下一分钟被重新扫起来，那会变成一个每分钟失败一次的循环
+        // Scheduled re-derivation (0002 R1). **Record the time before deriving** -- even when
+        // derivation throws, this KB must not be scanned up again the very next minute; that
+        // would turn into a loop that fails once a minute
         "materialize_inferences" => {
             let kb_id: Uuid = job
                 .payload
                 .get("kb_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 kb_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing kb_id"))?;
             utopia_store::reasoning::mark_inference_ran(&st.pool, kb_id).await?;
             let report = utopia_store::reasoning::materialize(&st.pool, kb_id).await?;
-            // **到点对比**：`materialize` 本来就在拿这一轮算出来的对上库里现有的，
-            // 所以「对比」不是新机制。这里只把那次对比的结果留下来给人看——
-            // 没有变化时不写，免得台账被每小时一条「什么都没变」淹掉
+            // **A comparison on schedule**: `materialize` is already matching what this round
+            // computed against what the database already holds, so the "comparison" is not a new
+            // mechanism. All this does is keep the result of that comparison around for people to
+            // look at -- nothing is written when there is no change, so the ledger does not get
+            // drowned under one "nothing changed" row an hour
             if report.inserted > 0 || report.invalidated > 0 {
                 let _ = utopia_store::audit::record(
                     &st.pool,
@@ -368,19 +394,20 @@ async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow
                 .get("kb_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 kb_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing kb_id"))?;
             bootstrap_ontology::bootstrap_ontology(st, kb_id).await
         }
-        // 本体向量索引：**后台建，不卡请求**。
-        // 一份 965 类的本体首次要嵌 2600 行，六到八分钟；放在
-        // 交互请求里就是导入完之后第一个用到检索的人干等
+        // Ontology vector index: **built in the background, never blocking a request**.
+        // A 965-class ontology needs 2600 rows embedded on the first pass, six to eight minutes;
+        // put that in an interactive request and the first person to use retrieval after the
+        // import just waits
         "embed_ontology" => {
             let kb_id: Uuid = job
                 .payload
                 .get("kb_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 kb_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing kb_id"))?;
             ontology_index::refresh(st, kb_id).await.map(|_| ())
         }
         "adjudicate_entities" => {
@@ -389,7 +416,7 @@ async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow
                 .get("kb_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 kb_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing kb_id"))?;
             adjudication::adjudicate_entities(st, kb_id).await
         }
         "sync_source" => {
@@ -398,9 +425,9 @@ async fn dispatch(st: &state::AppState, job: &utopia_store::jobs::Job) -> anyhow
                 .get("source_id")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("payload 缺少 source_id"))?;
+                .ok_or_else(|| anyhow::anyhow!("payload is missing source_id"))?;
             ingest_sources::sync_source(st, source_id).await
         }
-        other => anyhow::bail!("未知任务类型: {other}"),
+        other => anyhow::bail!("unknown job kind: {other}"),
     }
 }

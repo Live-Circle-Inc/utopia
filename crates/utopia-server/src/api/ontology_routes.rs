@@ -1,5 +1,6 @@
-//! 本体编辑器 API：类型/关系 CRUD + 未匹配统计 + LLM 扩展建议。
-//! 查看 = viewer；修改 = editor（本体直接影响后续抽取的白名单）。
+//! Ontology editor API: type/relation CRUD + unmatched counts + LLM extension suggestions.
+//! Reading = viewer; writing = editor (the ontology directly drives the whitelist that later
+//! extraction is held to).
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -33,8 +34,9 @@ pub async fn get(
     let entity_types = utopia_store::ontology::entity_type_views(&state.pool, kb_id).await?;
     let relation_types = utopia_store::ontology::relation_type_views(&state.pool, kb_id).await?;
     let misses = utopia_store::ontology::list_misses(&state.pool, kb_id).await?;
-    // 已忽略的单列一路：抑制照旧（提案与自动扩本体只看上面那份），
-    // 但让人看得见抑制掉了什么、现在涨到多少
+    // The dismissed ones get a list of their own: suppression still holds (proposals and the
+    // automatic ontology extension only look at the list above), but a person can still see what
+    // got suppressed and how far it has climbed since
     let dismissed_misses =
         utopia_store::ontology::list_dismissed_misses(&state.pool, kb_id).await?;
     Ok(Json(json!({
@@ -57,7 +59,7 @@ fn default_per() -> i64 {
     12
 }
 
-/// 某个类下的实体实例列表（详情区右侧，分页）。
+/// The entity instances under one class (right-hand side of the detail pane, paginated).
 pub async fn list_entity_instances(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -82,15 +84,17 @@ pub struct EntityTypeReq {
     /// circle | square
     #[serde(default)]
     pub shape: Option<String>,
-    /// 全部父类，**第一个当主父**（左栏画在那一支下）。
-    /// 界面上写明了这条，所以不额外给一个"选主父"的控件
+    /// All parents, **the first one counts as the primary parent** (the left column draws it
+    /// under that branch).
+    /// The UI spells this out, so there is no extra "pick the primary parent" control
     #[serde(default)]
     pub parents: Vec<Uuid>,
-    /// 与它互斥的类。**缺省 = 不动**——不管互斥的调用方（提案采纳、冷启动）
-    /// 不该因为一次建类就把已有的声明清空
+    /// The classes it is disjoint with. **Absent = leave alone** -- callers that do not care
+    /// about disjointness (proposal adoption, cold start) should not wipe out declarations that
+    /// are already there just because a class got created once
     #[serde(default)]
     pub disjoint: Option<Vec<Uuid>>,
-    /// 语义指引，注入抽取 prompt
+    /// Semantic guidance, injected into the extraction prompt
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -113,7 +117,7 @@ pub async fn create_entity_type(
         kb_id,
         key,
         req.label.trim(),
-        // 不给颜色就按 key 取一个，而不是所有类共用一个灰蓝
+        // No color given: pick one from the key, rather than every class sharing one grey-blue
         req.color
             .as_deref()
             .unwrap_or_else(|| utopia_store::palette::color_for_key(key)),
@@ -122,12 +126,13 @@ pub async fn create_entity_type(
         req.description.as_deref().unwrap_or("").trim(),
     )
     .await?;
-    // 互斥缺省 = 不动：不管它的调用方（提案采纳、冷启动）不该因为建一个类
-    // 就把已有的声明清空
+    // Disjointness absent = leave alone: callers that do not care about it (proposal adoption,
+    // cold start) should not wipe out declarations that are already there just because a class
+    // got created
     if let Some(d) = req.disjoint.as_deref() {
         utopia_store::ontology::set_disjoint_for(&state.pool, kb_id, id, d).await?;
     }
-    // 审计只记不阻断
+    // The audit trail records, it never blocks
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -153,9 +158,10 @@ pub async fn update_entity_type(
         kb_id,
         id,
         req.label.trim(),
-        // **不给颜色 = 保持原色**，不是重置。这里按 id 改，压根拿不到 key；
-        // 而从前无条件写 "#8ea5bd" 意味着任何一次不带颜色的改名
-        // 都会把用户挑过的颜色抹掉
+        // **No color given = keep the color it has**, not reset it. This path updates by id, so
+        // it cannot get at the key at all; and unconditionally writing "#8ea5bd" here, which is
+        // what it used to do, meant every rename that did not carry a color wiped out the color
+        // the user had picked
         req.color.as_deref(),
         req.shape.as_deref().unwrap_or("circle"),
         &req.parents,
@@ -209,12 +215,13 @@ pub struct RelationTypeReq {
     pub functional: bool,
     #[serde(default)]
     pub inverse_functional: bool,
-    /// 其余四条 OWL 公理。**必须能在界面上编**——推理机（0002）的判据全部
-    /// 来自这几位，而它们从前只能靠导入 OWL 文件带进来：一个在界面上手工建
-    /// 本体的用户，永远开不了那台机器。
+    /// The other four OWL axioms. **These have to be editable in the UI** -- every criterion the
+    /// reasoner (0002) judges by comes from these bits, and they used to be reachable only by
+    /// importing an OWL file: a user who builds an ontology by hand in the UI could never start
+    /// that machine.
     ///
-    /// 与 `functional` / `inverse_functional` 并排，因为它们本来就是同一族，
-    /// 只是那两个先落库了
+    /// They sit alongside `functional` / `inverse_functional`, because they were always the same
+    /// family; those two just landed in the database first
     #[serde(default)]
     pub is_transitive: bool,
     #[serde(default)]
@@ -223,30 +230,33 @@ pub struct RelationTypeReq {
     pub is_asymmetric: bool,
     #[serde(default)]
     pub is_irreflexive: bool,
-    /// 指向另一个关系的两条（`inverseOf` / `subPropertyOf`）。
+    /// The two that point at another relation (`inverseOf` / `subPropertyOf`).
     ///
-    /// **缺省 = 清空，与上面六位同一条规矩。** 它们是同一个表单一次提交的
-    /// 一组声明；一半覆盖一半保留，会让「我把逆去掉了」和「我没碰逆」
-    /// 长得一模一样。属性表单不填这两个，而属性本来就不许有——
-    /// store 层会拦，落库也照样是 NULL
+    /// **Absent = cleared, the same rule as the six above.** They are one set of declarations
+    /// submitted by one form in one go; overwriting half and keeping half would make "I removed
+    /// the inverse" and "I never touched the inverse" look exactly alike. The attribute form
+    /// does not fill these two in, and an attribute is not allowed to have them anyway --
+    /// the store layer blocks that, and the column stays NULL either way
     #[serde(default)]
     pub inverse_of: Option<Uuid>,
     #[serde(default)]
     pub sub_property_of: Option<Uuid>,
     #[serde(default)]
     pub description: Option<String>,
-    /// relation | attribute（创建时定死，更新时忽略）
+    /// relation | attribute (fixed at creation, ignored on update)
     #[serde(default)]
     pub kind: Option<String>,
-    /// 可以当主语的类。attribute 至少一个；relation 留空 = 不限。
-    /// **更新时缺省 = 不动**，所以是 Option 而不是 Vec——不管 domain 的
-    /// 调用方（属性表单）不该因为一次改名就把 domain 清空
+    /// The classes that may be the subject. An attribute needs at least one; empty on a relation
+    /// = unrestricted.
+    /// **Absent on update = leave alone**, which is why this is an Option and not a Vec -- a
+    /// caller that does not care about domain (the attribute form) should not wipe the domain
+    /// out over one rename
     #[serde(default)]
     pub domains: Option<Vec<Uuid>>,
-    /// 可以当宾语的类。只对 relation 有意义
+    /// The classes that may be the object. Only meaningful for a relation
     #[serde(default)]
     pub ranges: Option<Vec<Uuid>>,
-    /// attribute 专用：text | number | date | bool
+    /// Attributes only: text | number | date | bool
     #[serde(default)]
     pub datatype: Option<String>,
     #[serde(default)]
@@ -254,8 +264,9 @@ pub struct RelationTypeReq {
 }
 
 impl RelationTypeReq {
-    /// 公理打包。**散着传迟早传错顺序**——六位都是 bool，编译器帮不上忙；
-    /// 后两位都是 `Option<Uuid>`，一样。
+    /// Pack the axioms up. **Passed loose, they get passed in the wrong order sooner or later**
+    /// -- all six are bools, so the compiler cannot help; the last two are both `Option<Uuid>`,
+    /// same story.
     fn axioms(&self) -> utopia_core::models::RelationAxioms {
         utopia_core::models::RelationAxioms {
             functional: self.functional,
@@ -333,7 +344,8 @@ pub async fn update_relation_type(
         req.description.as_deref().unwrap_or("").trim(),
         req.datatype.as_deref(),
         req.unit.as_deref().map(str::trim).filter(|s| !s.is_empty()),
-        // 请求里没带这两个字段就不动它们——属性表单不管 domain
+        // The request did not carry these two fields, so leave them alone -- the attribute form
+        // has no business with domain
         req.domains.as_deref(),
         req.ranges.as_deref(),
     )
@@ -401,9 +413,11 @@ pub async fn restore_miss(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// LLM 本体扩展建议：现有本体 + 未匹配统计 → 提案（人审后经 create 端点合入）。
-/// `locale` 是**调用方**说的，不是后端的设置。reason 只给人看，而人就在这次请求的
-/// 另一端；界面语言在客户端（docs/decisions/0004），所以它只能这样传进来。
+/// LLM ontology extension suggestions: existing ontology + unmatched counts → proposals (merged
+/// in through the create endpoints once a person has reviewed them).
+/// `locale` is what the **caller** says, not a backend setting. The reason is read by a person,
+/// and that person is at the other end of this very request; the UI language lives on the client
+/// (docs/decisions/0004), so this is the only way it can get in here.
 #[derive(Deserialize, Default)]
 pub struct SuggestReq {
     #[serde(default)]
@@ -421,17 +435,20 @@ pub async fn suggest(
         .and_then(|Json(b)| b.locale)
         .filter(|l| matches!(l.as_str(), "en" | "zh"))
         .unwrap_or_else(|| "en".into());
-    // 人工那条路 min_docs = 0：面板上「出现在 1 篇」这个数字是显示给人看的，
-    // 他自己判断得了。替他滤掉，只是让他少一条信息
+    // The manual path passes min_docs = 0: that "appears in 1 document" number on the panel is
+    // shown to a person, and he can judge it for himself. Filtering it out on his behalf only
+    // takes one piece of information away from him
     let proposals = build_proposals(&state, kb_id, &locale, 0).await?;
-    // 算完就写下来（见 `ontology_proposals`）。从前这批结果只回给前端、存进一个 useState，
-    // 刷新一次就没了——而重算要再调一次模型，且未必给出同一批归并
+    // Write them down as soon as they are computed (see `ontology_proposals`). This batch used
+    // to go to the frontend and nowhere else, into a useState, and one refresh lost it -- while
+    // recomputing means another model call, and not necessarily the same set of merges
     persist_proposals(&state, kb_id, &proposals).await;
     Ok(Json(proposals))
 }
 
-/// 四个小节里的每一条都记一行。**失败不拦住返回**——提案已经算出来了，
-/// 存不下只是下次要重算，把整个请求判失败反而把算出来的也丢了。
+/// One row per item in each of the four sections. **A failure here does not block the response**
+/// -- the proposals are already computed; not being able to store them only means recomputing
+/// next time, whereas failing the whole request throws away what was computed too.
 async fn persist_proposals(state: &AppState, kb_id: Uuid, proposals: &serde_json::Value) {
     const SECTIONS: [&str; 4] = [
         "entity_types",
@@ -445,8 +462,9 @@ async fn persist_proposals(state: &AppState, kb_id: Uuid, proposals: &serde_json
             continue;
         };
         for it in items {
-            // key 是这一条的身份（迁移里的唯一约束用的就是它）。没有 key 的
-            // 存不了，也没法在采纳时对回来——跳过而不是编一个
+            // The key is this item's identity (it is what the unique constraint in the migration
+            // is built on). One without a key cannot be stored, and cannot be matched back up at
+            // adoption time -- so skip it rather than inventing one
             let Some(key) = it.get("key").and_then(|k| k.as_str()) else {
                 continue;
             };
@@ -454,13 +472,14 @@ async fn persist_proposals(state: &AppState, kb_id: Uuid, proposals: &serde_json
         }
     }
     if let Err(e) = utopia_store::ontology::save_proposals(&state.pool, kb_id, &rows).await {
-        tracing::warn!(%kb_id, error = %e, "本体提案落库失败，这一批只在本次响应里");
+        tracing::warn!(%kb_id, error = %e, "Could not store the ontology proposals; this batch lives only in this response");
     }
 }
 
-/// 还等着人看的提案，按接口原来的形状拼回去。
+/// The proposals still waiting on a person, reassembled into the shape the endpoint always had.
 ///
-/// 前端因此不必区分「刚算出来的」与「上次存下的」——两者同一个类型、同一套渲染。
+/// The frontend therefore does not have to tell "just computed" from "stored last time" -- they
+/// are the same type, rendered by the same code.
 pub async fn stored_proposals(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -487,8 +506,9 @@ pub struct DecideProposalReq {
     pub status: String,
 }
 
-/// 一条提案有人表态了。**改状态不删行**：采纳发生过、拒绝也发生过，
-/// 而拒绝留痕正是下一轮 Suggest 不再把它刷回待看的依据。
+/// Somebody has ruled on a proposal. **Change the status, never delete the row**: the adoption
+/// happened, and so did the rejection -- and the trace a rejection leaves is exactly what keeps
+/// the next round of Suggest from pushing it back into the waiting list.
 pub async fn decide_proposal(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -497,7 +517,7 @@ pub async fn decide_proposal(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
     if !matches!(req.status.as_str(), "adopted" | "rejected") {
-        return Err(AppError::invalid("bad_status", "status 只能是 adopted 或 rejected").into());
+        return Err(AppError::invalid("bad_status", "status must be adopted or rejected").into());
     }
     utopia_store::ontology::decide_proposal(
         &state.pool,
@@ -511,25 +531,31 @@ pub async fn decide_proposal(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 生成本体扩展提案。人工点 Suggest 与冷启动自动扩本体走同一条路——
-/// 自动那条不该是另一套判断，只是少了点头那一步。
-/// 每个说法检索几个候选。
+/// Generate ontology extension proposals. A person clicking Suggest and the cold-start automatic
+/// extension go down the same path -- the automatic one should not be a second set of
+/// judgements, it just skips the nod.
+/// A handful of candidates retrieved per wording.
 ///
-/// 小是刻意的：候选是给模型判断"是不是已经有了"用的，不是让它挑一个最像的凑合。
-/// 开大了只会让它在一堆勉强相关的条目里硬选一个映射过去。
+/// Small on purpose: the candidates are there for the model to judge "do we have this already",
+/// not for it to pick whichever looks most alike and make do. Opening it up only makes it force
+/// a mapping onto one entry out of a pile of barely related ones.
 const CANDIDATES_PER_PROBE: i64 = 5;
 
-/// `min_docs`：**只把出现在这么多篇文档里的说法交给模型**。0 = 全给。
+/// `min_docs`: **hand the model only the wordings that appear in at least this many documents**.
+/// 0 = hand over all of them.
 ///
-/// 这一位存在的理由是它曾经不存在。`ProposedPredicate.doc_count` 的注释写着
-/// 「自动扩展据此设门槛，人工提案只作参考不拦」，但接线没接完：
-/// `bootstrap_ontology` 把门槛算出来只用于 `forms.len()` 判断值不值得跑一次
-/// LLM，随后调这个函数时只传 kb_id，于是这里重查一遍**没过滤的**全量。
+/// This parameter exists because it once did not. The comment on `ProposedPredicate.doc_count`
+/// read "the automatic extension sets its threshold from this; manual proposals only take it as
+/// a hint and are never blocked by it", but the wiring was never finished: `bootstrap_ontology`
+/// computed the threshold and used it only for the `forms.len()` check on whether an LLM call
+/// was worth making, then called this function with nothing but kb_id, so this code re-queried
+/// the **unfiltered** full set.
 ///
-/// 实测后果（ai-timeline，348 块）：交给模型 526 个说法，其中 456 个只在一篇
-/// 里出现过——**86.7% 是噪声**。模型从这堆里只挑出 9 个，`runs_on`（8 篇都有）
-/// 和 `founded_by`（4 篇）没被挑中，275 条事实继续没有谓词。反方向也漏：
-/// 5 个单篇说法被采纳了，其中两个还建成了新属性，门槛形同虚设。
+/// Measured consequences (ai-timeline, 348 chunks): 526 wordings handed to the model, 456 of
+/// which appeared in a single document -- **86.7% noise**. Out of that pile the model picked
+/// only 9; `runs_on` (in all 8 documents) and `founded_by` (4 documents) were not picked, and
+/// 275 facts still have no predicate. It leaks the other way too: 5 single-document wordings
+/// were adopted, two of which even became new attributes, so the threshold was a fiction.
 pub async fn build_proposals(
     state: &AppState,
     kb_id: Uuid,
@@ -544,21 +570,25 @@ pub async fn build_proposals(
         .ok_or_else(|| AppError::invalid("no_chat_model", "Chat model not configured"))?;
 
     let mut misses = utopia_store::ontology::list_misses(&state.pool, kb_id).await?;
-    // 表层谓词比 misses 多一样东西：它连着具体事实，所以提案能承诺"改写 N 条"。
+    // Surface predicates carry one thing misses do not: they are attached to concrete facts, so
+    // a proposal can promise to "rewrite N of them".
     //
-    // **两条线严格分开**，按宾语是实体还是字面值：`收购` 要的是一条关系，
-    // `founding_date = "2015"` 要的是一个属性。混起来的后果具体——后者会被
-    // 提成关系，于是长出一条指向「2015」这个假实体的边
+    // **The two lines stay strictly apart**, by whether the object is an entity or a literal:
+    // `acquires` wants a relation, `founding_date = "2015"` wants an attribute. Mixing them has
+    // a concrete consequence -- the latter gets proposed as a relation, and out grows an edge
+    // pointing at "2015", an entity that does not exist
     let mut forms = utopia_store::graph::proposed_predicates(&state.pool, kb_id).await?;
     let mut value_forms = utopia_store::graph::proposed_attributes(&state.pool, kb_id).await?;
     if min_docs > 0 {
         forms.retain(|f| f.doc_count >= min_docs);
         value_forms.retain(|f| f.doc_count >= min_docs);
-        // **三份清单都要滤，滤一份等于没滤。** 同一个说法在提示词里出现两次：
-        // miss 行（"seen N times"）和表层谓词行（"on N fact(s)"）。
-        // `OntologyMiss` 没有文档维度，所以按活下来的说法集合筛——留下的是
-        // 那些既跨了篇、又还没有谓词的。类那一路不动：`ProposedType`
-        // 同样没有 doc_count，硬滤等于按另一个判据拦，而不是按这个
+        // **All three lists have to be filtered; filtering one is the same as filtering none.**
+        // The same wording appears twice in the prompt: as a miss line ("seen N times") and as a
+        // surface-predicate line ("on N fact(s)"). `OntologyMiss` has no document dimension, so
+        // filter it against the set of wordings that survived -- what is left is the ones that
+        // both spanned documents and still have no predicate. The class route is left alone:
+        // `ProposedType` has no doc_count either, so filtering it would be blocking on a
+        // different criterion rather than on this one
         let kept: std::collections::HashSet<&str> = forms.iter().map(|f| f.form.as_str()).collect();
         misses.retain(|m| m.kind != "relation_type" || kept.contains(m.key.as_str()));
     }
@@ -568,17 +598,20 @@ pub async fn build_proposals(
         }));
     }
 
-    // **本体的相关切片，不是它的全文。**
+    // **The relevant slice of the ontology, not the whole text of it.**
     //
-    // 从前这里内联两串全量 key。两个毛病：一份 965 类的本体就是 1949 个 key
-    // 的提示词；而且只有 key 没有描述，模型据此判断不了"这个说法是不是某个
-    // 已有类型的同义"，于是它只会新建，本体里就稳定长出重复。
+    // This used to inline two full lists of keys. Two things wrong with that: a 965-class
+    // ontology is a prompt of 1949 keys; and with keys but no descriptions, the model cannot
+    // judge "is this wording a synonym of some existing type" from them, so all it ever does is
+    // create, and duplicates grow in the ontology at a steady rate.
     //
-    // 现在按每个说法各检索几个最近的候选，带着描述给它看。提示词大小从此
-    // 与本体规模无关，而"已经有一个了"这件事第一次变得可判断。
+    // Now a few nearest candidates get retrieved per wording and shown to it with their
+    // descriptions. Prompt size is from here on independent of ontology size, and "there is one
+    // already" became judgeable for the first time.
     let _ = crate::ontology_index::refresh(state, kb_id).await;
-    // 谓词那一路：表层说法 + 关系类的 miss。样例给向量更多着落——
-    // 光一个 acquires 太短，带上"星云科技 → 深蓝存储"就有了语境
+    // The predicate route: surface wordings + relation-type misses. An example gives the vector
+    // more to hold on to -- acquires on its own is too short, but with "Nebula Technologies →
+    // Deep Blue Storage" attached it has context
     let pred_probes: Vec<String> = forms
         .iter()
         .map(|f| match f.example.as_deref() {
@@ -592,8 +625,9 @@ pub async fn build_proposals(
                 .map(|m| m.key.clone()),
         )
         .collect();
-    // 类那一路。**必须分开检索**：两张表的描述写的是完全不同的东西，
-    // 拿一个词表外的类名去关系里找，回来的一定是勉强相关的关系
+    // The class route. **The retrieval has to be separate**: the descriptions in the two tables
+    // say entirely different things, and taking a class name that is not in the vocabulary and
+    // searching the relations with it can only come back with a barely related relation
     let class_probes: Vec<String> = misses
         .iter()
         .filter(|m| m.kind == "entity_type")
@@ -617,8 +651,9 @@ pub async fn build_proposals(
     )
     .await
     .unwrap_or_default();
-    // 属性那一路：只在属性里找。这里若不限 kind，"成立日期"最近的往往是
-    // 某条关系，模型就会把一个字面值映射到一条边上去
+    // The attribute route: search only among the attributes. Without the kind restriction, the
+    // nearest hit for "founding date" is usually some relation, and the model would then map a
+    // literal value onto an edge
     let attr_probes: Vec<String> = value_forms
         .iter()
         .map(|f| match f.example.as_deref() {
@@ -641,12 +676,15 @@ pub async fn build_proposals(
     )
     .await
     .unwrap_or_default();
-    // 并集去重：几个说法常常指向同一个候选，逐个说法各列一遍是白费令牌
+    // Union and dedupe: several wordings often point at the same candidate, and listing it once
+    // per wording burns tokens for nothing
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut candidate_lines: Vec<String> = Vec::new();
-    // 模型抄回来的 key 要能对回本体：候选表同时按 key、归一化 key、标签建索引
+    // The key the model copies back has to be matchable against the ontology: index the
+    // candidate table by key, by normalized key and by label all at once
     let mut by_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    // 每个候选是关系还是属性。映射到已有类型时，采纳走哪条改写路径由它定
+    // Whether each candidate is a relation or an attribute. When mapping onto an existing type,
+    // this is what decides which rewrite path adoption takes
     let mut kind_of_key: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for c in per_pred
@@ -660,14 +698,15 @@ pub async fn build_proposals(
         }
         by_name.insert(normalize_name(&c.key), c.key.clone());
         by_name.insert(normalize_name(&c.label), c.key.clone());
-        // 关系行自带 relation / attribute，类行没有 kind
+        // Relation rows carry relation / attribute themselves; class rows have no kind
         let kind = c.kind.as_deref().unwrap_or("entity type");
         kind_of_key.insert(c.key.clone(), kind.to_string());
         let d = c.description.trim();
-        // **标签只在它确实多说了点什么的时候才写。**
-        // 导进来的本体里 label 常常只是 key 的驼峰写法（acquired_from /
-        // acquiredFrom），两个几乎一样的名字并排摆着，模型抄走的就是错的那个。
-        // 中文标签配英文 key 那种才是标签有信息量的情形，那时才留
+        // **Write the label out only when it genuinely says something more.**
+        // In imported ontologies the label is often just the camelCase spelling of the key
+        // (acquired_from / acquiredFrom), and with two nearly identical names sitting side by
+        // side, the one the model copies is the wrong one. A Chinese label against an English
+        // key is the case where a label does carry information; that is when it stays
         let name = if normalize_name(&c.label) == normalize_name(&c.key) {
             String::new()
         } else {
@@ -679,8 +718,9 @@ pub async fn build_proposals(
             format!("- {} [{kind}]{name}: {d}", c.key)
         });
     }
-    // 一个候选都没有（没配嵌入模型，或本体是空的）时如实说，别让模型
-    // 以为"本体里什么都没有"从而放开手建
+    // When there is not one candidate to be had (no embedding model configured, or the ontology
+    // is empty), say so honestly -- do not let the model conclude "there is nothing in the
+    // ontology" and start creating with a free hand
     let candidates_block = if candidate_lines.is_empty() {
         "(no candidates retrieved — the ontology may be empty, or embeddings are unavailable)"
             .to_string()
@@ -703,8 +743,9 @@ pub async fn build_proposals(
         })
         .collect();
 
-    // 表层谓词行带上事实数与样例：模型据此判断这是不是一个真关系，
-    // 而 forms 字段让采纳时知道该改写哪些事实
+    // Surface-predicate lines carry the fact count and an example: that is what the model judges
+    // from whether this is a real relation, and the forms field is what tells adoption which
+    // facts to rewrite
     let form_lines: Vec<String> = forms
         .iter()
         .map(|f| {
@@ -717,9 +758,11 @@ pub async fn build_proposals(
         })
         .collect();
 
-    // 字面值那一路多带两样：一条样例值（模型据此判断该是 number 还是 date），
-    // 和这个说法实际挂在哪些类上。后者不是给模型看的，是采纳时直接拿来当
-    // domain 的——属性的 domain 猜错，主语类型对不上就整条丢弃
+    // The literal-value route carries two extra things: one sample value (the model judges from
+    // it whether this should be number or date), and the classes this wording actually hangs
+    // off. The latter is not for the model to read; adoption takes it directly as the domain --
+    // guess an attribute's domain wrong and every fact whose subject type does not match is
+    // thrown away whole
     let value_lines: Vec<String> = value_forms
         .iter()
         .map(|f| {
@@ -815,8 +858,9 @@ pub async fn build_proposals(
     let mut proposals: serde_json::Value =
         serde_json::from_str(&block).map_err(|e| AppError::Other(e.into()))?;
     resolve_map_targets(&mut proposals, &by_name, &kind_of_key);
-    // 说法归哪一档，服务端说了算——它手里有事实。实测模型会把同一个
-    // \"founded_in\" 既提成关系又提成属性，两条都采纳就是同一批事实被抢两次
+    // Which category a wording belongs in is the server's call -- the server is holding the
+    // facts. In practice the model will propose the same \"founded_in\" as a relation and as an
+    // attribute, and adopting both means the same batch of facts gets claimed twice
     let value_only: std::collections::HashSet<&str> =
         value_forms.iter().map(|f| f.form.as_str()).collect();
     let entity_only: std::collections::HashSet<&str> =
@@ -826,14 +870,18 @@ pub async fn build_proposals(
     Ok(proposals)
 }
 
-/// 把 `map_to` 里的 key 对回本体真正的 key，对不上的整条丢掉。
+/// Match the keys in `map_to` back to the ontology's real keys, and drop any item that does not
+/// match.
 ///
-/// 模型抄错很常见，而且抄的往往是候选行里挨着的那个标签——`acquiredFrom`
-/// 而不是 `acquired_from`。**这一步必须在服务端做**：界面上那个"用已有的"
-/// 按钮承诺的是把一批事实挂到某个已有谓词上，key 对不上时它只会报错，
-/// 而承诺已经说出去了。对不上就不该显示这条。
-/// 顺带标上目标是关系还是属性：采纳时两条路的改写不一样，而模型答的是
-/// 一个 key，看不出这个 key 落在哪张表的哪一档。
+/// The model copying it wrong is common, and what it copies is usually the label sitting right
+/// next to it on the candidate line -- `acquiredFrom` rather than `acquired_from`. **This step
+/// has to happen on the server**: that "use the existing one" button in the UI promises to hang
+/// a batch of facts onto some predicate that already exists, and when the key does not match,
+/// all it can do is throw an error -- with the promise already made. If it does not match, the
+/// item should not be shown in the first place.
+/// While we are at it, mark whether the target is a relation or an attribute: the two adoption
+/// paths rewrite differently, and what the model answers with is a single key, which does not
+/// reveal which table or which category that key lands in.
 fn resolve_map_targets(
     proposals: &mut serde_json::Value,
     by_name: &std::collections::HashMap<String, String>,
@@ -856,20 +904,27 @@ fn resolve_map_targets(
                 true
             }
             None => {
-                tracing::debug!(key = raw, "map_to 指向了候选之外的 key，丢弃");
+                tracing::debug!(
+                    key = raw,
+                    "map_to pointed at a key outside the candidates, dropping it"
+                );
                 false
             }
         }
     });
 }
 
-/// 只保留说法确实属于这一档的提案，并把不属于的那些说法从 `forms` 里剔掉。
+/// Keep only the proposals whose wordings really do belong in this category, and strip the ones
+/// that do not out of `forms`.
 ///
-/// **判据在服务端手里**：一个说法带的是字面值还是实体宾语，事实里写着，
-/// 不必问模型。实测模型会把同一个 `founded_in` 既提成关系又提成属性——
-/// 两条都采纳的话，同一批事实被抢两次，先跑的那条赢，结果取决于循环顺序。
+/// **The criterion is in the server's hands**: whether a wording carries a literal or an entity
+/// object is written in the facts, so there is no need to ask the model. In practice the model
+/// does propose the same `founded_in` as a relation and as an attribute -- adopt both and the
+/// same batch of facts gets claimed twice, whichever ran first wins, and the outcome depends on
+/// loop order.
 ///
-/// `forms` 全被剔光的提案整条丢掉：它承诺的"改写 N 条"已经是零了。
+/// A proposal whose `forms` got stripped bare is dropped whole: the "rewrite N of them" it
+/// promised is already zero.
 fn keep_forms(
     proposals: &mut serde_json::Value,
     section: &str,
@@ -881,26 +936,30 @@ fn keep_forms(
     };
     items.retain_mut(|p| {
         let Some(forms) = p.get_mut("forms").and_then(|v| v.as_array_mut()) else {
-            // 没有 forms 的提案只是"加一个类型"，不改写事实，与归档无关
+            // A proposal with no forms is just "add a type": it rewrites no facts, so which
+            // category it belongs in does not apply
             return true;
         };
         forms.retain(|f| {
             let Some(s) = f.as_str() else { return false };
-            // 另一档明确认领的才剔掉。两边都不认识的说法（比如来自 misses
-            // 而不是表层谓词）原样留着——剔掉它等于替模型否决了一条提案
+            // Strip only the ones the other category explicitly claims. A wording neither side
+            // recognizes (one that came from misses rather than from a surface predicate) stays
+            // as it is -- stripping it would be vetoing one of the model's proposals for it
             !theirs.contains(s) || mine.contains(s)
         });
         !forms.is_empty()
     });
 }
 
-/// key 与标签的比较形式：小写，只留字母数字。
+/// The comparison form of a key or a label: lowercased, alphanumerics only.
 ///
-/// **分隔符整个扔掉**，因为要对齐的正是分隔符的差异：`acquiredFrom`、
-/// `acquired_from`、`Acquired From` 都归到 `acquiredfrom`。折成下划线是不够的
-/// ——驼峰里根本没有分隔符可折。
+/// **Separators get thrown out entirely**, because the difference in separators is precisely
+/// what has to line up: `acquiredFrom`, `acquired_from` and `Acquired From` all collapse to
+/// `acquiredfrom`. Folding them into underscores is not enough
+/// -- camelCase has no separator to fold in the first place.
 ///
-/// 只做写法对齐，不做同义判断——那是检索与模型的活。
+/// This only lines spellings up, it makes no synonym judgement -- that is the job of retrieval
+/// and of the model.
 fn normalize_name(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
@@ -911,11 +970,13 @@ fn normalize_name(s: &str) -> String {
 #[derive(Deserialize)]
 pub struct AdoptReq {
     pub key: String,
-    /// true = 这个 key 指的是**已有**的关系/属性，别再建一个。
+    /// true = this key refers to a relation/attribute that **already exists**, do not create
+    /// another one.
     ///
-    /// 这一位是本体消解的落点：检索告诉模型本体里已经有 `founding_date` 了，
-    /// 模型说"这些说法就是它"，采纳时只做改写那一半。少了这一位，同一个意思
-    /// 会长出第二个 key，往后这批事实就永久分在两处。
+    /// This bit is where ontology consolidation lands: retrieval tells the model the ontology
+    /// already has `founding_date`, the model says "these wordings are it", and adoption does
+    /// only the rewrite half. Without this bit, one meaning grows a second key, and from then on
+    /// this batch of facts is split across two places for good.
     #[serde(default)]
     pub existing: bool,
     #[serde(default)]
@@ -924,35 +985,40 @@ pub struct AdoptReq {
     pub description: Option<String>,
     #[serde(default = "default_temporal")]
     pub temporal: String,
-    /// 缺省 false，且刻意不由建议方决定——本体声明的唯一性会驱动时态引擎自动
-    /// 闭合事实，猜错就是成批的假冲突（part_of 就这么烧过一次）
+    /// Defaults to false, and deliberately not the suggester's call -- a uniqueness declaration
+    /// in the ontology drives the temporal engine to close facts off automatically, and guessing
+    /// wrong means false conflicts by the batch (part_of got burned that way once)
     #[serde(default)]
     pub functional: bool,
     #[serde(default)]
     pub inverse_functional: bool,
-    /// 归入这个关系的表层说法（"available_on"、"available through"…）
+    /// The surface wordings folded into this relation ("available_on", "available through", ...)
     pub forms: Vec<String>,
-    /// `relation`（缺省）或 `attribute`。
+    /// `relation` (the default) or `attribute`.
     ///
-    /// 属性走另一条改写路径：宾语是字面值，要按 datatype 换算过才能落到
-    /// 新属性上；domain 也不由请求带，从事实的主语类型里取
+    /// Attributes take the other rewrite path: the object is a literal, and it has to be
+    /// converted per the datatype before it can land on the new attribute; the domain does not
+    /// come from the request either, it is taken from the subject types of the facts
     #[serde(default)]
     pub kind: Option<String>,
-    /// 属性专用：text | number | date | bool
+    /// Attributes only: text | number | date | bool
     #[serde(default)]
     pub datatype: Option<String>,
     #[serde(default)]
     pub unit: Option<String>,
 }
 
-/// 采纳一个表层谓词：建关系类型 **并把等着它的 related_to 事实改写过去**。
+/// Adopt a surface predicate: create the relation type **and rewrite the related_to facts that
+/// were waiting on it**.
 ///
-/// 与单纯 create 的区别就在后半句。只建类型的话本体长大了、图没变好——
-/// 那 57 条事实会继续是"有关联"。改写走追加（新行 + supersedes），
-/// 实体历史里读得到"先记成 related to，后精化成 available on"。
+/// The second half is the whole difference from a plain create. Create the type only and the
+/// ontology has grown while the graph is no better -- those 57 facts go on saying "is related
+/// to". The rewrite appends (a new row + supersedes), so the entity history reads "recorded as
+/// related to first, refined to available on later".
 ///
-/// `existing` 为真时跳过前半句：本体里已经有这个意思了，这一次只做改写。
-/// 这是消解与增长的分界——同一个入口，因为对图做的事完全一样。
+/// When `existing` is true the first half is skipped: the ontology already carries this
+/// meaning, and this time only the rewrite happens. That is the line between consolidation and
+/// growth -- one entry point, because what it does to the graph is exactly the same.
 pub async fn adopt_predicate(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -968,8 +1034,9 @@ pub async fn adopt_predicate(
         return adopt_attribute(&state, &user, kb_id, &req).await;
     }
     let predicate_id = if req.existing {
-        // 按 key 找已有的那一条。找不到就报错而不是退回新建——
-        // 前端说的是"映射到已有的"，静默改成新建就是它最不想要的结果
+        // Look up the one that already exists, by key. If it is not there, error out rather
+        // than falling back to creating -- what the frontend said was "map onto the existing
+        // one", and silently turning that into a create is the outcome it wants least
         utopia_store::ontology::relation_type_id_by_key(&state.pool, kb_id, key)
             .await?
             .ok_or_else(|| {
@@ -982,9 +1049,11 @@ pub async fn adopt_predicate(
             key,
             req.label.trim(),
             &req.temporal,
-            // 采纳一个提案不替人声明公理。**functional 是唯一的例外**，
-            // 因为它是这个表单本来就问过的一项；其余四条要人去关系页显式勾——
-            // 推理机的判据必须是人写下来的，不是采纳时顺手带上的
+            // Adopting a proposal does not declare axioms on a person's behalf. **functional is
+            // the one exception**, because it is something this form asked about anyway; the
+            // other four have to be ticked explicitly on the relation page -- the criteria the
+            // reasoner judges by have to be written down by a person, not tacked on in passing
+            // at adoption time
             utopia_core::models::RelationAxioms {
                 functional: req.functional,
                 inverse_functional: req.inverse_functional,
@@ -992,7 +1061,8 @@ pub async fn adopt_predicate(
             },
             req.description.as_deref().unwrap_or("").trim(),
             "relation",
-            // 提案与冷启动只建关系，不声明 domain/range —— 留空 = 不限主宾类型
+            // Proposals and cold start only create the relation, they declare no domain/range
+            // -- left empty = no restriction on subject or object type
             &[],
             &[],
             None,
@@ -1000,12 +1070,15 @@ pub async fn adopt_predicate(
         )
         .await?
     };
-    // **人工路径不对调主宾。**
+    // **The manual path does not swap subject and object.**
     //
-    // 不是因为它不需要——把 `produced_by` 映射到 `produces` 同样该对调——而是
-    // 这里的 forms 是人在面板上勾的，完全可能同时勾了 `produced` 和 `produced_by`，
-    // 而一个 swap 标志伺候不了混合。自动那条路不存在这个问题：同组说法共享屈折基，
-    // 结尾有没有 `by` 必然一致。真要修得让 adopt 逐条判方向，那是另一件事。
+    // Not because it never needs to -- mapping `produced_by` onto `produces` ought to swap just
+    // the same -- but because the forms here are what a person ticked on the panel, and he may
+    // perfectly well have ticked both `produced` and `produced_by`, which one swap flag cannot
+    // serve. The automatic path does not have this problem: wordings in one group share an
+    // inflectional stem, so whether the ending carries `by` is necessarily consistent. Fixing
+    // this properly means making adopt decide the direction wording by wording, which is a
+    // different piece of work.
     let utopia_store::graph::Adopted {
         batch_id,
         moved: remapped,
@@ -1019,7 +1092,8 @@ pub async fn adopt_predicate(
         false,
     )
     .await?;
-    // 采纳同时清掉对应的未匹配统计——本体已经覆盖它们了
+    // Adoption clears the matching unmatched counts at the same time -- the ontology covers them
+    // now
     for form in &req.forms {
         let _ = utopia_store::ontology::clear_miss(&state.pool, kb_id, "relation_type", form).await;
     }
@@ -1044,15 +1118,15 @@ pub async fn adopt_predicate(
     })))
 }
 
-/// 撤销一次采纳：新写的行作废、旧行复活。关系类型留着（有事实指向过它，
-/// 而且一个没人用的关系是惰性的）。
+/// Undo an adoption: the newly written rows are voided, the old rows come back. The relation
+/// type stays (facts have pointed at it, and a relation nobody uses is inert).
 pub async fn unadopt_predicate(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((kb_id, batch_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // 归因要按关系类型找回这次撤销，所以先拿到它
+    // Attribution has to find this undo by relation type, so get hold of that first
     let predicate_id: Option<(Uuid,)> = sqlx::query_as(
         "SELECT predicate_id FROM fact_adoptions WHERE batch_id = $1 AND kb_id = $2 LIMIT 1",
     )
@@ -1061,8 +1135,9 @@ pub async fn unadopt_predicate(
     .fetch_optional(&state.pool)
     .await
     .map_err(utopia_core::AppError::Db)?;
-    // 一次采纳可能同时产生事实改写与实体改类的批次，调用方拿到的是一串
-    // 不分种类的批次号——这里两边都试，谁认领谁生效
+    // One adoption can produce both fact-rewrite and entity-retype batches, and what the caller
+    // is given is a list of batch ids with no kind attached -- so try both here, and whichever
+    // claims it is the one that takes effect
     if predicate_id.is_none() {
         let n = utopia_store::resolution::unadopt_types(&state.pool, kb_id, batch_id).await?;
         let _ = utopia_store::audit::record(
@@ -1093,7 +1168,8 @@ pub async fn unadopt_predicate(
     Ok(Json(json!({ "reverted": reverted })))
 }
 
-/// 待认领的表层谓词：原文说过、本体没有、事实降级成了 related_to。
+/// The surface predicates waiting to be claimed: the source text said it, the ontology does not
+/// have it, and the facts got demoted to related_to.
 pub async fn proposed_predicates(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1104,10 +1180,11 @@ pub async fn proposed_predicates(
     Ok(Json(json!({ "forms": forms })))
 }
 
-/// 最近一次自动扩本体做了什么，以及还能不能撤销。
+/// What the last automatic ontology extension did, and whether it can still be undone.
 ///
-/// 默认开启的前提是它的动作**可见且可退**。只记在审计台账里不算可见——
-/// 那是查证用的，不是通知用的。这里给 Ontology 页一条明确的横幅。
+/// Being on by default is conditional on its actions being **visible and reversible**. Recorded
+/// in the audit ledger and nowhere else does not count as visible -- that is for verifying after
+/// the fact, not for telling anyone. This gives the Ontology page an explicit banner.
 pub async fn last_auto_extension(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1126,7 +1203,8 @@ pub async fn last_auto_extension(
     let Some((detail, at)) = row else {
         return Ok(Json(json!({ "run": null })));
     };
-    // 已经被撤销干净的就不再提示——那一轮已经没有任何痕迹留在图上了
+    // A run that has been undone cleanly is not announced any more -- that round has left no
+    // trace on the graph at all
     let batches: Vec<Uuid> = detail
         .get("batches")
         .and_then(|v| v.as_array())
@@ -1157,10 +1235,11 @@ pub async fn last_auto_extension(
     }})))
 }
 
-/// OWL 导入：先看会发生什么，确认了才落库。
+/// OWL import: see what will happen first, write only once it is confirmed.
 ///
-/// **绝不让上传一个文件就不可逆地改掉本体**——预览与落库走同一个 plan，
-/// 两条独立路径迟早分叉，而分叉的后果是确认之后发生的事与刚看过的不一样。
+/// **Uploading a file must never irreversibly change the ontology** -- preview and write go
+/// through the same plan, because two independent paths drift apart sooner or later, and what
+/// drift means is that what happens after you confirm is not what you just looked at.
 pub async fn preview_import(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1183,13 +1262,17 @@ pub async fn apply_import(
     let (filename, bytes) = read_upload(multipart).await?;
     let (import_id, plan) =
         crate::owl_import::apply(&state, kb_id, user.id, &filename, &bytes).await?;
-    // 公理刚变，这是最该重算一致性的时刻——用户导进来的正是判据本身。
-    // 失败不影响导入本身：本体已经落库了，检查跑不动是另一件事，
-    // Review 页那个按钮还能再跑一次
+    // The axioms have just changed, which makes this the moment consistency most wants
+    // recomputing -- what the user imported is the criteria themselves. A failure does not
+    // affect the import itself: the ontology is already stored, the check failing to run is a
+    // separate matter, and that button on the Review page can still run it again
     let violations = match utopia_store::reasoning::run(&state.pool, kb_id).await {
         Ok(r) => r.found,
         Err(e) => {
-            tracing::warn!(?e, "导入后的一致性检查没跑成");
+            tracing::warn!(
+                ?e,
+                "The consistency check after the import did not go through"
+            );
             0
         }
     };
@@ -1209,8 +1292,9 @@ pub async fn list_imports(
     Ok(Json(json!({ "imports": imports })))
 }
 
-/// 取 multipart 里的第一个文件。上限 8 MB——FOAF 44 KB、DCTerms 48 KB，
-/// FIBO 那种大部头分模块也在几百 KB 量级；再大多半是传错了东西。
+/// Take the first file out of the multipart. Capped at 8 MB -- FOAF is 44 KB, DCTerms 48 KB, and
+/// even a doorstop like FIBO runs to a few hundred KB per module; bigger than that is most
+/// likely the wrong file.
 const MAX_ONTOLOGY_BYTES: usize = 8 * 1024 * 1024;
 
 async fn read_upload(
@@ -1243,7 +1327,8 @@ async fn read_upload(
     Err(AppError::invalid("no_files", "No file in the upload"))
 }
 
-/// 语言代码 → 提示词里写给模型看的名字。模型认得懂 "Chinese"，未必认得懂 "zh"。
+/// Language code → the name written into the prompt for the model. A model knows what "Chinese"
+/// means; it may well not know what "zh" means.
 fn lang_name(code: &str) -> &'static str {
     match code {
         "zh" => "Chinese",
@@ -1251,17 +1336,22 @@ fn lang_name(code: &str) -> &'static str {
     }
 }
 
-/// 采纳一个**字面值**说法：建（或指向已有的）属性，并把等着它的事实改挂过去。
+/// Adopt a **literal-value** wording: create (or point at an existing) attribute, and move the
+/// facts that were waiting on it across.
 ///
-/// 跟关系那条路有三处不同，每一处都是属性特有的：
+/// Three things differ from the relation path, and every one of them is specific to attributes:
 ///
-/// 1. **domain 从数据里取，不由请求带。** 属性必须声明能挂在哪些类下，而猜错
-///    的代价是硬的——主语类型对不上就整条丢弃（`attr_domain_mismatch`）。
-///    这些事实的主语现在是什么类是事实不是判断，直接读。
-/// 2. **值要按 datatype 换算。** 库里存的是抽取当时的原样（字符串 "2015"），
-///    落到一个 date 属性上得先变成日期。
-/// 3. **换不出来的不改写。** 宁可让它继续没有谓词，等下一次，也不把
-///    一个换不动的值硬塞进类型化的属性里——那是"宁缺勿脏"的同一条。
+/// 1. **The domain is taken from the data, not carried by the request.** An attribute has to
+///    declare which classes it can hang off, and the cost of guessing wrong is hard -- a fact
+///    whose subject type does not match is thrown away whole (`attr_domain_mismatch`).
+///    What class the subjects of these facts are in right now is a fact, not a judgement: read
+///    it.
+/// 2. **The value has to be converted per the datatype.** What the database holds is exactly
+///    what extraction saw at the time (the string "2015"); landing on a date attribute means
+///    becoming a date first.
+/// 3. **What will not convert does not get rewritten.** Better to leave it with no predicate
+///    and wait for next time than to force a value that will not convert into a typed attribute
+///    -- that is the same "rather empty than dirty" rule.
 async fn adopt_attribute(
     state: &AppState,
     user: &utopia_core::models::User,
@@ -1289,14 +1379,15 @@ async fn adopt_attribute(
                 "remapped": done.remapped, "unconvertible": done.unconvertible }),
     )
     .await;
-    // unconvertible 要回给调用方：改写了 3 条、丢下 2 条，界面得说得出后半句
+    // unconvertible goes back to the caller: 3 rewritten, 2 left behind -- the UI has to be able
+    // to say the second half too
     Ok(Json(json!({
         "id": done.attribute_id, "batch": done.batch_id,
         "remapped": done.remapped, "unconvertible": done.unconvertible
     })))
 }
 
-/// 一次属性采纳要的全部输入。
+/// Everything one attribute adoption takes as input.
 pub(crate) struct AttributeAdoption<'a> {
     pub key: &'a str,
     pub label: &'a str,
@@ -1304,7 +1395,7 @@ pub(crate) struct AttributeAdoption<'a> {
     pub datatype: &'a str,
     pub unit: Option<&'a str>,
     pub forms: &'a [String],
-    /// true = key 指的是已有属性，只改写、不新建
+    /// true = the key refers to an attribute that exists; rewrite only, create nothing
     pub existing: bool,
 }
 
@@ -1312,18 +1403,21 @@ pub(crate) struct AttributeAdopted {
     pub attribute_id: Uuid,
     pub batch_id: Uuid,
     pub remapped: u32,
-    /// 值换不动那个 datatype、因而**没有**被改写的条数。
-    /// 必须往上传：改写了 3 条、丢下 2 条，只报前半句就是报喜不报忧
+    /// How many were **not** rewritten because their value would not convert to that datatype.
+    /// This has to travel upwards: 3 rewritten, 2 left behind -- reporting only the first half
+    /// is announcing the good news and burying the bad
     pub unconvertible: usize,
 }
 
-/// 建（或指向已有的）属性，并把等着它的字面值事实改挂过去。人工与自动共用。
+/// Create (or point at an existing) attribute, and move the literal-value facts that were
+/// waiting on it across. Shared by the manual and the automatic path.
 pub(crate) async fn adopt_attribute_core(
     state: &AppState,
     kb_id: Uuid,
     spec: &AttributeAdoption<'_>,
 ) -> Result<AttributeAdopted, AppError> {
-    // 先把待改写的事实取出来：它既定 domain，也定值换不换得动
+    // Pull the facts to be rewritten out first: they settle the domain, and they settle whether
+    // the values will convert
     let facts = utopia_store::graph::value_facts_for_forms(&state.pool, kb_id, spec.forms).await?;
     let attribute_id = if spec.existing {
         utopia_store::ontology::relation_type_id_by_key(&state.pool, kb_id, spec.key)
@@ -1332,8 +1426,10 @@ pub(crate) async fn adopt_attribute_core(
                 AppError::invalid("unknown_relation_key", "no relation type with that key")
             })?
     } else {
-        // **domain 从数据里取。** 属性必须声明能挂在哪些类下，猜错的代价是硬的：
-        // 主语类型对不上就整条丢弃。这些事实的主语现在是什么类是事实，不是判断
+        // **The domain is taken from the data.** An attribute has to declare which classes it
+        // can hang off, and the cost of guessing wrong is hard: a fact whose subject type does
+        // not match is thrown away whole. What class the subjects of these facts are in right
+        // now is a fact, not a judgement
         let mut domains: Vec<Uuid> = facts.iter().map(|(_, type_id, _)| *type_id).collect();
         domains.sort_unstable();
         domains.dedup();
@@ -1349,8 +1445,9 @@ pub(crate) async fn adopt_attribute_core(
             spec.key,
             spec.label,
             "state",
-            // 建议方不替时态引擎做决定：functional 会驱动它自动闭合旧值，
-            // 而其余公理会驱动推理机——两者都该由人显式声明
+            // The suggester does not decide for the temporal engine: functional drives it to
+            // close old values off automatically, and the remaining axioms drive the reasoner --
+            // both of which should be declared explicitly by a person
             Default::default(),
             spec.description,
             "attribute",
@@ -1362,24 +1459,27 @@ pub(crate) async fn adopt_attribute_core(
         .await?
     };
 
-    // 换算按**库里那一条**的 datatype，不按请求——指向已有属性时请求里根本
-    // 没有 datatype，而即便有，也该听本体的
+    // Conversion follows the datatype of **the row in the database**, not of the request -- when
+    // pointing at an attribute that already exists the request has no datatype at all, and even
+    // if it did, the ontology is what to listen to
     let datatype = utopia_store::ontology::relation_type_datatype(&state.pool, attribute_id)
         .await?
         .unwrap_or_else(|| "text".to_string());
     let mut rewrites: Vec<(Uuid, serde_json::Value)> = Vec::new();
     let mut unconvertible = 0usize;
     for (fact_id, _, object_value) in &facts {
-        // 抽取写进去的形状是 {"value": …}，取里面那一层来换算
+        // The shape extraction wrote is {"value": ...}, so take the inner layer to convert
         let raw = object_value.get("value").unwrap_or(object_value);
         match utopia_extract::normalize_attr_value(&datatype, raw) {
             Some(v) => rewrites.push((*fact_id, json!({ "value": v }))),
-            // 换不动的**不改写**：宁可让它继续没有谓词，等下一次，
-            // 也不把一个换不动的值硬塞进类型化的属性里
+            // What will not convert is **not rewritten**: better to leave it with no predicate
+            // and wait for next time than to force a value that will not convert into a typed
+            // attribute
             None => unconvertible += 1,
         }
     }
-    // 属性那一路没有签名可判（宾语是字面值），`left_off` 恒为 0
+    // The attribute route has no signature to judge by (the object is a literal), so `left_off`
+    // is always 0
     let utopia_store::graph::Adopted {
         batch_id,
         moved: remapped,
@@ -1397,7 +1497,8 @@ pub(crate) async fn adopt_attribute_core(
     })
 }
 
-/// 映射到**已有属性**：不建东西，只把这些说法的字面值事实挂过去。
+/// Map onto an attribute that **already exists**: create nothing, just move these wordings'
+/// literal-value facts across.
 pub(crate) async fn adopt_attribute_existing(
     state: &AppState,
     kb_id: Uuid,
@@ -1421,8 +1522,9 @@ pub(crate) async fn adopt_attribute_existing(
     Ok((done.batch_id, done.remapped))
 }
 
-/// 自动扩本体那条路的入口。参数摊开而不是传 `AdoptReq`——那个结构是 HTTP
-/// 请求体，自动路径没有请求。
+/// The entry point for the automatic ontology extension path. The parameters are spread out
+/// rather than passed as an `AdoptReq` -- that struct is an HTTP request body, and the automatic
+/// path has no request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn adopt_attribute_auto(
     state: &AppState,
@@ -1451,17 +1553,19 @@ pub(crate) async fn adopt_attribute_auto(
     if done.unconvertible > 0 {
         tracing::info!(
             %kb_id, key, dropped = done.unconvertible,
-            "有值换不动这个 datatype，那些事实继续没有谓词"
+            "Some values would not convert to this datatype; those facts still have no predicate"
         );
     }
     Ok((done.batch_id, done.remapped))
 }
 
-/// 类型消解的**只算不写**那一步：每个待精化实体的画像与候选类。
+/// The **compute but do not write** step of type resolution: the profile and the candidate
+/// classes for every entity waiting to be refined.
 ///
-/// 跟本体导入同一个模式：先看计划，再决定落不落。在这里它还多一层用处——
-/// 检索找不着的时候，回执里带着"我们拿什么去找的"，第一眼就知道该改画像
-/// 还是该改类的描述。
+/// The same pattern as the ontology import: look at the plan, then decide whether to commit. It
+/// earns one more use here -- when retrieval finds nothing, the response carries "this is what
+/// we went looking with", so one glance tells you whether to fix the profile or fix the class
+/// descriptions.
 pub async fn type_resolution_preview(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1472,11 +1576,12 @@ pub async fn type_resolution_preview(
     Ok(Json(json!({ "items": items })))
 }
 
-/// 跑一遍类型消解并落库：检索候选 → 裁决 → 三档处置。
+/// Run type resolution and write it: retrieve candidates → adjudicate → three-way disposition.
 ///
-/// 与 preview 分开是本仓库既有的形状（本体导入也是先看计划再落库）。这里还多
-/// 一层理由：改类**不进时间轴**，所以它不像事实改写那样在实体历史里自己显形，
-/// 先看一眼再动是唯一能看见它的时机。
+/// Keeping it apart from preview is the shape this repository already has (the ontology import
+/// shows the plan before writing too). There is one more reason here: a retype **does not go on
+/// the timeline**, so unlike a fact rewrite it does not show itself in the entity history, and
+/// looking before acting is the only chance there is to see it.
 pub async fn type_resolution_apply(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1498,7 +1603,7 @@ pub async fn type_resolution_apply(
     Ok(Json(json!(outcome)))
 }
 
-/// 撤销一次类型消解：把那一批实体放回原来的类。
+/// Undo one type resolution: put that batch of entities back into the class they were in.
 pub async fn type_resolution_undo(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1523,17 +1628,20 @@ pub async fn type_resolution_undo(
 pub struct ApproveRefinementReq {
     pub from_type_id: Uuid,
     pub to_type_id: Uuid,
-    /// 这一次要一并改掉的实体。**认可的是类对，改的是实体**——
-    /// 两件事分开，所以调用方可以只认可规则而暂不动任何实体
+    /// The entities to change over in the same call. **What gets approved is the class pair;
+    /// what gets changed is the entities** -- the two are separate, so a caller can approve the
+    /// rule and leave every entity alone for now
     #[serde(default)]
     pub entity_ids: Vec<Uuid>,
 }
 
-/// 认可一个"粗类 → 细类"的配对，并把随请求带来的实体改过去。
+/// Approve a "coarse class → fine class" pair, and move the entities that came with the request.
 ///
-/// 待人工那一档由"跨没跨分类轴"触发，而实测那条判据测的往往是**种子类跟导入
-/// 词汇表连没连上**，不是风险——schema.org 的 Place 另起 key，于是每个城市都
-/// 要问一遍。配对认可一次就不再问：那是类与类之间的判断，实体只是碰巧撞上它。
+/// The needs-a-person bucket is triggered by "did this cross a classification axis", and in
+/// practice what that criterion mostly measures is **whether the seed classes got wired up to
+/// the imported vocabulary**, not risk -- schema.org's Place starts a key of its own, so every
+/// single city has to be asked about. Approve the pair once and it stops asking: that is a
+/// judgement between one class and another, and the entities merely happen to run into it.
 pub async fn approve_refinement(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1583,7 +1691,8 @@ mod tests {
 
     #[test]
     fn names_align_across_spellings() {
-        // 导进来的本体里 label 常常只是 key 的驼峰写法，两者必须归到一起
+        // In imported ontologies the label is often just the camelCase spelling of the key, and
+        // the two have to collapse together
         assert_eq!(
             normalize_name("acquiredFrom"),
             normalize_name("acquired_from")
@@ -1592,9 +1701,10 @@ mod tests {
             normalize_name("Acquired From"),
             normalize_name("acquired_from")
         );
-        // 不同的名字仍然不同——这一步只对齐写法，不做同义判断
+        // Different names stay different -- this step only lines spellings up, it makes no
+        // synonym judgement
         assert_ne!(normalize_name("acquired_from"), normalize_name("acquires"));
-        // 中文标签原样保留（去不掉也不该去）
+        // Chinese labels survive verbatim (they cannot be stripped, and should not be)
         assert_eq!(normalize_name("员工数"), "员工数");
     }
 
@@ -1607,13 +1717,15 @@ mod tests {
         .into_iter()
         .collect();
         let mut p = json!({"map_to": [
-            // 抄的是标签而不是 key —— 实测里模型就是这么干的，要能对回去
+            // The label got copied instead of the key -- this is exactly what the model does in
+            // practice, and it has to match back
             {"key": "acquiredFrom", "forms": ["acquired from"]},
-            // 按中文标签抄的，同样对得回去
+            // Copied from the Chinese label; that matches back just the same
             {"key": "员工数", "forms": ["员工总数"]},
-            // 候选表里没有：界面上那个按钮会承诺一件做不到的事，所以整条丢掉
+            // Not in the candidate table: that button in the UI would promise something it
+            // cannot do, so the whole item is dropped
             {"key": "invented_key", "forms": ["whatever"]},
-            // 连 key 都没有
+            // No key at all
             {"forms": ["x"]},
         ]});
         resolve_map_targets(&mut p, &by_name, &HashMap::new());
@@ -1632,8 +1744,9 @@ mod tests {
 
     #[test]
     fn a_wording_that_carries_a_value_cannot_also_become_a_relation() {
-        // 实测过的形状：模型把同一个 founded_in 既提成关系又提成属性。
-        // 两条都采纳的话同一批事实被抢两次，谁先跑谁赢
+        // A shape seen in practice: the model proposes the same founded_in as a relation and as
+        // an attribute. Adopt both and the same batch of facts gets claimed twice, whichever
+        // runs first wins
         let value_only: HashSet<&str> = ["founded_in", "registered_capital"].into_iter().collect();
         let entity_only: HashSet<&str> = ["acquires"].into_iter().collect();
         let mut p = json!({
@@ -1650,18 +1763,20 @@ mod tests {
         super::keep_forms(&mut p, "attribute_types", &value_only, &entity_only);
 
         let rels = p["relation_types"].as_array().unwrap();
-        // founded 只剩 "founding date"——那个说法两边都不认识，不该替模型否决
+        // founded is left with only "founding date" -- neither side recognizes that wording, and
+        // it is not ours to veto for the model
         assert_eq!(rels.len(), 2);
         assert_eq!(rels[0]["forms"].as_array().unwrap().len(), 1);
         assert_eq!(rels[0]["forms"][0], "founding date");
         assert_eq!(rels[1]["key"], "acquires");
-        // 属性那边一条不动
+        // Nothing on the attribute side moves
         assert_eq!(p["attribute_types"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn a_proposal_left_with_no_wordings_is_dropped() {
-        // forms 被剔光 = 它承诺的"改写 N 条"已经是零，留着只会让人点一下什么也没发生
+        // forms stripped bare = the "rewrite N of them" it promised is already zero, and keeping
+        // it only earns someone a click where nothing happens
         let value_only: HashSet<&str> = ["founded_in"].into_iter().collect();
         let mut p = json!({"relation_types": [{"key": "founded", "forms": ["founded_in"]}]});
         super::keep_forms(&mut p, "relation_types", &HashSet::new(), &value_only);
@@ -1670,7 +1785,8 @@ mod tests {
 
     #[test]
     fn a_type_proposal_without_wordings_is_left_alone() {
-        // 没有 forms 的提案只是"加一个类型"，不改写任何事实，与归档无关
+        // A proposal with no forms is just "add a type": it rewrites no facts, so which category
+        // it belongs in does not apply
         let mut p = json!({"entity_types": [{"key": "platform", "label": "Platform"}]});
         super::keep_forms(&mut p, "entity_types", &HashSet::new(), &HashSet::new());
         assert_eq!(p["entity_types"].as_array().unwrap().len(), 1);

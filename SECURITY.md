@@ -1,6 +1,6 @@
 # Security
 
-*[中文版](SECURITY.zh-CN.md)*
+*[Chinese version](SECURITY.zh-CN.md)*
 
 Utopia is at v0.1. Below are the **known, unresolved** limits — not a vulnerability report,
 but the places the design has not reached yet.

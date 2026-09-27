@@ -1,7 +1,8 @@
--- 问数引擎扩到 HTTP 协议族：trino（Iceberg / Delta / Hive 都是它的 catalog）、
--- databricks（SQL Statement API）、snowflake（SQL API v2）。
--- 挂载模型与注册表引擎无关（0006 的判断仍成立），这里只放宽 engine 的取值；
--- 允许的名字与 `query_engine::ENGINES` 同一张表。
+-- Ask-the-Data engines widened to the HTTP protocol family: trino (Iceberg / Delta / Hive are all
+-- catalogs of it), databricks (SQL Statement API), snowflake (SQL API v2).
+-- The mount model has nothing to do with which engine is registered (0006's judgment still holds);
+-- this only relaxes the values engine may take. The permitted names are the same list as
+-- `query_engine::ENGINES`.
 ALTER TABLE data_sources DROP CONSTRAINT data_sources_engine_check;
 ALTER TABLE data_sources ADD CONSTRAINT data_sources_engine_check
     CHECK (engine IN ('postgres', 'trino', 'databricks', 'snowflake'));

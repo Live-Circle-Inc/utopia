@@ -1,11 +1,12 @@
-# 发布容器镜像到 ghcr.io。没有这个，README 承诺的"一条命令"实际是
-# "在自己机器上编译 Rust release + LTO 二十分钟，还得先拉得到 rust/node 基础镜像"。
+# Publish the container image to ghcr.io. Without this, the "one command" the README promises
+# is really "compile a Rust release + LTO on your own machine for twenty minutes, and first you
+# have to be able to pull the rust/node base images".
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  # 正式打 tag 之前先出一个可部署的镜像用
+  # For getting a deployable image out before the real tag is cut
   workflow_dispatch:
     inputs:
       tag:
@@ -37,16 +38,20 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            # **预发布不动 latest。** `{{major}}.{{minor}}` 那两条
-            # metadata-action 自己会跳过预发布，而这条 raw 不会——推一个
-            # `v0.1.0-rc1` 就把 latest 拖了过去，而那正好是 rc 要避免的事。
-            # 判据是 tag 里有没有连字符：semver 用它标预发布
+            # **A pre-release must not move latest.** For the two
+            # `{{major}}.{{minor}}` lines metadata-action skips pre-releases on
+            # its own, but this raw one does not -- pushing a `v0.1.0-rc1` would
+            # drag latest along with it, which is exactly what an rc is meant to
+            # avoid. The test is whether the tag contains a hyphen: that is how
+            # semver marks a pre-release
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      # 先只 load 到本地跑一遍。"镜像构建成功"证明不了"容器能起来"——
-      # glibc 跨发行版不匹配就是构建全绿、启动即死。
-      # amd64 only：arm64 得走 QEMU，Rust release + LTO 会拖到一小时以上。
+      # First only load it locally and run it once. "The image built" proves nothing about
+      # "the container comes up" -- a glibc mismatch across distributions is all green at build
+      # time and dead on startup.
+      # amd64 only: arm64 would have to go through QEMU, and a Rust release + LTO would drag
+      # past an hour.
       - name: Build for smoke test
         uses: docker/build-push-action@v6
         with:
@@ -64,20 +69,22 @@ jobs:
           docker run -d --name pg --network smoke \
             -e POSTGRES_USER=utopia -e POSTGRES_PASSWORD=utopia -e POSTGRES_DB=utopia \
             pgvector/pgvector:pg16
-          # 轮询条件一律写进 if：set -e 下 `cmd && break` 在 cmd 失败时会终止整个
-          # 脚本，把"还没就绪"变成"构建失败"。
+          # Always put the polling condition inside an if: under set -e, `cmd && break` kills
+          # the whole script when cmd fails, turning "not ready yet" into "the build failed".
           for _ in $(seq 1 40); do
             if docker exec pg pg_isready -U utopia -d utopia >/dev/null 2>&1; then break; fi
             sleep 2
           done
-          # 故意不给 UTOPIA_JWT_SECRET：让这一跑覆盖自动生成那条路径。
-          # 下面的注册请求会签发并携带 token，密钥没生成好就过不了。
+          # Deliberately no UTOPIA_JWT_SECRET: let this run cover the auto-generation path.
+          # The register request below issues and carries a token, so it cannot pass unless the
+          # secret was generated properly.
           docker run -d --name app --network smoke -p 1516:1516 \
             -e UTOPIA_DATABASE_URL=postgres://utopia:utopia@pg:5432/utopia \
             utopia:smoke
 
-          # 必须打 /api/v1/health 并核对 JSON：健康检查挂在 nest("/api/v1") 里，
-          # 而镜像带 SPA fallback——请求 /health 会拿到 200 的 index.html，看着像通过。
+          # It must hit /api/v1/health and check the JSON: the health check hangs off
+          # nest("/api/v1"), and the image ships an SPA fallback -- a request to /health gets
+          # back a 200 index.html, which looks like a pass.
           ok=""
           for _ in $(seq 1 40); do
             if curl -sf -m 3 http://localhost:1516/api/v1/health -o /tmp/h.json \
@@ -86,7 +93,7 @@ jobs:
           done
           if [ -z "$ok" ]; then echo "::error::container never became healthy"; docker logs app; exit 1; fi
 
-          # 注册一次，把迁移 + argon2 + JWT 签发整条链路真正走一遍
+          # Register once, so migrations + argon2 + JWT issuance really run end to end
           code=$(curl -s -o /tmp/reg.json -w '%{http_code}' -m 10 \
             -X POST http://localhost:1516/api/v1/auth/register \
             -H 'Content-Type: application/json' \
@@ -97,7 +104,8 @@ jobs:
           grep -q '"token"' /tmp/reg.json || { echo "::error::no token issued"; cat /tmp/reg.json; exit 1; }
           echo "smoke test passed: healthy, migrated, user registered, token issued"
 
-      # 冒烟通过才发布。缓存已热，这步基本是瞬间完成。
+      # Publish only once the smoke test passes. The cache is warm, so this step is
+      # essentially instant.
       - name: Push
         uses: docker/build-push-action@v6
         with:

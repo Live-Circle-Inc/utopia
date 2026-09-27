@@ -1,25 +1,32 @@
-//! 语义层的「业务概念 → 数据资产」映射（见 `docs/decisions/0011`）。
+//! The semantic layer's "business concept → data asset" mapping (see
+//! `docs/decisions/0011`).
 //!
-//! 它从前是一条 `mapped_to` 事实，宾语是塞在 `object_value` 里的一份 JSON。
-//! 搬出来的理由写在 `concept_mappings` 的建表注释里，一句话：**它不是关于世界的断言，是配置**。
+//! It used to be a `mapped_to` fact whose object was a blob of JSON stuffed into
+//! `object_value`. The reason for moving it out is written in the create-table comment on
+//! `concept_mappings`, in one sentence: **it is not an assertion about the world, it is
+//! configuration**.
 //!
-//! 与账本的区别在这里就能看见：这张表**允许原地改**。`confirm` 改的是
-//! 「这条配置生效了没有」，不是「我们对世界的认知变了」——所以它不需要
-//! append-only，改之前的那一版进 `concept_mapping_revisions` 留痕即可。
+//! The difference from the ledger is visible right here: this table **allows in-place
+//! edits**. What `confirm` changes is "has this piece of configuration taken effect", not
+//! "our understanding of the world has changed" -- so it does not need to be append-only;
+//! it is enough that the version before the edit leaves a trace in
+//! `concept_mapping_revisions`.
 
 use sqlx::PgPool;
 use utopia_core::models::{ConceptMapping, MappingRevision};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// 探索任务提议一条映射。
+/// The discovery job proposes a mapping.
 ///
-/// **同一个 (概念, 源) 只有一条**，由主键管——从前这条唯一性藏在 `object_value`
-/// 内部，数据库看不见，只能靠确认流程显式闭合。
+/// **Only one row per (concept, source)**, enforced by the primary key -- this uniqueness
+/// used to be buried inside `object_value` where the database could not see it, and could
+/// only be closed explicitly by the confirmation flow.
 ///
-/// 已经有人表过态的不覆盖：重跑探索会再次算出被拒绝过的那条，不加这一句
-/// 它就被刷回待看，等于每跑一次都把人的否决抹掉一次（`ontology_proposals`
-/// 那边踩过同一个坑，见 `ontology_proposals`）。
+/// What someone has already ruled on is not overwritten: rerunning discovery computes the
+/// rejected one all over again, and without this clause it gets flipped back to pending,
+/// which means every single run erases a person's veto once more (`ontology_proposals`
+/// stepped into the same hole, see `ontology_proposals`).
 #[allow(clippy::too_many_arguments)]
 pub async fn propose(
     pool: &PgPool,
@@ -33,13 +40,16 @@ pub async fn propose(
     summary: Option<&str>,
     derived: bool,
 ) -> AppResult<Uuid> {
-    // **`DO UPDATE ... WHERE` 不满足时 `RETURNING` 一行都不返回。**
+    // **When `DO UPDATE ... WHERE` is not satisfied, `RETURNING` returns no row at all.**
     //
-    // 这是 Postgres 的实情而不是直觉：条件挡住更新，那一行就不算被这条语句
-    // 动过，于是也不出现在 RETURNING 里。测试当场撞上——第二次提议一条已被
-    // 拒绝的映射，`fetch_one` 报「no rows returned」。
+    // That is how Postgres really behaves, not what intuition says: the condition blocks
+    // the update, so that row does not count as having been touched by this statement, and
+    // therefore does not show up in RETURNING either. A test ran straight into it -- on
+    // proposing an already-rejected mapping a second time, `fetch_one` reported
+    // "no rows returned".
     //
-    // 所以把 id 单独查出来：更新与否是一回事，「这条映射是哪一行」是另一回事。
+    // So the id is looked up on its own: whether an update happens is one thing, and
+    // "which row is this mapping" is another.
     let existing: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM concept_mappings
           WHERE kb_id = $1 AND concept_id = $2 AND source = $3",
@@ -76,7 +86,7 @@ pub async fn propose(
     Ok(id)
 }
 
-/// 还等着人表态的。Review 页读它。
+/// The ones still waiting for a person to rule. The Review page reads this.
 pub async fn proposed(
     pool: &PgPool,
     kb_id: Uuid,
@@ -99,8 +109,9 @@ pub async fn proposed(
     .await?)
 }
 
-/// 人确认过的。问数把它们注进 system prompt——**只用确认过的口径**，
-/// 而不是每次从 schema 猜。
+/// The ones a person confirmed. Data questions inject them into the system prompt --
+/// **only confirmed definitions get used**, rather than guessing from the schema every
+/// time.
 pub async fn confirmed(pool: &PgPool, kb_id: Uuid, limit: i64) -> AppResult<Vec<ConceptMapping>> {
     Ok(sqlx::query_as(
         "SELECT m.id, m.concept_id, e.canonical_name AS concept_name, m.source,
@@ -117,10 +128,11 @@ pub async fn confirmed(pool: &PgPool, kb_id: Uuid, limit: i64) -> AppResult<Vec<
     .await?)
 }
 
-/// 有人表态了。
+/// Someone has ruled.
 ///
-/// **改状态不删行**：确认发生过、拒绝也发生过。而拒绝留痕还有当下就用得着的
-/// 作用——`propose` 的 `WHERE status = 'proposed'` 据此不把它刷回待看。
+/// **The status changes, the row is not deleted**: the confirmation happened, and so did
+/// the rejection. And the trace a rejection leaves has a use right now -- `propose`'s
+/// `WHERE status = 'proposed'` relies on it to not flip the row back to pending.
 pub async fn decide(
     pool: &PgPool,
     kb_id: Uuid,
@@ -145,11 +157,12 @@ pub async fn decide(
     Ok(())
 }
 
-/// 改一条确认过的口径。**改之前那一版先进 revisions**——问数回溯历史报表时
-/// 要答得出「上季度这个数是怎么算的」。
+/// Edit a confirmed definition. **The version before the edit goes into revisions first**
+/// -- when data questions look back at a historical report, they have to be able to
+/// answer "how was this number computed last quarter".
 ///
-/// 存整版快照而不是差异：读的时候要的就是「当时是什么」，而差异得从头重放
-/// 才能回答这个问题。
+/// A whole-version snapshot is stored rather than a diff: what the reader wants is "what
+/// it was at the time", and a diff has to be replayed from the start to answer that.
 #[allow(clippy::too_many_arguments)]
 pub async fn revise(
     pool: &PgPool,
@@ -206,12 +219,14 @@ pub async fn revise(
     Ok(())
 }
 
-/// 数据映射页读的：一页口径，可按状态与关键词筛。
+/// What the data mapping page reads: one page of definitions, filterable by status and
+/// keyword.
 ///
-/// **`proposed` 与 `confirmed` 那两条查询都不够用**——前者只捞待表态的，
-/// 后者是给问数拼 prompt 的（无分页、无筛选、限 30 条）。人要看的是全部，
-/// 包括被自己拒绝过的那些：拒绝留了痕，就该看得见，否则「为什么这个概念
-/// 没被映射」永远答不上来。
+/// **Neither the `proposed` nor the `confirmed` query is enough** -- the first only pulls
+/// what is awaiting a ruling, and the second assembles the prompt for data questions (no
+/// pagination, no filtering, capped at 30). What a person wants to see is all of them,
+/// including the ones they rejected themselves: the rejection left a trace, so it should
+/// be visible, otherwise "why was this concept never mapped" can never be answered.
 pub async fn page(
     pool: &PgPool,
     kb_id: Uuid,
@@ -220,7 +235,8 @@ pub async fn page(
     limit: i64,
     offset: i64,
 ) -> AppResult<(Vec<ConceptMapping>, i64)> {
-    // 概念名与数据源名都可搜：人记得住的是「GMV」，也可能是「那个接了 orders 的」
+    // Both concept names and source names are searchable: what a person remembers is
+    // "GMV", or possibly "the one hooked up to orders"
     const WHERE: &str = "WHERE m.kb_id = $1
            AND ($2::text IS NULL OR m.status = $2)
            AND ($3::text IS NULL
@@ -255,7 +271,8 @@ pub async fn page(
     Ok((rows, total))
 }
 
-/// 每种状态各多少。页面的筛选条要显示计数，分三次查是三次全表扫。
+/// How many of each status. The page's filter bar has to show counts, and asking in three
+/// separate queries is three full table scans.
 pub async fn status_counts(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64, i64)> {
     let row: (i64, i64, i64) = sqlx::query_as(
         "SELECT count(*) FILTER (WHERE status = 'proposed'),
@@ -269,18 +286,19 @@ pub async fn status_counts(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64, i
     Ok(row)
 }
 
-/// 一条口径改过几次、每次改之前是什么样。
+/// How many times a definition was edited, and what it looked like before each edit.
 ///
-/// `revise` 从建表起就在写 `concept_mapping_revisions`，而**在此之前没有任何
-/// 地方读它**——留痕留了个寂寞。0006 说留痕是为了「问数回溯历史报表时答得出
-/// 『上季度这个数是怎么算的』」，那就得有人看得见。
+/// `revise` has been writing `concept_mapping_revisions` since the table was created, and
+/// **until now nowhere read it** -- a trace kept for nobody. 0006 says the trace is there
+/// so that "when data questions look back at a historical report they can answer 'how was
+/// this number computed last quarter'", and for that somebody has to be able to see it.
 pub async fn revisions(
     pool: &PgPool,
     kb_id: Uuid,
     mapping_id: Uuid,
 ) -> AppResult<Vec<MappingRevision>> {
-    // kb_id 走 JOIN 校验归属：revisions 表自己没有 kb_id，
-    // 不校验就能拿别的库的口径历史
+    // kb_id verifies ownership through the JOIN: the revisions table has no kb_id of its
+    // own, and without the check you could pull another KB's definition history
     Ok(sqlx::query_as(
         "SELECT r.id, r.before, u.display_name AS changed_by_name, r.changed_at
            FROM concept_mapping_revisions r

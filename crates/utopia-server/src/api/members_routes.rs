@@ -1,6 +1,6 @@
-//! 工作区成员管理。
-//! 规则：查看成员 = viewer+；改角色/移除 = admin+；涉及 owner 角色的授予/剥夺 = 仅 owner；
-//! 永远保证工作区至少剩一个 owner。
+//! Workspace member management.
+//! Rules: viewing members = viewer+; changing a role or removing = admin+; granting or stripping
+//! the owner role = owner only; and a workspace is always guaranteed to keep at least one owner.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -26,7 +26,7 @@ pub async fn list(
     ))
 }
 
-/// 部署内全部用户（供成员选人器；同一公司内可见）。
+/// Every user in the deployment (for the member picker; visible within the same company).
 pub async fn org_users(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -36,11 +36,12 @@ pub async fn org_users(
     ))
 }
 
-/// 已停用的账号。**仅管理员**——它是一份「谁被停了」的名单，
-/// 而恢复本来就是管理员动作。
+/// Deactivated accounts. **Admins only** -- it is a list of "who got deactivated", and
+/// reactivating someone is an admin action to begin with.
 ///
-/// 没有这个接口的时候，恢复是一条死路：停用的人从每一个列表里消失，
-/// 管理员拿不到 id，而 `POST /admin/users/{id}` 要的正是那个 id。
+/// Without this endpoint, reactivating was a dead end: a deactivated person disappears from every
+/// list, the admin can never get hold of the id, and that id is exactly what
+/// `POST /admin/users/{id}` wants.
 pub async fn deactivated_users(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -74,12 +75,12 @@ pub async fn set_role(
     let target_role =
         utopia_store::members::current_role(&state.pool, workspace_id, target_id).await?;
 
-    // owner 角色的授予或剥夺，只有 owner 能做
+    // only an owner may grant or strip the owner role
     let touches_owner = new_role == Role::Owner || target_role == Some(Role::Owner);
     if touches_owner && caller_role != Role::Owner {
         return Err(AppError::Forbidden.into());
     }
-    // 不能把最后一个 owner 降级
+    // the last owner must not be demoted
     if target_role == Some(Role::Owner)
         && new_role != Role::Owner
         && utopia_store::members::owner_count(&state.pool, workspace_id).await? <= 1

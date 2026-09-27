@@ -1,4 +1,5 @@
-//! 图谱仓储：本体、实体消解（P2 第一刀：同 KB 同类型同名合一）、事实账本、图查询。
+//! Graph store: the ontology, entity resolution (the first cut of P2: same KB, same type and
+//! same name become one), the fact ledger, graph queries.
 
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -9,39 +10,45 @@ use utopia_core::models::{
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// 同断言已有事实的行投影：(id, valid_from, valid_to)。
+/// Row projection of the facts an assertion already has: (id, valid_from, valid_to).
 type FactSpanRow = (
     Uuid,
     Option<chrono::DateTime<chrono::Utc>>,
     Option<chrono::DateTime<chrono::Utc>>,
 );
 
-/// 采纳时旧事实的去向（`fact_adoptions.mode`）：新写一行取代它。
+/// Where the old fact goes on adoption (`fact_adoptions.mode`): a new row is written in its
+/// place.
 const ADOPT_SUPERSEDED: &str = "superseded";
-/// 目标断言已存在 → 并进去。旧行被作废且没有后继，实体历史必须据此把它
-/// 读成"并入"而不是"撤回"，否则界面会宣称一件没发生的事。
+/// The target assertion already exists -> merge into it. The old row is invalidated with no
+/// successor, so entity history has to read it as "merged" rather than "withdrawn" on that basis,
+/// otherwise the UI announces something that never happened.
 const ADOPT_MERGED: &str = "merged";
 
-// 建库不再播种任何关系，也不再有 `ensure_default_ontology`。
+// Creating a KB no longer seeds any relations, and `ensure_default_ontology` is gone as well.
 //
-// 这里曾经有十条种子关系、一张中文措辞表、一个按语言取措辞的 `localized`，
-// 以及一个在建库 / 首次读本体 / 每次抽取前都会跑一遍的播种函数。它们分三次退场：
+// This used to hold ten seed relations, a table of Chinese wordings, a `localized` that picked
+// the wording by language, and a seeding function that ran on KB creation / on the first read of
+// the ontology / before every extraction. They left in three waves:
 //
-// - `related_to`（0010）：代码层面的兜底，摆进提示词就成了逃生舱
-// - 另外八条（`#125`）：零个带签名、装了本体包也不会被同名顶替
-//   （`worksFor` 与 `works_at` 的 key 对不上，于是并存成两条边）、
-//   而且公理位恒为 false，一致性检查在它们上面永远查不出矛盾
-// - `mapped_to`（0011）：它是「这个数怎么算」不是「世界上有什么」，
-//   已搬去 `concept_mappings`
+// - `related_to` (0010): a code-level fallback, which becomes an escape hatch once it is put in
+//   the prompt
+// - the other eight (`#125`): zero of them carried a signature, and installing an ontology pack
+//   would not replace them by name either (`worksFor` and `works_at` have keys that do not
+//   match, so the two coexist as two edges) -- and their axiom flag was permanently false, so
+//   the consistency check could never find a contradiction on them
+// - `mapped_to` (0011): it is "how this number is computed", not "what exists in the world",
+//   and has moved to `concept_mappings`
 //
-// 剩下的那个函数于是只是在遍历一张空表。**本体从建库第一天起就只有
-// 用户自己导入的词表**——与 0009 删掉内置实体类是同一件事的下半段。
+// The one function left over was therefore just iterating an empty table. **From the first day a
+// KB exists, the ontology holds nothing but the vocabulary the user imported themselves** -- the
+// second half of the same move as deleting the built-in entity types in 0009.
 
 pub async fn entity_types(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<EntityType>> {
     Ok(
-        // 又一次 SELECT *：parents 在关联表里，`*` 取不到。
-        // 这是同一个陷阱的第三次——SQL 在字符串里，cargo check 全绿，
-        // 第一个请求才报 no column found
+        // SELECT * again: parents lives in a join table, `*` cannot reach it.
+        // This is the third time in the same trap -- the SQL is in a string, cargo check is all
+        // green, and only the first request reports no column found
         sqlx::query_as(
             "SELECT t.*,
                     ARRAY(SELECT p.parent_id FROM entity_type_parents p
@@ -57,8 +64,8 @@ pub async fn entity_types(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<EntityTyp
 }
 
 pub async fn relation_types(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<RelationType>> {
-    // 不用 SELECT *：domain/range 在关联表里，`*` 取不到，
-    // 而且 sqlx 要到运行时才会说 "no column found" —— 编译器看不见 SQL 字符串
+    // Not SELECT *: domain/range live in join tables, `*` cannot reach them,
+    // and sqlx only says "no column found" at runtime -- the compiler cannot see the SQL string
     Ok(sqlx::query_as(
         "SELECT r.*,
                 ARRAY(SELECT d.entity_type_id FROM relation_type_domains d
@@ -72,17 +79,24 @@ pub async fn relation_types(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Relatio
     .await?)
 }
 
-/// 写入事实。返回 (事实 id, 是否新建)。
+/// Writes a fact. Returns (fact id, whether it is new).
 ///
-/// 同断言（同主谓宾）的多次观察不各立门户：
-/// - 同 valid_from 的 live 行已存在 → 复用（证据累积到同一条）
-/// - 新观察**没带时间**、同断言已有开放行 → 弱化陈述并入已有行（"隶属星云科技"
-///   并进"2021-02 起隶属星云科技"，不再产生一条无时间的重复）
-/// - 新观察**带了时间**、同断言已有的是无时无终的裸行 → 时间精化：新行落库后
-///   把裸行作废并以 supersedes 链上（作废+改写，认知史完整），证据随行复制
-/// - 双方都带时间但不同 → 保守并存（可能真是两段区间，如离职又回归）
+/// Repeated observations of the same assertion (same subject, predicate and object) do not each
+/// set up their own household:
+/// - a live row with the same valid_from already exists -> reuse it (evidence accumulates on the
+///   one row)
+/// - the new observation **carries no time** and the assertion already has an open row -> the
+///   weaker statement merges into the existing row ("affiliated with Nebula Tech" merges into
+///   "affiliated with Nebula Tech since 2021-02", instead of producing a timeless duplicate)
+/// - the new observation **carries a time** and what the assertion already has is a bare row with
+///   no start and no end -> temporal refinement: once the new row is stored, the bare row is
+///   invalidated and chained on via supersedes (invalidate + rewrite, so the epistemic history
+///   stays complete), and the evidence is copied along with the row
+/// - both sides carry a time and they differ -> conservatively keep both (they may genuinely be
+///   two intervals, e.g. left the company and came back)
 ///
-/// 事实的宾语：实体（关系）或字面值（属性/问数映射）。同一套折并与时间精化逻辑。
+/// A fact's object: an entity (a relation) or a literal value (an attribute / a metric mapping).
+/// The same folding and temporal-refinement logic for both.
 #[derive(Debug, Clone, Copy)]
 pub enum FactObject<'a> {
     Entity(Uuid),
@@ -94,8 +108,9 @@ pub async fn insert_fact(
     pool: &PgPool,
     kb_id: Uuid,
     subject_id: Uuid,
-    // None = 本体里没有对应的关系。原意不丢——它在证据的 proposed_predicate 里，
-    // 显示时由 fact_surface_predicate() 取回（见 `facts.predicate_id`）
+    // None = the ontology has no matching relation. The original meaning is not lost -- it is in
+    // the evidence's proposed_predicate, and fact_surface_predicate() fetches it back for display
+    // (see `facts.predicate_id`)
     predicate_id: Option<Uuid>,
     object_id: Uuid,
     validity: Validity<'_>,
@@ -113,22 +128,26 @@ pub async fn insert_fact(
     .await
 }
 
-/// 一条事实在**世界轴**上的位置：两端各自的时刻与粒度。
+/// Where a fact sits on the **world axis**: the instant and the granularity of each end.
 ///
-/// 打包成结构而不是四个平行参数：`Option<DateTime>` 和 `Option<&str>` 各有两个，
-/// 相邻同型的参数写反了编译器一声不吭，而这里写反的后果是一条事实的起止颠倒。
+/// Packed into a struct rather than four parallel parameters: there are two `Option<DateTime>`
+/// and two `Option<&str>`, and when two adjacent parameters of the same type get swapped the
+/// compiler does not make a sound -- while what a swap costs here is a fact whose start and end
+/// are reversed.
 ///
-/// 结束端的三种状态（数据库的 `facts_to_precision_matches_date` 约束在挡）：
+/// The three states of the end side (the database's `facts_to_precision_matches_date` constraint
+/// is what holds the line):
 ///
-/// | 语义 | `to` | `to_precision` |
+/// | Meaning | `to` | `to_precision` |
 /// |---|---|---|
-/// | 仍在持续 | `None` | `None` |
-/// | **结束了，不知哪天** | `None` | `Some("unknown")` |
-/// | 某时结束 | `Some(t)` | `Some("year"/"month"/"day")` |
+/// | still going | `None` | `None` |
+/// | **ended, day unknown** | `None` | `Some("unknown")` |
+/// | ended at some time | `Some(t)` | `Some("year"/"month"/"day")` |
 ///
-/// 第二行是后加的。在它之前 `to = None` 同时承载「还在持续」和「不知何时
-/// 结束」，于是 "former CEO of Weta Digital" 这种**结束明确、日期缺失**的句子
-/// 只能写成前者，图会断言一件原文说已经结束的事。
+/// The second row was added later. Before it, `to = None` carried both "still going" and "we do
+/// not know when it ended", so a sentence like "former CEO of Weta Digital" -- **clearly ended,
+/// date missing** -- could only be written as the former, and the graph would assert something
+/// the source says is already over.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Validity<'a> {
     pub from: Option<chrono::DateTime<chrono::Utc>>,
@@ -137,11 +156,11 @@ pub struct Validity<'a> {
     pub to_precision: Option<&'a str>,
 }
 
-/// `valid_to_precision` 表示「结束了，但不知道是哪天」。
+/// `valid_to_precision` meaning "it ended, but we do not know which day".
 pub const ENDED_UNKNOWN: &str = "unknown";
 
 impl<'a> Validity<'a> {
-    /// 起始端已知、结束端未知或不适用。
+    /// Start end known, finish end unknown or not applicable.
     pub fn starting(
         from: Option<chrono::DateTime<chrono::Utc>>,
         from_precision: Option<&'a str>,
@@ -154,17 +173,18 @@ impl<'a> Validity<'a> {
         }
     }
 
-    /// 原文说它结束了，但没说哪天。
+    /// The source says it ended, but does not say which day.
     pub fn ended_when_unknown(mut self) -> Self {
         self.to = None;
         self.to_precision = Some(ENDED_UNKNOWN);
         self
     }
 
-    /// 这条断言是否已经不再成立——**两种结束都算**。
+    /// Whether this assertion no longer holds -- **both kinds of ending count**.
     ///
-    /// 判据写在这里而不是散在各处的 `valid_to.is_some()`：那种写法会把
-    /// 「结束了但不知哪天」漏成「仍在持续」，而那正是两端各记精度要修的东西。
+    /// The test lives here rather than as `valid_to.is_some()` scattered all over: that spelling
+    /// misses "ended but we do not know which day" as "still going", and that is exactly what
+    /// recording a precision at each end was there to fix.
     pub fn has_ended(&self) -> bool {
         self.to.is_some() || self.to_precision == Some(ENDED_UNKNOWN)
     }
@@ -175,8 +195,9 @@ async fn insert_fact_inner(
     pool: &PgPool,
     kb_id: Uuid,
     subject_id: Uuid,
-    // None = 本体里没有对应的关系。原意不丢——它在证据的 proposed_predicate 里，
-    // 显示时由 fact_surface_predicate() 取回（见 `facts.predicate_id`）
+    // None = the ontology has no matching relation. The original meaning is not lost -- it is in
+    // the evidence's proposed_predicate, and fact_surface_predicate() fetches it back for display
+    // (see `facts.predicate_id`)
     predicate_id: Option<Uuid>,
     object: FactObject<'_>,
     validity: Validity<'_>,
@@ -203,11 +224,12 @@ async fn insert_fact_inner(
         FactObject::Value(v) => q.bind(v),
     };
     let same: Vec<FactSpanRow> = q.fetch_all(pool).await?;
-    // 精确重复：同 valid_from → 复用
+    // Exact duplicate: same valid_from -> reuse
     if let Some((existing, _, _)) = same.iter().find(|(_, vf, _)| *vf == validity.from) {
         return Ok((*existing, false));
     }
-    // 弱化陈述：新观察无时间，同断言已有开放行 → 并入（取起点最新的开放行）
+    // Weaker statement: the new observation has no time and the assertion already has an open
+    // row -> merge into it (take the open row with the latest start)
     if validity.from.is_none() && !validity.has_ended() {
         if let Some((existing, _, _)) = same
             .iter()
@@ -217,7 +239,8 @@ async fn insert_fact_inner(
             return Ok((*existing, false));
         }
     }
-    // 时间精化候选：已有无时无终的裸行，本次观察带了起点 → 落库后作废裸行并链上
+    // Temporal-refinement candidate: a bare row with no start and no end already exists and this
+    // observation carries a start -> once stored, invalidate the bare row and chain on
     let refine_target = if validity.from.is_some() {
         same.iter()
             .find(|(_, vf, vt)| vf.is_none() && vt.is_none())
@@ -258,7 +281,8 @@ async fn insert_fact_inner(
         .execute(pool)
         .await?;
 
-    // 时间精化：裸行（无时无终的同断言）被本次带时间的观察取代——作废+链上，证据随行
+    // Temporal refinement: the bare row (same assertion, no start, no end) is superseded by this
+    // timed observation -- invalidate + chain on, and the evidence goes with it
     if let Some(old_id) = refine_target {
         sqlx::query("UPDATE facts SET invalidated_at = now() WHERE id = $1")
             .bind(old_id)
@@ -270,7 +294,8 @@ async fn insert_fact_inner(
             .execute(pool)
             .await?;
         sqlx::query(
-            // 表层谓词随证据一起搬：精化的是时间，不是原文说了什么
+            // The surface predicate moves with the evidence: what is refined is the time, not
+            // what the source said
             "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
              SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
              FROM fact_evidence WHERE fact_id = $2
@@ -284,15 +309,17 @@ async fn insert_fact_inner(
     Ok((id, true))
 }
 
-/// 字面值宾语的事实（object_value 通道，问数映射首个消费者）。
-/// 去重：同 (S,P) 且 object_value 完全相等的 live 事实只存一条。
+/// A fact with a literal-value object (the object_value channel, whose first consumer is the
+/// metric mapping).
+/// Dedup: for the same (S,P) with an exactly equal object_value, only one live fact is stored.
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_value_fact(
     pool: &PgPool,
     kb_id: Uuid,
     subject_id: Uuid,
-    // None = 本体里没有对应的关系。原意不丢——它在证据的 proposed_predicate 里，
-    // 显示时由 fact_surface_predicate() 取回（见 `facts.predicate_id`）
+    // None = the ontology has no matching relation. The original meaning is not lost -- it is in
+    // the evidence's proposed_predicate, and fact_surface_predicate() fetches it back for display
+    // (see `facts.predicate_id`)
     predicate_id: Option<Uuid>,
     object_value: &serde_json::Value,
     validity: Validity<'_>,
@@ -310,9 +337,10 @@ pub async fn insert_value_fact(
     .await
 }
 
-/// `proposed`：模型在这一块里实际提议的谓词。命中本体时它等于 key，
-/// 本体外的谓词不落到关系上时，它是唯一还留着原意的东西——事实行上只剩
-/// "有关联"，原文说的"runs on"就靠这里活下来。
+/// `proposed`: the predicate the model actually proposed in this chunk. When it hits the ontology
+/// it equals the key; when a predicate outside the ontology does not land on a relation, this is
+/// the only thing still holding the original meaning -- all the fact row has left is "related
+/// to", and the "runs on" the source said survives right here.
 pub async fn add_evidence(
     pool: &PgPool,
     fact_id: Uuid,
@@ -320,10 +348,13 @@ pub async fn add_evidence(
     quote: Option<&str>,
     proposed: Option<&str>,
 ) -> AppResult<()> {
-    // 证据落笔即记版本：出自哪份文档的第几版（S3 版本对账与"证据过期"判定的依据）
-    // 冲突时补写表层谓词而非整行跳过：重抽命中的多是已有的 (事实, 分块) 对，
-    // DO NOTHING 会让存量证据永远填不上这一列。只在原值为空时补，不覆盖——
-    // 同一分块的同一条事实，第一次记下的说法就是它的说法
+    // Evidence records the version the moment it is written: which document and which version of
+    // it (the basis for S3 version reconciliation and for deciding evidence is "stale")
+    // On conflict we fill in the surface predicate rather than skipping the whole row:
+    // re-extraction mostly hits (fact, chunk) pairs that already exist, and DO NOTHING would
+    // leave existing evidence never able to fill this column in. We only fill it when the old
+    // value is empty, never overwrite -- for the same fact in the same chunk, the wording
+    // recorded first is its wording
     sqlx::query(
         "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
          SELECT $1, $2, $3, left($4, 120), c.document_id, c.doc_version FROM chunks c WHERE c.id = $2
@@ -339,14 +370,17 @@ pub async fn add_evidence(
     Ok(())
 }
 
-/// 所有图查询共用的取节点语句。
+/// The node-fetching statement shared by every graph query.
 ///
-/// **LEFT JOIN，不是 JOIN**（0009）。没判出类型的实体照样是图上的节点：它有名字、
-/// 有事实、有证据，缺的只是一个标签。内连接会让它整个消失——事实还在库里，
-/// 图上却查无此人，那是最难发现的一种数据丢失。
+/// **LEFT JOIN, not JOIN** (0009). An entity whose type was never decided is still a node on the
+/// graph: it has a name, it has facts, it has evidence, and all it lacks is a label. An inner
+/// join makes it disappear entirely -- the facts are still in the database while the graph has no
+/// such person, and that is the hardest kind of data loss to notice.
 ///
-/// key 与 label 留 NULL，**颜色和形状给缺省值**：前者是身份，没有就该说没有；
-/// 后者是画布必须拿到的东西，编不出来就没法渲染。灰色圆点正是「还没定」的样子
+/// key and label stay NULL, **while colour and shape get defaults**: the former is identity, and
+/// when there is none we should say so; the latter is something the canvas has to be given, and
+/// without making one up there is nothing to render. A grey dot is exactly what "not yet decided"
+/// looks like
 const NODE_SQL: &str = "SELECT e.id, e.canonical_name AS name, t.key AS type_key,
         t.label AS type_label,
         coalesce(t.color, '#94a3b8') AS color,
@@ -356,15 +390,18 @@ const NODE_SQL: &str = "SELECT e.id, e.canonical_name AS name, t.key AS type_key
          WHERE (f.subject_id = e.id OR f.object_id = e.id) AND f.invalidated_at IS NULL) AS degree
      FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id";
 
-/// 全图概览：按度数取 top N 实体及其间的边。
-/// `at`：服务端 as-of——只返回 T 时刻有效的边（起点不晚于 T 或未知，终点晚于 T 或开放）。
-/// 前端时间滑杆走本地过滤不传此参数；这是给 API/MCP 消费者的时间旅行入口。
-/// 图谱总览：度数最高的 `limit` 个节点，以及它们之间的边。
+/// Whole-graph overview: the top N entities by degree and the edges between them.
+/// `at`: server-side as-of -- returns only the edges valid at instant T (start no later than T or
+/// unknown, end later than T or open).
+/// The frontend time slider filters locally and does not pass this parameter; this is the
+/// time-travel entry point for API/MCP consumers.
+/// Graph overview: the `limit` nodes with the highest degree, and the edges between them.
 ///
-/// **一并回总数。** 画多少个是渲染的事，库里有多少是知识库的事，两者从前
-/// 在界面上被同一个数字表示——一个上万实体的库，右上角永远写着 150，而那
-/// 是上限不是规模。渲染上限本身是合理的（画一万个点没人看得懂），骗人的是
-/// 把它说成总数。
+/// **Returns the totals as well.** How many we draw is a rendering matter, how many are in the
+/// database is a knowledge-base matter, and the two used to be represented by the same number in
+/// the UI -- a database with tens of thousands of entities would forever read 150 in the top
+/// right corner, and that is a cap, not a size. The rendering cap itself is reasonable (nobody
+/// can make sense of ten thousand dots); what lies is calling it the total.
 pub async fn overview(
     pool: &PgPool,
     kb_id: Uuid,
@@ -382,9 +419,10 @@ pub async fn overview(
     let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let edges = edges_among(pool, kb_id, &ids, at).await?;
 
-    // 总数按与画布同一套口径数：合并掉的实体不算，作废的事实不算，
-    // 属性事实（宾语是字面值）画不出边所以也不算。口径不同的话，
-    // 「150 / 325」里那个 325 会跟用户在别处看到的数对不上
+    // The totals are counted by the same rules as the canvas: merged-away entities do not count,
+    // invalidated facts do not count, and attribute facts (object is a literal value) draw no
+    // edge so they do not count either. With different rules, the 325 in "150 / 325" would not
+    // match the number the user sees elsewhere
     let total_nodes: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM entities WHERE kb_id = $1 AND merged_into IS NULL",
     )
@@ -412,19 +450,23 @@ async fn edges_among(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // **派生边显式 UNION 进来。** 它们住在 `derived_facts`，不在 `facts` 里——
-    // 所以每一个想看到推理结果的读路径都得像这里一样写出来。忘了写的后果是
-    // 看不见派生，而不是把它们当成谁的断言（那正是分表买到的东西）。
+    // **Derived edges are UNIONed in explicitly.** They live in `derived_facts`, not in `facts`
+    // -- so every read path that wants to see inference results has to spell them out the way
+    // this one does. Forgetting to means you do not see the derivations, rather than mistaking
+    // them for somebody's assertion (which is exactly what the separate table bought us).
     //
-    // 图要它们，因为「这条边是推出来的」正是用户该看见的信息之一；`derived`
-    // 那一位让界面画得出区别，也让人整体过滤掉。
+    // The graph wants them, because "this edge was inferred" is one of the things the user ought
+    // to see; the `derived` bit lets the UI draw the difference, and lets people filter them all
+    // out.
     //
-    // 第三段是**幽灵边**（0017 §3）：推出来却没落地的派生，住在 `axiom_violations`
-    // 的 `detail` 里。它的 id 是违规的 id；`derived` 与 `blocked` 同时为 true，
-    // 界面据此让它跟着派生开关走、画成争议色往背景混的那一档。
+    // The third branch is the **ghost edges** (0017 §3): derivations that were inferred but never
+    // landed, living in `axiom_violations`'s `detail`. Their id is the violation's id; `derived`
+    // and `blocked` are both true, which is how the UI makes them follow the derivation toggle
+    // and draws them in the contested colour, in the grade that blends into the background.
     //
-    // 断言那一段多算一位 `contested`：有 open 的违规或时态冲突指着它。派生撞断言
-    // 时被撞的是 left；right 只是最后一条前提，它本身没有争议
+    // The assertion branch computes one extra bit, `contested`: an open violation or temporal
+    // conflict is pointing at it. When a derivation collides with an assertion the one hit is
+    // left; right is only the last premise, and is not itself contested
     let edges: Vec<GraphEdge> = sqlx::query_as(
         "SELECT f.id, f.subject_id AS source, f.object_id AS target,
                 COALESCE(r.key, fact_surface_predicate(f.id)) AS predicate,
@@ -491,7 +533,7 @@ async fn edges_among(
     Ok(edges)
 }
 
-/// 邻域扩展（BFS，最多 2 跳，节点数封顶）。
+/// Neighbourhood expansion (BFS, at most 2 hops, with a cap on the node count).
 pub async fn neighborhood(
     pool: &PgPool,
     kb_id: Uuid,
@@ -542,8 +584,9 @@ pub async fn neighborhood(
     Ok((nodes, edges))
 }
 
-/// 按名字找实体。**一并回总数**——「宁分勿合」本来就会造出一堆同名，
-/// 固定十条的时候，想找的那个可能根本不在这十条里而界面上看不出来。
+/// Finds entities by name. **Returns the total as well** -- "rather split than merge" produces a
+/// pile of same-named entities by design, and with a fixed ten rows the one you want may not be
+/// among those ten at all, with nothing in the UI to show it.
 pub async fn search_entities(
     pool: &PgPool,
     kb_id: Uuid,
@@ -574,7 +617,7 @@ pub async fn search_entities(
     Ok((nodes, total))
 }
 
-/// 实体详情：节点信息 + 事实时间线。
+/// Entity detail: the node info plus the fact timeline.
 pub async fn entity_detail(
     pool: &PgPool,
     kb_id: Uuid,
@@ -640,12 +683,16 @@ pub async fn entity_detail(
     Ok((node, facts))
 }
 
-/// 人工修正实体的类型或名字。返回 (改前快照, 改后状态)——调用方据此记审计台账。
+/// A human corrects an entity's type or name. Returns (snapshot before, state after) -- the
+/// caller records the audit ledger from that.
 ///
-/// 类型判错、名字抽歪，此前只能整库重抽这把大锤。抽取给的是初判，不是定论。
+/// A misjudged type or a badly extracted name used to leave only the sledgehammer of re-extracting
+/// the whole database. What extraction gives is a first judgement, not a verdict.
 ///
-/// 同名不拦：同类同名的两个实体是"宁分勿合"的正当产物（两个张伟），
-/// 拦下来就录不进第二个。碰撞由调用方查出后提示合并，见 `same_name_peers`。
+/// Same names are not blocked: two entities with the same type and the same name are a legitimate
+/// product of "rather split than merge" (two people both called Zhang Wei), and blocking it would
+/// make the second one impossible to record. The caller looks the collision up and offers a
+/// merge, see `same_name_peers`.
 pub async fn update_entity(
     pool: &PgPool,
     kb_id: Uuid,
@@ -671,7 +718,8 @@ pub async fn update_entity(
                     "Name cannot be empty",
                 ));
             }
-            // 与抽取侧同一上限：越过这条线的多半是整句被当成了名字
+            // The same cap as on the extraction side: anything past this line is usually a whole
+            // sentence that got taken for a name
             if n.chars().count() > 100 {
                 return Err(AppError::invalid(
                     "entity_name_too_long",
@@ -699,13 +747,16 @@ pub async fn update_entity(
     }
 
     sqlx::query(
-        // 改了类型才标 human——这个端点也用来改名字，只改名不该顺手把类型
-        // 的来源盖成人工。`$3 IS NULL` 在这个接口里表示「本次没提供类型」，
-        // 不是「把类型清空」：路由层要求两个字段至少给一个，给不出三态。
+        // Only a type change marks it human -- this endpoint is also used to rename, and a
+        // rename alone should not casually stamp the type's provenance as human. In this
+        // interface `$3 IS NULL` means "no type was supplied this time", not "clear the type":
+        // the routing layer requires at least one of the two fields, so it cannot give three
+        // states.
         //
-        // 于是有一件今天做不到的事：0009 之后「没有类型」可能是人的决定
-        //（看过了，本体里没有合适的类），而这个接口表达不了它。要补得让
-        // 请求体区分「未提供」与「显式置空」，那是另一件事
+        // Which leaves one thing that cannot be done today: after 0009, "no type" may be a
+        // human's decision (they looked, and the ontology has no suitable class), and this
+        // interface cannot express that. Fixing it means having the request body distinguish
+        // "not supplied" from "explicitly cleared", and that is a separate job
         "UPDATE entities
          SET type_id = COALESCE($3, type_id),
              canonical_name = COALESCE($4, canonical_name),
@@ -720,8 +771,10 @@ pub async fn update_entity(
     .execute(pool)
     .await?;
 
-    // 消歧后缀依赖名字分组与类型标签（类型标签是它的兜底值），两者都刚被改过。
-    // 改名要刷两组：旧名那组可能掉到 1 个（后缀该清掉），新名那组可能涨到 2 个。
+    // The disambiguator suffix depends on the name grouping and on the type label (the type
+    // label is its fallback value), and both were just changed. A rename has to refresh two
+    // groups: the old name's group may drop to 1 (where the suffix should be cleared) and the new
+    // name's group may rise to 2.
     if let Some(n) = new_name.filter(|n| !n.eq_ignore_ascii_case(&before.name)) {
         crate::resolution::refresh_disambiguators(pool, kb_id, &before.name).await?;
         crate::resolution::refresh_disambiguators(pool, kb_id, n).await?;
@@ -737,8 +790,9 @@ pub async fn update_entity(
     Ok((before, after))
 }
 
-/// 与给定实体同名（不区分大小写）的其他存活实体——用于改名后提示"是否合并"。
-/// 只报告，不阻断：判定它们是否真是同一个，是人的事。
+/// Other live entities with the same name (case-insensitive) as the given one -- used to ask
+/// "merge them?" after a rename.
+/// Reports only, never blocks: deciding whether they really are the same one is a human's job.
 pub async fn same_name_peers(
     pool: &PgPool,
     kb_id: Uuid,
@@ -756,7 +810,7 @@ pub async fn same_name_peers(
     .map_err(Into::into)
 }
 
-/// 低置信 live 事实（审核页）。
+/// Low-confidence live facts (the review page).
 pub async fn low_confidence_facts(
     pool: &PgPool,
     kb_id: Uuid,
@@ -788,9 +842,12 @@ pub async fn low_confidence_facts(
     Ok(rows)
 }
 
-/// "证据全部停留在旧版"的现行事实（S3 第三刀：文档新版没再确认的知识）。
-/// 判定纯派生自 chunk 存活性——认领机制保证未变段落的证据不被误伤；
-/// 绝不自动删除（没再提 ≠ 不成立），删除/闭合权在 Review 的人手里。
+/// Live facts whose "evidence all stays on an old version" (the third cut of S3: knowledge a new
+/// version of the document no longer confirms).
+/// The decision derives purely from chunk liveness -- the claiming mechanism guarantees evidence
+/// on unchanged paragraphs is not hit by mistake; nothing is ever deleted automatically (no
+/// longer mentioned != no longer true), and the power to delete or close stays with the human in
+/// Review.
 pub async fn stale_facts(
     pool: &PgPool,
     kb_id: Uuid,
@@ -824,7 +881,7 @@ pub async fn stale_facts(
     Ok(rows)
 }
 
-/// 人工确认低置信事实：置信度提到 1.0。
+/// A human confirms a low-confidence fact: confidence is raised to 1.0.
 pub async fn confirm_fact(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResult<()> {
     let res = sqlx::query(
         "UPDATE facts SET confidence = 1.0 WHERE id = $1 AND kb_id = $2 AND invalidated_at IS NULL",
@@ -836,12 +893,14 @@ pub async fn confirm_fact(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResul
     if res.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
-    // 从前这里还有一段：确认 `mapped_to` 事实时把同 (概念, 源) 的旧映射作废。
-    // 映射已搬出账本（0011，`concept_mappings` 自己管唯一性），那段 SQL 恒匹配零行，删了。
+    // There used to be another block here: confirming a `mapped_to` fact invalidated the old
+    // mapping for the same (concept, source). Mappings have moved out of the ledger (0011,
+    // `concept_mappings` manages uniqueness itself), so that SQL always matched zero rows and was
+    // deleted.
     Ok(())
 }
 
-/// 人工否决事实：作废（账本 append-only，不 DELETE）。
+/// A human rejects a fact: invalidate it (the ledger is append-only, no DELETE).
 pub async fn reject_fact(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResult<()> {
     let res = sqlx::query(
         "UPDATE facts SET invalidated_at = now()
@@ -857,7 +916,8 @@ pub async fn reject_fact(pool: &PgPool, kb_id: Uuid, fact_id: Uuid) -> AppResult
     Ok(())
 }
 
-/// 反向证据链：该文档每个分块抽出了哪些 live 事实（文档查看器右栏）。
+/// The evidence chain in reverse: which live facts each chunk of this document produced (the
+/// right-hand column of the document viewer).
 pub async fn document_extractions(
     pool: &PgPool,
     document_id: Uuid,
@@ -884,8 +944,10 @@ pub async fn document_extractions(
     Ok(rows)
 }
 
-/// 证据回放路径：不过滤 superseded——它的职责就是能看旧版。
-/// stale = 证据版本落后于文档当前版本（UI 标 "from v{n}"）。
+/// The evidence replay path: does not filter superseded out -- its whole job is being able to see
+/// old versions.
+/// stale = the evidence version lags the document's current version (the UI marks it "from
+/// v{n}").
 pub async fn fact_evidence(pool: &PgPool, fact_id: Uuid) -> AppResult<Vec<EvidenceView>> {
     let rows: Vec<EvidenceView> = sqlx::query_as(
         "SELECT fe.quote, fe.proposed_predicate, fe.chunk_id, c.document_id, d.filename, c.seq,
@@ -904,12 +966,15 @@ pub async fn fact_evidence(pool: &PgPool, fact_id: Uuid) -> AppResult<Vec<Eviden
     Ok(rows)
 }
 
-/// 清空 KB 的整个图层（Rebuild graph 的清算语义）：实体/事实/证据/待审/冲突/合并
-/// 记录全删，本体（类与关系定义）与文档/分块/嵌入保留。
+/// Wipes a KB's entire graph layer (the settlement semantics of Rebuild graph): entities /
+/// facts / evidence / review queue / conflicts / merge records are all deleted, while the
+/// ontology (class and relation definitions) and documents / chunks / embeddings are kept.
 ///
-/// 刻意保留两样：决策台账（audit_events，快照自包含，图没了记录仍可读）与裁决
-/// 缓存（resolution_verdicts，重建后同名对重现直接命中，省一批 LLM 调用）。
-/// 返回 (删除实体数, 删除事实数)。
+/// Two things are kept deliberately: the decision ledger (audit_events -- its snapshots are
+/// self-contained, so the records stay readable once the graph is gone) and the verdict cache
+/// (resolution_verdicts -- after a rebuild the same-name pairs reappear and hit it directly,
+/// saving a batch of LLM calls).
+/// Returns (entities deleted, facts deleted).
 pub async fn purge_graph(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64)> {
     let mut tx = pool.begin().await?;
     let (entity_count,): (i64,) = sqlx::query_as("SELECT count(*) FROM entities WHERE kb_id = $1")
@@ -921,8 +986,9 @@ pub async fn purge_graph(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64)> {
         .fetch_one(&mut *tx)
         .await?;
 
-    // FK 多为 CASCADE，但两处自引用是 NO ACTION：先解引用再删，顺序显式写出
-    // （这段本身就是"图层由什么构成"的定义）
+    // Most FKs are CASCADE, but two self-references are NO ACTION: dereference first, then
+    // delete, with the order spelled out (this block is itself the definition of "what the graph
+    // layer is made of")
     for sql in [
         "DELETE FROM fact_conflicts WHERE kb_id = $1",
         "DELETE FROM resolution_reviews WHERE kb_id = $1",
@@ -932,7 +998,7 @@ pub async fn purge_graph(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64)> {
         "DELETE FROM facts WHERE kb_id = $1",
         "UPDATE entities SET merged_into = NULL WHERE kb_id = $1",
         "DELETE FROM entities WHERE kb_id = $1",
-        // 未匹配统计由抽取重新累积
+        // The unmatched-ontology counts get accumulated again by extraction
         "DELETE FROM ontology_misses WHERE kb_id = $1",
     ] {
         sqlx::query(sql).bind(kb_id).execute(&mut *tx).await?;
@@ -941,18 +1007,23 @@ pub async fn purge_graph(pool: &PgPool, kb_id: Uuid) -> AppResult<(i64, i64)> {
     Ok((entity_count, fact_count))
 }
 
-/// 实体的认知变更历史（记录时间轴）。
+/// An entity's history of epistemic change (the record-time axis).
 ///
-/// 与 entity_detail 的根本差别：那里 `invalidated_at IS NULL`，只答"现在认为是什么"；
-/// 这里不过滤，答"我们何时这么认为、又何时改了主意"。数据一直都在——账本
-/// append-only，修正是插新行 + 标旧行作废，从不覆盖。
+/// The fundamental difference from entity_detail: there it is `invalidated_at IS NULL` and it
+/// only answers "what do we believe now"; here nothing is filtered and it answers "when did we
+/// believe this, and when did we change our mind". The data was always there -- the ledger is
+/// append-only, a correction inserts a new row + marks the old one invalidated, and never
+/// overwrites.
 ///
-/// 一行事实最多产出两个事件：写入（asserted / corrected）与作废（rejected）。
-/// 有后继修正行的作废不单独记——那次死亡已由后继那条 corrected 解释。
+/// One fact row produces at most two events: the write (asserted / corrected) and the
+/// invalidation (rejected). An invalidation that has a successor correction row is not recorded
+/// separately -- that death is already explained by the successor's corrected event.
 ///
-/// 归因：审计台账里 fact.close 的 target 是**被闭合的旧行**，而修正行是新插的另一行，
-/// 所以按 COALESCE(supersedes, id) 回查；冲突裁决的 target 是 conflict 行，再绕一跳。
-/// 查不到审计记录 = 引擎自动（抽取写入或时态对账），actor 为 NULL。
+/// Attribution: in the audit ledger the target of fact.close is **the old row that was closed**,
+/// while the correction row is a different, newly inserted row, so we look it up by
+/// COALESCE(supersedes, id); for conflict adjudication the target is the conflict row, one more
+/// hop away. No audit record found = the engine did it (an extraction write or temporal
+/// reconciliation), and actor is NULL.
 pub async fn entity_history(
     pool: &PgPool,
     kb_id: Uuid,
@@ -973,8 +1044,9 @@ pub async fn entity_history(
                    CASE WHEN ef.supersedes IS NULL THEN 'asserted' ELSE 'corrected' END AS kind
             FROM ef
             UNION ALL
-            -- 作废且无后继 = 被推翻……除非它是被并进了另一条断言。那种情形下
-            -- 内容一字未少，说成「撤回」就是界面在陈述一件没发生的事
+            -- Invalidated with no successor = overturned ... unless it was merged into another
+            -- assertion. In that case not a word of content was lost, and calling it \"withdrawn\"
+            -- is the UI stating something that never happened
             SELECT ef.*, ef.invalidated_at AS at,
                    CASE WHEN EXISTS (SELECT 1 FROM fact_adoptions fa
                                      WHERE fa.old_fact_id = ef.id AND fa.mode = 'merged'
@@ -984,11 +1056,13 @@ pub async fn entity_history(
             WHERE ef.invalidated_at IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM facts s WHERE s.supersedes = ef.id)
         ),
-        -- 改类不是事实：没有谓词、没有对方、没有方向。它来自 entity_retypes，
-        -- 一行最多产出两个事件——改动本身，以及撤销。
+        -- A retype is not a fact: no predicate, no other party, no direction. It comes from
+        -- entity_retypes, and one row produces at most two events -- the change itself, and the
+        -- revert.
         --
-        -- **撤销过的照样显示。** 读成「改过、又撤了」，不是没发生过。同一类错
-        -- 这仓库栽过两次（#37；并入被读成撤回），所以这不是防御性编程
+        -- **A reverted retype is still shown.** It reads as \"changed, then reverted\", not as
+        -- never having happened. This repo has fallen for that same class of mistake twice
+        -- (#37; a merge read as a withdrawal), so this is not defensive programming
         rt AS (
             SELECT r.created_at AS at, 'retyped' AS kind, r.actor_id,
                    tf.label AS from_type_label, tt.label AS to_type_label
@@ -1021,13 +1095,14 @@ pub async fn entity_history(
              FROM audit_events a
              LEFT JOIN users u ON u.id = a.actor_id
              WHERE a.kb_id = $1
-               -- 断言由抽取写入，从来不是人的决定：归因只问修正与推翻这两类事件，
-               -- 否则后发生的人工裁决会被错安到当初那条断言头上
+               -- Assertions are written by extraction and are never a human's decision:
+               -- attribution only asks about the corrected and overturned kinds of event,
+               -- otherwise a later human adjudication gets pinned on the original assertion
                AND ev.kind <> 'asserted'
                AND a.action = ANY(CASE ev.kind
                      WHEN 'corrected' THEN
                        ARRAY['fact.close', 'conflict.close_old', 'ontology.predicate_adopted']
-                     -- 并入只可能由采纳造成，不会是 Review 里的拒绝
+                     -- A merge can only come from an adoption, never from a Review rejection
                      WHEN 'merged' THEN ARRAY['ontology.predicate_adopted']
                      ELSE ARRAY['fact.reject', 'conflict.reject_new',
                                 'ontology.adoption_reverted'] END)
@@ -1035,9 +1110,10 @@ pub async fn entity_history(
                     OR a.target_id IN (SELECT c.id FROM fact_conflicts c
                                        WHERE c.old_fact_id = COALESCE(ev.supersedes, ev.id)
                                           OR c.new_fact_id = ev.id)
-                    -- 采纳与撤销都记在关系类型上、一次动作改一批事实，
-                    -- 靠 fact_adoptions 精确关联到具体哪几条（corrected 事件
-                    -- 是新行、merged 是旧行，两头都认）
+                    -- Adoption and revert are both recorded against the relation type, and one
+                    -- action rewrites a batch of facts, so fact_adoptions is what ties them to
+                    -- exactly which rows (a corrected event is the new row, a merged one the old
+                    -- row; both ends are accepted)
                     OR (a.action IN ('ontology.predicate_adopted',
                                      'ontology.adoption_reverted')
                         AND EXISTS (SELECT 1 FROM fact_adoptions fa
@@ -1073,7 +1149,7 @@ pub async fn entity_history(
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    // 总数把改类那一支也算上，否则分页会少一截
+    // The total counts the retype branch too, otherwise pagination comes up short
     let (total,): (i64,) = sqlx::query_as(&format!(
         "{EVENTS} SELECT (SELECT count(*) FROM ev) + (SELECT count(*) FROM rt)"
     ))
@@ -1084,15 +1160,18 @@ pub async fn entity_history(
     Ok((rows, total))
 }
 
-/// 一段记录时间窗口里，全库的认知变更。
+/// Every epistemic change across the whole database within one record-time window.
 ///
-/// **窗口开在认知轴上**：`since`/`until` 比的是 recorded_at 与 invalidated_at，
-/// 不是 valid_from/valid_to。这是与 `entity_facts(at)` 唯一也是全部的区别——
-/// 那个问"某时刻世界什么样"，这个问"某段时间里我们改了什么主意"。两者查同一张表、
-/// 用不同的列，混起来会安静地给出一个看着合理的错答案。
+/// **The window opens on the epistemic axis**: `since`/`until` are compared against recorded_at
+/// and invalidated_at, not valid_from/valid_to. That is the only difference from
+/// `entity_facts(at)`, and the whole of it -- that one asks "what did the world look like at
+/// instant T", this one asks "what did we change our mind about during this period". The two
+/// query the same table using different columns, and mixing them up quietly gives a wrong answer
+/// that looks reasonable.
 ///
-/// 事件推导与 `entity_history` 同源（见那里的注释）：一条事实行最多产出两个事件，
-/// 且已被后继修正的死亡不重复记。
+/// Event derivation has the same source as `entity_history` (see the comments there): one fact
+/// row produces at most two events, and a death already corrected by a successor is not recorded
+/// twice.
 pub async fn graph_changes(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1102,8 +1181,9 @@ pub async fn graph_changes(
     kinds: Option<&[String]>,
     limit: i64,
 ) -> AppResult<Vec<GraphChange>> {
-    // 两个分支各自按**自己那根时间列**开窗，而不是先union再过滤：
-    // 一条 2 月写入、8 月被推翻的事实，在"3–4 月"窗口里两个事件都不该出现
+    // Each branch opens the window on **its own time column** rather than unioning first and
+    // filtering after: a fact written in February and overturned in August should have neither
+    // event show up in a "March-April" window
     const EVENTS: &str = "
         WITH ev AS (
             SELECT f.id, f.subject_id, f.predicate_id, f.object_id, f.object_value,
@@ -1161,31 +1241,37 @@ pub async fn graph_changes(
 }
 
 // ---------------------------------------------------------------------------
-// 谓词消解：把没有谓词的事实认领回本体
+// Predicate resolution: claiming facts that have no predicate back into the ontology
 // ---------------------------------------------------------------------------
 
-// 视图类型 ProposedPredicate 定义在 utopia-core::models（store 不直接依赖 serde）
+// The view type ProposedPredicate is defined in utopia-core::models (store does not depend on
+// serde directly)
 
-/// 没有谓词的事实上，原文用过哪些说法。
+/// Which wordings the source used on the facts that have no predicate.
 ///
-/// 这是本体扩展建议的证据基础——比 `ontology_misses` 的纯计数强的地方在于：
-/// 它连着具体事实，所以采纳一个说法时能直接说"将重新归类 57 条"并真的去改。
+/// This is the evidential basis for ontology-extension suggestions -- what it has over
+/// `ontology_misses`'s bare counts is that it is connected to the actual facts, so adopting a
+/// wording can say outright "will reclassify 57 rows" and really go and change them.
 pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<ProposedPredicate>> {
     Ok(sqlx::query_as(
-        // **普遍程度从全量证据里数，不从积压里数。**
+        // **Prevalence is counted from all the evidence, not from the backlog.**
         //
-        // 下面那些 WHERE 把行集收窄到「还没有谓词、还活着、宾语是实体」
-        // ——那是**采纳要改写的东西**，`fact_count` 该这么数。但 `doc_count`
-        // 回答的是另一个问题：这个说法在语料里有多普遍。拿残渣去数它会系统性
-        // 偏低，而且越用越低——说法一旦被采纳、被谓词匹配接住、或被修正作废，
-        // 它的行就离开积压了。一篇一篇往里灌的库尤其吃亏：每轮搬走一批，
-        // 剩下的永远攒不够两篇，本体于是永远长不起来。
+        // The WHEREs below narrow the row set to "has no predicate yet, still alive, object is an
+        // entity" -- that is **what adoption is going to rewrite**, and that is how `fact_count`
+        // should be counted. But `doc_count` answers a different question: how prevalent is this
+        // wording in the corpus. Counting it off the leftovers is systematically low, and gets
+        // lower the more it is used -- once a wording is adopted, caught by predicate matching,
+        // or invalidated by a correction, its rows leave the backlog. A database fed one document
+        // at a time suffers worst: every round carries a batch away, what is left never
+        // accumulates two documents, and so the ontology never grows.
         //
-        // 实测（ai-timeline 348 块）：两种口径下 8 个说法分处门槛两侧，
-        // 按积压数是「只在 1 篇」、按全量数是「≥2 篇」。
+        // Measured (ai-timeline, 348 chunks): under the two ways of counting, 8 wordings fall on
+        // opposite sides of the threshold -- "in only 1 document" by the backlog count, "in ≥2
+        // documents" by the full count.
         //
-        // 走 CTE 而不是相关子查询：后者每组重扫一遍证据表，同一份数据上
-        // 360ms 对 7ms。这个函数每次 Suggest 和每次自动扩本体都要跑。
+        // Via a CTE rather than a correlated subquery: the latter rescans the evidence table once
+        // per group, 360ms against 7ms on the same data. This function runs on every Suggest and
+        // on every automatic ontology extension.
         "WITH spread AS (
              SELECT e.proposed_predicate AS form,
                     count(DISTINCT e.document_id) AS doc_count
@@ -1210,11 +1296,13 @@ pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Pr
          JOIN spread sp ON sp.form = fe.proposed_predicate
          WHERE f.kb_id = $1 AND f.predicate_id IS NULL
            AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
-           -- 字面值宾语的不算：它们同样没有谓词、也带原文说法，但要的是
-           -- 一个属性而不是一个关系。混进来提案就会照着建关系，然后
-           -- `founding_date` 变成一条指向「2015」的边——正是这条路要修掉的东西
+           -- Literal-value objects do not count: they also have no predicate and also carry the
+           -- source's wording, but what they want is an attribute, not a relation. Let them in
+           -- and the suggestion builds a relation to match, and then `founding_date` becomes an
+           -- edge pointing at \"2015\" -- exactly the thing this path is here to fix
            AND f.object_id IS NOT NULL
-           -- 用户拒绝过的说法不再出现在候选里（人工与自动两条路都据此绕开）
+           -- Wordings the user has dismissed no longer appear among the candidates (both the
+           -- manual and the automatic path steer around them on this basis)
            AND NOT EXISTS (SELECT 1 FROM ontology_misses m
                            WHERE m.kb_id = $1 AND m.kind = 'relation_type'
                              AND m.key = fe.proposed_predicate AND m.dismissed_at IS NOT NULL)
@@ -1226,21 +1314,25 @@ pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Pr
     .await?)
 }
 
-/// 每个待认领说法出现在**哪些文档**里。
+/// Which **documents** each wording waiting to be claimed appears in.
 ///
-/// [`proposed_predicates`] 已经给了 `doc_count`，但采纳那条路要先按屈折基把说法
-/// 归并（`sued` 与 `sues` 是一个关系），归并之后的篇数是**并集**而不是相加——
-/// 同一篇文档完全可能两种写法都用过，相加就成了重复计数，一篇文档能把一个说法
-/// 顶过「≥2 篇」的门槛。
+/// [`proposed_predicates`] already gives a `doc_count`, but the adoption path first folds
+/// wordings together by inflectional stem (`sued` and `sues` are one relation), and the document
+/// count after folding is a **union**, not a sum -- one document may perfectly well have used
+/// both spellings, so adding them up double-counts, and a single document could push a wording
+/// over the "≥2 documents" threshold.
 ///
-/// **不筛兜底谓词。** 这条查询与 [`proposed_predicates`] 回答的是两个问题：
-/// 那条问「还有哪些说法等着被采纳」，看的是积压；这条问「这个说法有多普遍」，
-/// 看的是全量证据，条件与它内部那个 `spread` CTE 一致。
+/// **The fallback predicate is not filtered on.** This query and [`proposed_predicates`] answer
+/// two different questions: that one asks "which wordings are still waiting to be adopted" and
+/// looks at the backlog; this one asks "how prevalent is this wording" and looks at all the
+/// evidence, with conditions matching that function's internal `spread` CTE.
 ///
-/// 第一版照抄了 `rt.key = 'related_to'`（当时还有那个兜底关系），理由写的是「两处条件要一致」——错的。
-/// 那样数出来的还是残渣：说法一旦被采纳、被谓词匹配接住、或被修正作废，
-/// 它的行就离开积压，篇数随之下降。一篇一篇往里灌的库因此永远攒不够两篇。
-/// 测试当场抓住了（两篇里只回来一篇）。
+/// The first version copied `rt.key = 'related_to'` over (the fallback relation still existed
+/// then), with the reason given as "the conditions in the two places have to match" -- which was
+/// wrong. What that counts is still the leftovers: once a wording is adopted, caught by predicate
+/// matching, or invalidated by a correction, its rows leave the backlog and the document count
+/// drops with them. A database fed one document at a time therefore never accumulates two
+/// documents. The test caught it on the spot (only one of the two documents came back).
 pub async fn proposed_predicate_documents(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1261,25 +1353,30 @@ pub async fn proposed_predicate_documents(
     .await?)
 }
 
-/// 把由 `forms` 认出来的无谓词事实改写到 `predicate_id`。
-/// 返回 (批次 id, 改写条数)——批次 id 是撤销的把手。
+/// Rewrites the predicate-less facts identified by `forms` onto `predicate_id`.
+/// Returns (batch id, number of rows rewritten) -- the batch id is the handle for undoing it.
 ///
-/// **追加而非原地改**：插入带 `supersedes` 的新行并作废旧行，与人工纠正、
-/// 时态闭合走同一条路——认知变更本身是信息，实体历史里读得到
-/// "先记成 related to，后精化成 available on"。
+/// **Appends rather than editing in place**: inserts a new row carrying `supersedes` and
+/// invalidates the old one, the same path human corrections and temporal closure take -- the
+/// epistemic change is itself information, and entity history lets you read "first recorded as
+/// related to, later refined to available on".
 ///
-/// 只改写说法**全部**落在 `forms` 内的事实：一条事实可能积累多种说法
-/// （甲块 "runs on"、乙块 "optimized for"），只认领了其中一种就改写等于替
-/// 另一种也做了决定。实测这类事实占比不到 1%，宁可漏也不猜。
+/// Only facts whose wordings **all** fall inside `forms` are rewritten: one fact may accumulate
+/// several wordings (chunk A says "runs on", chunk B says "optimized for"), and rewriting when
+/// only one of them has been claimed amounts to deciding for the other one too. Measured, facts
+/// like that are under 1% -- better to miss them than to guess.
 ///
-/// 每条去向都写进 `fact_adoptions`。`supersedes` 一个指针不够用——目标断言
-/// 已存在时走的是"并入"，旧行被作废却没有后继，于是既撤不回来、实体历史
-/// 又会把它判成 rejected 而对外宣称"这条被撤回了"（它其实一字未少地并进了
-/// 另一条）。
-/// `swap = true`：这些说法是目标关系的**被动形**，改写时主宾要对调。
+/// Every destination is written into `fact_adoptions`. One `supersedes` pointer is not enough --
+/// when the target assertion already exists the path taken is "merge", the old row is invalidated
+/// with no successor, and so it can neither be undone, nor kept from entity history judging it
+/// rejected and announcing to the world that "this one was withdrawn" (when in fact it was merged
+/// into another one without losing a word).
+/// `swap = true`: these wordings are the **passive form** of the target relation, so subject and
+/// object have to be exchanged in the rewrite.
 ///
-/// `X produced_by Y` 与 `Y produces X` 是同一条边。不对调就会在图上多出一条
-/// 反着的箭头，而且它跟正向那些永远合不到一起——同一件事分在两个方向上。
+/// `X produced_by Y` and `Y produces X` are the same edge. Without the exchange the graph grows
+/// an extra arrow pointing the other way, and it can never be brought together with the
+/// forward-facing ones -- the same thing, split across two directions.
 pub async fn adopt_proposed_predicates(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1290,35 +1387,41 @@ pub async fn adopt_proposed_predicates(
     adopt(pool, kb_id, predicate_id, AdoptTargets::ByForm(forms), swap).await
 }
 
-/// 一次采纳的账。`left_off` 必须往上传：改写了 20 条、留下 3 条，只报前半句是报喜不报忧。
+/// The books for one adoption. `left_off` has to be passed up: rewrote 20, left 3 behind --
+/// reporting only the first half is reporting the good news and hiding the bad.
 #[derive(Debug, Clone, Copy)]
 pub struct Adopted {
     pub batch_id: Uuid,
-    /// 改写过去的条数
+    /// How many rows were rewritten across
     pub moved: u32,
-    /// 签名两边都对不上、**没有**挂上谓词的条数（#190）。它们照旧留在空谓词上，
-    /// 原文说法还在证据里——与抽取遇到同样情形的处置一致
+    /// How many matched the signature on neither side and so did **not** get a predicate
+    /// attached (#190). They stay on the empty predicate as before, with the source's wording
+    /// still in the evidence -- the same handling extraction applies in the same situation
     pub left_off: u32,
-    /// 按签名对调了主宾的条数。
+    /// How many had subject and object exchanged according to the signature.
     ///
-    /// **掰正不该静默。** 抽取那条路每掰一次就落一条 `direction_corrected`
-    /// 丢弃信号（#138 的原话是「绝不静默」：用可能错的声明驱动的自动动作，
-    /// 留痕才不属于 0001 判据 2 反对的那一类）。采纳走的是同一道判断，
-    /// 也该说出来自己动了几条，否则台账上只剩「改写了 N 条」，看不出其中
-    /// 有几条是被本体掉了个头的
+    /// **Straightening something out should not be silent.** On the extraction path, every
+    /// straightening drops a `direction_corrected` discard signal (#138 puts it as "never
+    /// silently": an automatic action driven by a possibly wrong declaration only stays out of
+    /// the category criterion 2 of 0001 objects to if it leaves a trace). Adoption makes the same
+    /// judgement, so it should also say how many rows it moved, otherwise all the ledger has left
+    /// is "rewrote N rows" and you cannot see how many of those the ontology turned around
     pub corrected: u32,
 }
 
-/// 要改写哪些事实，以及新行的宾语从哪来。
+/// Which facts to rewrite, and where the new row's object comes from.
 pub enum AdoptTargets<'a> {
-    /// 关系那一路：按表层说法去找，宾语原样搬走。
+    /// The relation route: found by surface wording, with the object carried over as it is.
     ByForm(&'a [String]),
-    /// 属性那一路：调用方已经挑好事实、并把值按 datatype 归一化过。
+    /// The attribute route: the caller has already picked the facts and normalised the values
+    /// according to the datatype.
     ///
-    /// **归一化必须在调用方做**：那套规则（"2015" → 日期、"1,200" → 数字）
-    /// 住在抽取模块，store 够不着也不该够得着。更要紧的是它会**失败**——
-    /// 一个换算不出来的值不该硬塞进一个日期属性里，那条事实宁可继续没有
-    /// 谓词（原词还在证据里）。所以由调用方筛完再交回来。
+    /// **Normalisation has to happen in the caller**: that set of rules ("2015" -> a date,
+    /// "1,200" -> a number) lives in the extraction module, which the store cannot reach and
+    /// should not be able to reach. More importantly, it can **fail** -- a value that cannot be
+    /// converted should not be forced into a date attribute, and that fact would rather go on
+    /// having no predicate (the original word is still in the evidence). So the caller filters
+    /// first and hands the result back.
     WithValues(&'a [(Uuid, serde_json::Value)]),
 }
 
@@ -1345,9 +1448,10 @@ async fn adopt(
                 "SELECT f.id, f.subject_id, f.object_id, f.object_value
                  FROM facts f
                  WHERE f.kb_id = $1 AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
-                   -- **只碰宾语是实体的。** 同一个说法可能既有指向实体的事实
-                   -- 又有带字面值的（location 两种都用），后者归属性那条路：
-                   -- 把它改挂到一条关系上，那个值就再也不是值了
+                   -- **Only touch the ones whose object is an entity.** The same wording may
+                   -- have both facts pointing at entities and facts carrying literal values
+                   -- (location uses both), and the latter belong to the attribute route:
+                   -- rehang one onto a relation and that value is no longer a value
                    AND f.object_id IS NOT NULL
                    AND EXISTS (SELECT 1 FROM fact_evidence e
                                WHERE e.fact_id = f.id AND e.proposed_predicate = ANY($2))
@@ -1365,8 +1469,9 @@ async fn adopt(
             if items.is_empty() {
                 return Ok(nothing);
             }
-            // 主语要从库里读回来（调用方给的是 fact_id 与新值），顺带确认这些
-            // 事实还活着——挑选与采纳之间可能隔着一次重抽
+            // The subject has to be read back from the database (the caller gives fact_id and
+            // the new value), which also confirms these facts are still alive -- there may have
+            // been a re-extraction between the picking and the adoption
             let ids: Vec<Uuid> = items.iter().map(|(id, _)| *id).collect();
             let live: Vec<(Uuid, Uuid)> = sqlx::query_as(
                 "SELECT id, subject_id FROM facts
@@ -1390,17 +1495,22 @@ async fn adopt(
     let mut left_off = 0u32;
     let mut corrected = 0u32;
     for (old_id, subject_id, object_id, object_value) in targets {
-        // 被动形改写：主宾对调。字面值宾语的事实换不了（值不能当主语），
-        // 而 ByForm 那条查询本来就只取 object_id 非空的，所以这里只可能是实体宾语
+        // Passive-form rewrite: exchange subject and object. Facts with a literal-value object
+        // cannot be exchanged (a value cannot be a subject), and the ByForm query only takes rows
+        // where object_id is non-null anyway, so here it can only be an entity object
         let (subject_id, object_id) = match (swap, object_id) {
             (true, Some(o)) => (o, Some(subject_id)),
             _ => (subject_id, object_id),
         };
-        // **挂谓词之前过一遍签名**（#190）。抽取写入时按 domain 掰正方向或留空，
-        // 而采纳是第二条写谓词的路——从前直接把谓词挂回去，实测把违反率从 0 抬到
-        // 12.3%，全在包关系上。同一道判断（`ontology::judge_direction`），同样三种
-        // 结果：合就挂，主语不合宾语合就对调着挂，都不合就**不挂**——那条事实留在
-        // 空谓词上，原文说法还在证据里，与抽取遇到同样情形的处置一致
+        // **Run the signature check before attaching a predicate** (#190). Extraction writes
+        // straighten the direction by domain or leave it empty, and adoption is the second path
+        // that writes predicates -- it used to attach the predicate straight back, which measured
+        // out at raising the violation rate from 0 to 12.3%, all of it on containment relations.
+        // The same judgement (`ontology::judge_direction`), the same three outcomes: if it fits,
+        // attach it; if the subject does not fit but the object does, attach it exchanged; if
+        // neither fits, **do not attach** -- that fact stays on the empty predicate with the
+        // source's wording still in the evidence, the same handling extraction applies in the
+        // same situation
         let (subject_id, object_id) = match object_id {
             Some(o) => {
                 match crate::ontology::judge_direction(pool, predicate_id, subject_id, o).await? {
@@ -1420,11 +1530,14 @@ async fn adopt(
             None => (subject_id, None),
         };
         let mut tx = pool.begin().await?;
-        // 目标断言可能已存在（同主宾已有一条真关系）：那就并进去，别造重复。
+        // The target assertion may already exist (the same subject and object already have a
+        // real relation): then merge into it, do not create a duplicate.
         //
-        // **宾语两侧都要比。** 字面值事实的 object_id 都是 NULL，只比它就等于
-        // 把同主同谓的所有值当成同一条断言——(星云科技, founding_date, 2015) 与
-        // (星云科技, founding_date, 2016) 会被并成一条，后一个值静默消失
+        // **Both sides of the object have to be compared.** object_id is NULL on every
+        // literal-value fact, so comparing only that amounts to treating every value under the
+        // same subject and predicate as one assertion -- (Nebula Tech, founding_date, 2015) and
+        // (Nebula Tech, founding_date, 2016) would be merged into one, and the second value would
+        // silently disappear
         let existing: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM facts
              WHERE kb_id = $1 AND subject_id = $2 AND predicate_id = $3
@@ -1444,9 +1557,11 @@ async fn adopt(
             Some((id,)) => (id, ADOPT_MERGED),
             None => {
                 let id = Uuid::now_v7();
-                // 宾语显式绑定而不是从旧行复制：属性那一路的新值是归一化过的
-                //（"2015" → 日期），照抄旧行就等于把没换算的原值塞进去。
-                // 关系那一路绑的就是旧行的值，行为一字不变
+                // The object is bound explicitly rather than copied from the old row: the new
+                // value on the attribute route has been normalised ("2015" -> a date), and
+                // copying the old row would mean stuffing the unconverted original value in.
+                // On the relation route what is bound is the old row's value, so the behaviour
+                // does not change by a word
                 let inserted: Option<(Uuid,)> = sqlx::query_as(
                     "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id, object_value,
                                         valid_from, valid_from_precision,
@@ -1462,13 +1577,15 @@ async fn adopt(
                 .bind(predicate_id)
                 .bind(object_id)
                 .bind(&object_value)
-                // 主语也显式绑定，不再从旧行复制——被动形改写要的正是换掉它。
-                // 第一版漏了这一处：局部变量换了、SQL 里还写着 subject_id，
-                // 于是宾语换了、主语没换，凭空造出一条 `OpenAI produces OpenAI`
+                // The subject is bound explicitly too, no longer copied from the old row --
+                // replacing it is exactly what a passive-form rewrite is for. The first version
+                // missed this spot: the local variable had been exchanged while the SQL still
+                // said subject_id, so the object changed and the subject did not, conjuring an
+                // `OpenAI produces OpenAI` out of thin air
                 .bind(subject_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-                // 已被并发改写：不重复动手
+                // Already rewritten concurrently: do not act twice
                 let Some((id,)) = inserted else {
                     tx.rollback().await?;
                     continue;
@@ -1477,7 +1594,8 @@ async fn adopt(
             }
         };
 
-        // 证据整体搬过去，表层谓词一并保留——它是这次改写的依据，不该在改写中丢失
+        // The evidence moves over wholesale and the surface predicate is kept with it -- it is
+        // the basis for this rewrite, and should not be lost in the rewrite
         sqlx::query(
             "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
              SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
@@ -1516,14 +1634,18 @@ async fn adopt(
     })
 }
 
-/// 撤销一次采纳：新写的行作废、旧行复活。
+/// Undoes one adoption: the newly written rows are invalidated and the old rows come back to
+/// life.
 ///
-/// 关系类型**不删**——已有事实指向过它（`delete_relation_type` 也会拒绝），
-/// 而按 append-only 的规矩"它存在过"本身是历史；一个没人用的关系是惰性的。
-/// 证据也不清：新行已作废，其证据随之惰性，删掉反而抹掉"我们曾经这么认为"。
+/// The relation type is **not deleted** -- existing facts have pointed at it
+/// (`delete_relation_type` refuses too), and under append-only rules "it existed" is itself
+/// history; a relation nobody uses is inert. The evidence is not cleared either: the new rows are
+/// invalidated, so their evidence is inert along with them, and deleting it would instead erase
+/// "we once believed this".
 ///
-/// 并入那种（mode = merged）只复活旧行，不动被并入的目标——它本来就在，
-/// 复制过去的证据留着无害（`ON CONFLICT DO NOTHING` 本就可能是它自己的）。
+/// The merged kind (mode = merged) only revives the old row and leaves the merge target alone --
+/// it was already there, and the evidence copied over does no harm by staying (`ON CONFLICT DO
+/// NOTHING` means it may well have been its own anyway).
 pub async fn unadopt(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppResult<u32> {
     let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT old_fact_id, new_fact_id, mode FROM fact_adoptions
@@ -1554,7 +1676,8 @@ pub async fn unadopt(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppResult<u3
             .await?;
         reverted += 1;
     }
-    // 标记而不是删除：这次采纳发生过，撤销也发生过，两件都是历史
+    // Mark rather than delete: this adoption happened and so did the revert, and both are
+    // history
     sqlx::query(
         "UPDATE fact_adoptions SET reverted_at = now()
          WHERE batch_id = $1 AND kb_id = $2 AND reverted_at IS NULL",
@@ -1567,17 +1690,20 @@ pub async fn unadopt(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppResult<u3
     Ok(reverted)
 }
 
-/// 词表外的**字面值**说法：还没有谓词、宾语是值而不是实体的那些。
+/// **Literal-value** wordings outside the vocabulary: the ones with no predicate yet whose object
+/// is a value rather than an entity.
 ///
-/// 跟 [`proposed_predicates`] 互补，两边用 `object_id` 是否为空严格分开。
-/// 混在一起提案就会把 `founding_date` 提成一条关系，而那正是这条路要修掉的。
+/// Complementary to [`proposed_predicates`], the two strictly separated by whether `object_id` is
+/// null. Mixed together, the suggestion would propose `founding_date` as a relation, and that is
+/// exactly what this path is here to fix.
 pub async fn proposed_attributes(
     pool: &PgPool,
     kb_id: Uuid,
 ) -> AppResult<Vec<utopia_core::models::ProposedAttribute>> {
     Ok(sqlx::query_as(
-        // 同 proposed_predicates：普遍程度从全量证据数，改写量从积压数；
-        // 走 CTE 而不是相关子查询，后者每组重扫一遍证据表
+        // Same as proposed_predicates: prevalence is counted from all the evidence, the rewrite
+        // volume from the backlog; via a CTE rather than a correlated subquery, since the latter
+        // rescans the evidence table once per group
         "WITH spread AS (
              SELECT e.proposed_predicate AS form,
                     count(DISTINCT e.document_id) AS doc_count
@@ -1596,7 +1722,8 @@ pub async fn proposed_attributes(
                    AND f2.kb_id = $1 AND f2.predicate_id IS NULL
                    AND f2.object_id IS NULL AND f2.invalidated_at IS NULL
                  LIMIT 1) AS example,
-                -- 主语实际是什么类：属性的 domain 从这里来，不靠猜
+                -- What class the subject actually is: an attribute's domain comes from here,
+                -- not from guessing
                 ARRAY(SELECT DISTINCT t.key
                       FROM fact_evidence e3
                       JOIN facts f3 ON f3.id = e3.fact_id
@@ -1611,7 +1738,7 @@ pub async fn proposed_attributes(
          WHERE f.kb_id = $1 AND f.predicate_id IS NULL
            AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
            AND f.object_id IS NULL
-           -- 拒绝过的说法不再出现在候选里
+           -- Dismissed wordings no longer appear among the candidates
            AND NOT EXISTS (SELECT 1 FROM ontology_misses m
                            WHERE m.kb_id = $1 AND m.kind = 'attribute_type'
                              AND m.key = fe.proposed_predicate AND m.dismissed_at IS NOT NULL)
@@ -1623,11 +1750,13 @@ pub async fn proposed_attributes(
     .await?)
 }
 
-/// 某几个字面值说法当前挂着的事实：id、主语的类型、原始值。
+/// The facts currently hanging off a few literal-value wordings: id, the subject's type, the raw
+/// value.
 ///
-/// 给采纳那一步用。**归一化不在这里做**——它按 datatype 把 "2015" 变成日期、
-/// 把 "1,200" 变成数字，那套规则住在抽取模块，store 够不着也不该够得着。
-/// 调用方归一化完，把结果原样交回来。
+/// For the adoption step to use. **Normalisation does not happen here** -- it turns "2015" into a
+/// date and "1,200" into a number according to the datatype, and that set of rules lives in the
+/// extraction module, which the store cannot reach and should not be able to reach. The caller
+/// normalises and hands the result straight back.
 pub async fn value_facts_for_forms(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1651,18 +1780,21 @@ pub async fn value_facts_for_forms(
     .await?)
 }
 
-/// 采纳一批**字面值**说法：把它们的事实改挂到某个属性上。
+/// Adopts a batch of **literal-value** wordings: rehangs their facts onto some attribute.
 ///
-/// 与 [`adopt_proposed_predicates`] 共用改写、批次与撤销——对图做的事是同一件，
-/// 只有"新宾语从哪来"不同：这里的值由调用方按属性的 datatype 归一化过，
-/// 换算不出来的那些根本不会传进来（它们继续没有谓词，等下一次）。
+/// Shares the rewrite, the batch and the undo with [`adopt_proposed_predicates`] -- what is done
+/// to the graph is the same thing, and only "where the new object comes from" differs: the values
+/// here have been normalised by the caller according to the attribute's datatype, and the ones
+/// that cannot be converted never get passed in at all (they go on having no predicate, and wait
+/// for next time).
 pub async fn adopt_value_facts(
     pool: &PgPool,
     kb_id: Uuid,
     attribute_id: Uuid,
     rewrites: &[(Uuid, serde_json::Value)],
 ) -> AppResult<Adopted> {
-    // 属性那一路没有对调可言：宾语是字面值，值不能当主语
+    // There is no exchanging on the attribute route: the object is a literal value, and a value
+    // cannot be a subject
     adopt(
         pool,
         kb_id,
