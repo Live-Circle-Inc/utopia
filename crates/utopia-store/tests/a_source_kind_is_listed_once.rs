@@ -1,17 +1,21 @@
-//! #247：来源的种类只在一处定义，前后端对表。
+//! #247: a source kind is defined in exactly one place, and the two ends are checked against
+//! each other.
 //!
-//! 后端 `SourceKind`（utopia-core）一个枚举出两份清单：创建时的白名单、同步时的分派
-//! （后者按枚举穷举匹配，编译器保证加了种类就得决定它怎么同步）。前端那一份在
-//! `web/src/sourceKinds.ts`，这个测试把它读出来跟枚举比——此前两边各自手写，五种
-//! 连接器进了界面、进了同步，却没进创建白名单，界面上选得到、建的时候报
-//! 「kind must be one of…」。单元测试与 tsc 都看不见的那种漂移，这里看得见。
+//! On the backend one enum, `SourceKind` (utopia-core), yields two lists: the allow-list used at
+//! creation time and the dispatch used at sync time (the latter matches the enum exhaustively,
+//! so the compiler guarantees that adding a kind forces you to decide how it syncs). The
+//! frontend's copy lives in `web/src/sourceKinds.ts`, and this test reads it out and compares it
+//! with the enum -- before, each side was hand-written, and five connectors made it into the UI
+//! and into sync but not into the creation allow-list, so you could pick them in the UI and
+//! creating one answered "kind must be one of...". That is the kind of drift neither the unit
+//! tests nor tsc can see; here it is visible.
 //!
-//! 不需要数据库。
+//! No database needed.
 
 use std::path::Path;
 use utopia_core::models::SourceKind;
 
-/// 从 `CREATABLE_SOURCE_KINDS = [ "…", … ] as const` 里把引号里的字面量按顺序读出来
+/// Read the quoted literals, in order, out of `CREATABLE_SOURCE_KINDS = [ "…", … ] as const`
 fn frontend_kinds(src: &str) -> Vec<String> {
     let start = src
         .find("CREATABLE_SOURCE_KINDS = [")

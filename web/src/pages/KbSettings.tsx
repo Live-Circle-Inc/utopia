@@ -1,7 +1,9 @@
-/* 知识库设置：左栏分节（General / Members / Danger zone），为未来设置项立骨架
-   （抽取设置、保留策略、库级令牌…）。访问控制由 API 端执行（库 admin 起步）。
-   分节互斥渲染也根治了下拉弹层被后续玻璃卡（backdrop-filter 自成 stacking
-   context）遮蔽的层级 bug。 */
+/* Knowledge base settings: sections in the left rail (General / Members / Danger zone),
+   laying the skeleton for settings still to come (extraction settings, retention policy,
+   KB-level tokens...). Access control is enforced on the API side (KB admin and up).
+   Rendering the sections mutually exclusively also cured the stacking bug where a
+   dropdown popover was hidden behind a later glass card (backdrop-filter creates its own
+   stacking context). */
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams, useNavigate } from "@tanstack/react-router";
@@ -31,14 +33,16 @@ const KB_ROLES = [
 ];
 
 /**
- * 这个库能授予哪些角色。
+ * Which roles this KB can grant.
  *
- * **open 库没有 viewer 可授**：`access::kb_role` 对 open 库直接给部署内每个人
- * Viewer，所以写一行 `role=viewer` 什么都没多给——一条空操作的记录，
- * 还占着成员名单一行让人以为它起了作用。列在这里的意义只剩"给写权限"。
+ * **An open KB has no viewer to grant**: for an open KB `access::kb_role` hands Viewer
+ * to everyone in the deployment, so writing a `role=viewer` row grants nothing extra --
+ * a no-op record that still takes up a line in the member list and makes people think it
+ * did something. The only meaning left for listing it here is "grants write access".
  *
- * 历史数据里可能存着 open 库的 viewer 行，但那些行在名单里已经不显示了
- *（见 `listed`），所以这里不必为"当前值不在选项里"兜底。
+ * Historical data may still hold viewer rows for open KBs, but those rows no longer show
+ * in the list (see `listed`), so there is no need to guard here against "the current
+ * value is not among the options".
  */
 function rolesFor(isOpen: boolean) {
   return isOpen ? KB_ROLES.filter((r) => r.value !== "viewer") : KB_ROLES;
@@ -49,11 +53,13 @@ type Section = "general" | "members" | "activity" | "danger";
 export function KbSettings() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  /* 库 id 来自路径。**从前是 `?kb=`**——那是这套路由改造之前唯一
-     带着库走的地方，现在整片都在 /kb/$kbId 之下，它就不必自成一格了 */
+  /* The KB id comes from the path. **It used to be `?kb=`** -- that was the only place
+     carrying the KB around before this routing rework; now the whole area lives under
+     /kb/$kbId, so it no longer has to be its own special case */
   const { kbId } = useParams({ from: "/app/kb/$kbId/settings" });
 
-  // 失败任务数与重排（#216）。查询键带库 id，重排后失效重取
+  // Failed job count and requeue (#216). The query key carries the KB id, and a requeue
+  // invalidates it so it refetches
   const failedJobs = useQuery({
     queryKey: ["jobs", "failed", kbId],
     queryFn: () => api.failedJobs(kbId!),
@@ -78,7 +84,8 @@ export function KbSettings() {
   const [desc, setDesc] = useState("");
   const [visibility, setVisibility] = useState<"open" | "restricted">("open");
   const [autoExtend, setAutoExtend] = useState(true);
-  // **默认关**，与上面那个相反：推理往账本里写事实，而声明可能是错的
+  // **Off by default**, the opposite of the one above: inference writes facts into the
+  // ledger, and a declaration can be wrong
   const [materialize, setMaterialize] = useState(false);
   const [inferMins, setInferMins] = useState(60);
   const [ontoLang, setOntoLang] = useState<"en" | "zh">("en");
@@ -151,7 +158,7 @@ export function KbSettings() {
     { key: "general", label: S.kbset.general, Icon: Settings2 },
     { key: "members", label: S.kbset.members, Icon: Users },
     { key: "activity", label: S.kbset.activity, Icon: HistoryIcon },
-    // 默认库不可删除：danger 节整个不出现
+    // The default KB cannot be deleted: the danger section does not appear at all
     ...(isDefault
       ? []
       : [
@@ -166,7 +173,7 @@ export function KbSettings() {
 
   return (
     <div className="h-full flex">
-      {/* 分节导航：未来的抽取设置/保留策略/令牌等在此扩展 */}
+      {/* Section nav: future extraction settings / retention policy / tokens extend here */}
       <aside className={`${RAIL_CLS} p-3 space-y-0.5`}>
         {sections.map(({ key, label, Icon, danger }) => (
           <button
@@ -188,7 +195,7 @@ export function KbSettings() {
 
       <main className="flex-1 min-w-0 overflow-y-auto u-scroll px-8 py-6">
         <div className="max-w-xl space-y-5">
-          {/* 不缀库名：顶栏切换器已标明当前库 */}
+          {/* No KB name appended: the top-bar switcher already says which KB this is */}
           <h2 className="u-title text-lg">{S.kbset.title}</h2>
 
           {section === "general" && (
@@ -205,7 +212,9 @@ export function KbSettings() {
                 <div>
                   <label className={lbl}>{S.settings.kbs.visibility}</label>
                   {isDefault ? (
-                    /* 默认库锁 open：说明常驻可见（藏在 hover 里等于没解释）,详情见 grid 下方整行 */
+                    /* The default KB is locked open: the explanation stays permanently
+                       visible (buried in a hover is the same as no explanation), with the
+                       details in the full-width row below the grid */
                     <div className="flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-2 text-[11px] text-neutral-500 cursor-not-allowed">
                       <Lock size={11} className="shrink-0 text-neutral-600" />
                       {S.kbset.defaultOpenLabel}
@@ -248,8 +257,9 @@ export function KbSettings() {
                   onChange={(e) => setDesc(e.target.value)}
                 />
               </div>
-              {/* 自动扩本体：默认开，因为新库的十个默认关系不是任何人选的。
-                  说明里要讲清关掉之后失去的**只是**代劳，不是留意 */}
+              {/* Auto-extend the ontology: on by default, because nobody chose the ten
+                  default relations a new KB comes with. The note has to make clear that
+                  turning it off loses **only** the doing-it-for-you, not the noticing */}
               <label className="flex items-start gap-2.5 pt-1 cursor-pointer">
                 <input
                   type="checkbox"
@@ -266,8 +276,10 @@ export function KbSettings() {
                   </span>
                 </span>
               </label>
-              {/* 物化推理：**默认关**，与上面那个相反。自动扩本体动的是词表，
-                  这个动的是账本——它按公理往图里写事实，而声明可能是错的 */}
+              {/* Materialized inference: **off by default**, the opposite of the one
+                  above. Auto-extending the ontology touches the vocabulary; this one
+                  touches the ledger -- it writes facts into the graph by the axioms, and
+                  a declaration can be wrong */}
               <label className="flex items-start gap-2.5 pt-1 cursor-pointer">
                 <input
                   type="checkbox"
@@ -284,8 +296,9 @@ export function KbSettings() {
                   </span>
                 </span>
               </label>
-              {/* 重推间隔。**只在开着的时候露出来**——关着时它不影响任何事，
-                  摆在那里只会让人以为设了就会推 */}
+              {/* Re-inference interval. **Only shown while it is switched on** -- with
+                  it off it affects nothing, and sitting there it only makes people think
+                  that setting it will make inference run */}
               {materialize && (
                 <div className="pl-6 flex items-center gap-2">
                   <label className="text-xs text-neutral-500">
@@ -311,7 +324,8 @@ export function KbSettings() {
                   )}
                 </div>
               )}
-              {/* 失败的任务（#216）：有才露出来。「再跑一遍」把这个库里全部 failed 放回队列 */}
+              {/* Failed jobs (#216): only shown when there are any. "Run it again" puts
+                  every failed job in this KB back on the queue */}
               {failedJobs.data && failedJobs.data.failed > 0 && (
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-neutral-400">
@@ -326,8 +340,9 @@ export function KbSettings() {
                   </button>
                 </div>
               )}
-              {/* 语料语言。**不是界面语言**——类描述逐字进抽取提示词，
-                  读者是正在读这些文档的模型，所以它跟文档走不跟读者走 */}
+              {/* Corpus language. **Not the interface language** -- class descriptions
+                  go verbatim into the extraction prompt, and the reader is the model
+                  reading these documents, so it follows the documents, not the reader */}
               <div className="pt-1">
                 <span className="block text-sm text-neutral-200">
                   {S.kbset.ontologyLang}
@@ -417,7 +432,7 @@ export function KbSettings() {
   );
 }
 
-/** detail 里挑一个人类可读的名字（按 action 语义各异，逐键兜底） */
+/** Pick a human-readable name out of detail (semantics differ per action, so fall back key by key) */
 function auditDetailName(e: AuditEvent): string {
   const d = e.detail;
   const cand = [d.label, d.name, d.filename, d.key, d.role];
@@ -428,8 +443,9 @@ function auditDetailName(e: AuditEvent): string {
 const AUDIT_PAGE = 50;
 
 function KbActivity({ kbId }: { kbId: string }) {
-  // 筛选按真实查法来：查一类动作、查一个人、查一段时间。
-  // 动作前缀匹配——`entity.` 就能把 retyped / renamed 一族一起捞出来
+  // The filters follow how people actually look things up: one kind of action, one
+  // person, one stretch of time. Actions match by prefix -- `entity.` alone scoops up the
+  // whole retyped / renamed family
   const [action, setAction] = useState("");
   const [since, setSince] = useState("");
   const [until, setUntil] = useState("");
@@ -448,7 +464,8 @@ function KbActivity({ kbId }: { kbId: string }) {
   });
   const events = audit.data?.events ?? [];
   const total = audit.data?.total ?? 0;
-  // 下拉按这个库实际发生过的动作填，不是硬编码清单
+  // The dropdown is filled from the actions that actually happened in this KB, not from
+  // a hardcoded list
   const actions = audit.data?.actions ?? [];
   const filtered = !!(action || since || until);
 
@@ -556,7 +573,7 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
   });
   const orgUsers = useQuery({ queryKey: ["orgUsers"], queryFn: api.orgUsers });
   const [addUserId, setAddUserId] = useState("");
-  // open 库连 viewer 这个选项都没有，默认值得跟着走
+  // An open KB does not even have the viewer option, so the default has to follow suit
   const [addRole, setAddRole] = useState(isOpen ? "editor" : "viewer");
 
   const invalidate = () =>
@@ -575,12 +592,14 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
     onSuccess: invalidate,
   });
 
-  // open 库里 `role=viewer` 的一行**等价于没有这一行**：读权限本来人人都有，
-  // 那条记录什么都没授予。所以名单里只留真正拿到写权限的人。
+  // In an open KB a `role=viewer` row is **equivalent to not having the row at all**:
+  // everyone has read access anyway, so that record grants nothing. Which is why the list
+  // only keeps the people who genuinely hold write access.
   //
-  // **不算进 memberIds 是配套的一半**，不能只藏不放：留在里面的话，
-  // 那个人会从添加选择器里消失，于是再也授不了 editor——
-  // 一条本该无意义的记录反而把人锁住了
+  // **Leaving them out of memberIds is the matching other half**, and it cannot be
+  // skipped: kept in there, that person vanishes from the add picker, and so can never be
+  // granted editor again -- a record that was supposed to mean nothing would instead lock
+  // the person out
   const listed = (members.data?.members ?? []).filter(
     (m) => !isOpen || m.role !== "viewer",
   );
@@ -622,10 +641,11 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
         </div>
       ))}
 
-      {/* **picker 常驻**，不按"有没有人可加"来显示或隐藏。
-          一个时有时无的控件比一个空着的控件更让人困惑——不见了的第一反应是
-          功能坏了，而不是"没人可加"。空列表由 SearchSelect 自己说
-          （它有 noMatches 空态），这里不必再加一句话 */}
+      {/* **The picker is always there**, not shown or hidden by "is there anyone left to
+          add". A control that comes and goes is more confusing than one sitting there
+          empty -- the first reaction to something missing is that the feature broke, not
+          that "there is nobody to add". The empty list is SearchSelect's own business to
+          state (it has a noMatches empty state), so no extra sentence is needed here */}
       <div className="mt-3 flex gap-2 items-center border-t border-white/5 pt-3">
         <SearchSelect
           className="flex-1"

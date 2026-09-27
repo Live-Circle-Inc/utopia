@@ -1,5 +1,7 @@
-//! 问数数据源：系统层注册（凭据集中、跨 KB 复用）+ 知识库层挂载（权限跟 KB 走）。
-//! 查询执行时的安全闸（只读会话、SQL 解析白名单、LIMIT/超时）在 server 侧。
+//! Data sources for data questions: registration at the system level (credentials kept in one
+//! place, reused across KBs) + mounting at the knowledge base level (permissions follow the KB).
+//! The safety gates at query execution time (read-only session, allowlist from SQL parsing,
+//! LIMIT/timeout) live on the server side.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -7,7 +9,7 @@ use utopia_core::models::DataSourceView;
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// data_sources 的行投影，list 与 mounted 共用。
+/// The row projection of data_sources, shared by list and mounted.
 type DataSourceRow = (
     Uuid,
     String,
@@ -18,8 +20,10 @@ type DataSourceRow = (
     Option<bool>,
 );
 
-/// 连接串 → 无凭据摘要（host[:port]/path）。解析失败给占位符，绝不回显原串。
-/// 端口没写就不补：四种 scheme 的默认端口各不相同，补错比不补更误导
+/// Connection string → credential-free summary (host[:port]/path). On a parse failure give a
+/// placeholder; never echo the original string back.
+/// If the port was not written, do not fill one in: the four schemes each have a different
+/// default port, and filling in the wrong one misleads more than filling in nothing
 pub fn conn_summary(conn: &str) -> String {
     url::Url::parse(conn)
         .ok()
@@ -34,8 +38,9 @@ pub fn conn_summary(conn: &str) -> String {
         .unwrap_or_else(|| "(unparsed)".into())
 }
 
-/// 行 → 视图。**连接串在这里换成无凭据摘要**，是它不外流的那道关口；
-/// 四条查询共用一份，免得哪天新加一条忘了换
+/// Row → view. **The connection string is swapped for the credential-free summary here**, which
+/// is the gate that keeps it from leaking out; all four queries share this one copy, so that a
+/// fifth one added some day cannot forget to do the swap
 fn row_to_view(
     (id, name, engine, conn, created_at, last_test_at, last_test_ok): DataSourceRow,
 ) -> DataSourceView {
@@ -50,9 +55,9 @@ fn row_to_view(
     }
 }
 
-/// 部署里全部的源。**只给系统管理员的注册台用。**
-/// 从前可挂载列表也走它，那是 0014 关掉的门——KB 侧现在走
-/// `granted_to_workspace`。
+/// Every source in the deployment. **For the system admin's registration desk only.**
+/// The mountable list used to go through this too, and that is the door 0014 closed -- the KB
+/// side now goes through `granted_to_workspace`.
 pub async fn list(pool: &PgPool) -> AppResult<Vec<DataSourceView>> {
     let rows: Vec<DataSourceRow> = sqlx::query_as(
         "SELECT id, name, engine, conn_string, created_at, last_test_at, last_test_ok
@@ -76,8 +81,9 @@ pub async fn create(
             "Data source name is required",
         ));
     }
-    // 引擎由调用方按连接串的 scheme 定（`query_engine::engine_from_conn`）；
-    // 允许的取值在迁移 0020 的 CHECK 里，这里不再复制一份
+    // The engine is decided by the caller from the connection string's scheme
+    // (`query_engine::engine_from_conn`); the permitted values live in the CHECK in migration
+    // 0020, and are not copied a second time here
     if engine.is_empty() || conn_string.trim().is_empty() {
         return Err(AppError::invalid(
             "bad_conn_string",
@@ -110,7 +116,7 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// 连接串只在服务端内部流转（测试连接/查询执行）。
+/// The connection string only circulates inside the server (connection test / query execution).
 pub async fn conn_string(pool: &PgPool, id: Uuid) -> AppResult<String> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT conn_string FROM data_sources WHERE id = $1")
@@ -130,7 +136,7 @@ pub async fn record_test(pool: &PgPool, id: Uuid, ok: bool) -> AppResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// KB 挂载
+// KB mounting
 // ---------------------------------------------------------------------------
 
 pub async fn mount(pool: &PgPool, kb_id: Uuid, data_source_id: Uuid) -> AppResult<()> {
@@ -167,7 +173,8 @@ pub async fn mounted(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<DataSourceView
     Ok(rows.into_iter().map(row_to_view).collect())
 }
 
-/// (engine, conn_string)：查询执行/测试/拉 schema 用（凭据不出服务端）。
+/// (engine, conn_string): for query execution / testing / pulling the schema (credentials never
+/// leave the server).
 pub async fn engine_and_conn(pool: &PgPool, id: Uuid) -> AppResult<(String, String)> {
     let row: Option<(String, String)> =
         sqlx::query_as("SELECT engine, conn_string FROM data_sources WHERE id = $1")
@@ -177,11 +184,12 @@ pub async fn engine_and_conn(pool: &PgPool, id: Uuid) -> AppResult<(String, Stri
     row.ok_or(AppError::NotFound)
 }
 
-/// 这个工作区被授权用哪些源（0014）。
+/// Which sources this workspace has been granted (0014).
 ///
-/// **可挂载列表从此走这里，不再走 `list`。** 从前那条路给 KB 管理员看的是
-/// `datasources::list(pool)`——全部署每一个源，不过滤。于是任何库的管理员
-/// 都能把任意生产库挂进自己库，而挂上之后该库每个 Viewer 都能对它跑只读 SQL。
+/// **From now on the mountable list goes through here, not through `list`.** What that old path
+/// showed a KB admin was `datasources::list(pool)` -- every single source in the deployment, with
+/// no filtering. So an admin of any KB could mount any production database into their own KB, and
+/// once mounted every Viewer of that KB could run read-only SQL against it.
 pub async fn granted_to_workspace(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -198,7 +206,7 @@ pub async fn granted_to_workspace(
     Ok(rows.into_iter().map(row_to_view).collect())
 }
 
-/// 这个源授权给了哪些工作区。管理台读它。
+/// Which workspaces this source has been granted to. The admin console reads this.
 pub async fn grants_for_source(
     pool: &PgPool,
     data_source_id: Uuid,
@@ -213,7 +221,7 @@ pub async fn grants_for_source(
     .await?)
 }
 
-/// 授权一个工作区用这个源。幂等。
+/// Grant a workspace the use of this source. Idempotent.
 pub async fn grant(
     pool: &PgPool,
     data_source_id: Uuid,
@@ -232,13 +240,15 @@ pub async fn grant(
     Ok(())
 }
 
-/// 收回授权，**连同该工作区里已经挂上的那些一起卸掉**。
+/// Revoke a grant, **unmounting whatever is already mounted in that workspace along with it**.
 ///
-/// 只删授权行不够：`mounted` 读的是 `kb_data_sources`，问数也读它。留着挂载
-/// 就等于收回了授权而访问照旧——一个不生效的权限撤销比没有还危险。
+/// Deleting the grant row alone is not enough: `mounted` reads `kb_data_sources`, and so do data
+/// questions. Leaving the mount in place means the grant is revoked while access carries on as
+/// before -- and a permission revocation that does not take effect is more dangerous than none.
 ///
-/// 一个事务里做完：两条 DELETE 之间如果崩了，留下的正是「无授权却挂着」那种
-/// 状态，而那恰恰是这条迁移要消灭的东西。
+/// Done inside one transaction: a crash between the two DELETEs would leave behind exactly the
+/// "mounted without a grant" state, and that is precisely what this migration is meant to
+/// eliminate.
 pub async fn revoke(pool: &PgPool, data_source_id: Uuid, workspace_id: Uuid) -> AppResult<u64> {
     let mut tx = pool.begin().await?;
     let unmounted = sqlx::query(
@@ -260,8 +270,9 @@ pub async fn revoke(pool: &PgPool, data_source_id: Uuid, workspace_id: Uuid) -> 
     Ok(unmounted)
 }
 
-/// 这个源对这个知识库是不是授权过的。**挂载前必查**——守卫不能只在列表那一侧：
-/// 列表过滤挡的是「看得见」，而挂载端点是照着 id 调的，谁都能自己拼一个。
+/// Whether this source has been granted to this knowledge base. **Must be checked before
+/// mounting** -- the guard cannot live only on the list side: the list filter blocks "being able
+/// to see it", while the mount endpoint is called with an id, and anyone can assemble one.
 pub async fn is_granted(pool: &PgPool, kb_id: Uuid, data_source_id: Uuid) -> AppResult<bool> {
     let found: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM data_source_grants g

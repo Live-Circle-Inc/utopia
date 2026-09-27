@@ -1,7 +1,7 @@
-//! Databricks SQL Statement Execution API（`/api/2.0/sql/statements`）。
-//! 一个 SQL warehouse 后面是 Unity Catalog 的整个湖仓（Delta 为主），
-//! 令牌是 personal access token。结果要 INLINE + JSON_ARRAY：值全是字符串，
-//! 按 manifest 里的列类型还原成数与布尔。
+//! Databricks SQL Statement Execution API (`/api/2.0/sql/statements`).
+//! Behind one SQL warehouse sits Unity Catalog's entire lakehouse (mostly Delta),
+//! and the token is a personal access token. Results are asked for as INLINE + JSON_ARRAY:
+//! values are all strings, restored to numbers and booleans by the column types in the manifest.
 
 use super::conn::DatabricksConn;
 use super::{
@@ -158,7 +158,7 @@ impl QueryEngine for DatabricksEngine {
     }
 
     async fn fetch_schema(&self) -> anyhow::Result<Vec<SchemaColumn>> {
-        // 带 catalog 就查那个 catalog 的 information_schema；不带就是会话默认的
+        // With a catalog, query that catalog's information_schema; without one, the session default
         let prefix = self
             .conn
             .catalog

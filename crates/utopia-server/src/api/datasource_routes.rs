@@ -1,6 +1,9 @@
-//! 问数数据源：系统层注册（admin，凭据只进不出）+ 知识库层挂载（库 admin）。
-//! 挂载/手动刷新时把目标库的 schema 生成 markdown 摄入 KB（同 key 原地更新），
-//! Chat 写 SQL 前可检索到表结构。查询执行的安全闸在刀 2（query_data 工具）。
+//! Query-the-data data sources: system-level registration (admin; credentials go in and never
+//! come out) + knowledge-base-level mounting (KB admin).
+//! On mount, and on a manual refresh, the target database's schema is generated as markdown and
+//! ingested into the KB (updated in place under the same key), so Chat can retrieve the table
+//! structure before it writes SQL. The safety gate on query execution is at knife 2 (the
+//! query_data tool).
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -24,7 +27,7 @@ fn require_admin(user: &utopia_core::models::User) -> Result<(), AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// 系统层：注册/测试/删除
+// System level: register / test / delete
 // ---------------------------------------------------------------------------
 
 pub async fn list(
@@ -53,7 +56,8 @@ pub async fn create(
     Json(body): Json<CreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_admin(&user)?;
-    // 引擎跟着 scheme 走，界面只有一个连接串输入框；body.engine 只为兼容旧调用留着
+    // The engine follows the scheme; the UI has only one connection-string input box.
+    // body.engine is kept only for compatibility with old callers
     let engine = crate::query_engine::engine_from_conn(&body.conn_string).ok_or_else(|| {
         utopia_core::AppError::invalid(
             "unsupported_conn_scheme",
@@ -64,8 +68,9 @@ pub async fn create(
         )
     })?;
     let _ = &body.engine;
-    // 连接串的形状在登记时就校验（缺令牌、缺 warehouse……），错误信息里带写法；
-    // 否则要等到「测试」才知道，而那一步只回 ok:false
+    // The shape of the connection string is validated at registration time (missing token,
+    // missing warehouse, ...) and the error message carries the correct syntax; otherwise you
+    // only find out at "test", and that step only returns ok:false
     crate::query_engine::engine_for(engine, &body.conn_string)
         .map_err(|e| utopia_core::AppError::invalid("bad_conn_string", e.to_string()))?;
     let id = utopia_store::datasources::create(
@@ -105,7 +110,7 @@ pub async fn test(
 }
 
 // ---------------------------------------------------------------------------
-// 知识库层：挂载/卸载/schema 刷新
+// Knowledge-base level: mount / unmount / schema refresh
 // ---------------------------------------------------------------------------
 
 pub async fn mounted(
@@ -118,10 +123,11 @@ pub async fn mounted(
     Ok(Json(json!({ "data_sources": mounted })))
 }
 
-/// 库 admin 能挂哪些（列表给 name/summary，不含凭据）。
+/// Which ones a KB admin can mount (the list gives name/summary, with no credentials).
 ///
-/// **只列授权给本工作区的（0014）。** 从前这里返回 `datasources::list`——
-/// 全部署每一个源，于是任何库的管理员都看得见并挂得上任意生产库。
+/// **Only lists the ones granted to this workspace (0014).** This used to return
+/// `datasources::list` -- every source in the whole deployment, which meant any database's
+/// administrator could see, and mount, any production database.
 pub async fn mountable(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -139,8 +145,9 @@ pub async fn mount(
     Path((kb_id, ds_id)): Path<(Uuid, Uuid)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Admin).await?;
-    // **列表过滤不是守卫。** 那只挡「看得见」，而这个端点是照着 id 调的——
-    // 谁都能自己拼一个 uuid 打过来。授权在这里再查一次
+    // **Filtering the list is not a guard.** That only blocks "can see it", and this endpoint
+    // is called by id -- anyone can put together a uuid of their own and fire it at us. The
+    // grant is checked again right here
     if !utopia_store::datasources::is_granted(&state.pool, kb_id, ds_id).await? {
         return Err(AppError::invalid(
             "source_not_granted",
@@ -149,12 +156,15 @@ pub async fn mount(
         .into());
     }
     utopia_store::datasources::mount(&state.pool, kb_id, ds_id).await?;
-    // 挂载即摄取 schema：Chat 写 SQL 前能检索到表结构
+    // Mounting means ingesting the schema: Chat can retrieve the table structure before it
+    // writes SQL
     //
-    // **这一步失败不能回报成挂载失败。** 上面那行已经写进 kb_data_sources 了，
-    // 源是真挂着的；从前这里 `?` 出去回 500，人以为没挂上，实际挂上了——
-    // 而问数看不见它有哪些表。改成：照实说挂载成了，schema 没成，并且
-    // 报进告警中心，因为那之后就是一个静默的缺失状态（0009）
+    // **A failure in this step must not be reported back as a mount failure.** The line above
+    // has already written to kb_data_sources, so the source really is mounted; this used to `?`
+    // out of here and return a 500, so the human thought it had not mounted when in fact it had
+    // -- and query-the-data could not see which tables it had. Changed to: say truthfully that
+    // the mount succeeded and the schema did not, and report it to the alert centre, because
+    // from that point on it is a silent missing state (0009)
     match sync_schema_doc(&state, kb_id, ds_id).await {
         Ok(synced) => Ok(Json(json!({ "ok": true, "schema_tables": synced }))),
         Err(e) => {
@@ -169,8 +179,10 @@ pub async fn mount(
     }
 }
 
-/// 告警要留住名字：源被删之后 `subject_id` 就解析不出名字了。查不到时给占位符
-/// 而不是让告警本身失败——**报警路径上的失败不该淹掉它要报的那件事**。
+/// The alert has to hold on to the name: once the source is deleted, `subject_id` no longer
+/// resolves to one. When it cannot be found, hand back a placeholder rather than letting the
+/// alert itself fail -- **a failure on the alerting path must not drown out the thing it is
+/// there to report**.
 async fn source_name(state: &AppState, ds_id: Uuid) -> String {
     utopia_store::datasources::list(&state.pool)
         .await
@@ -189,11 +201,13 @@ pub async fn unmount(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 手动刷新结构。
+/// Refreshing the structure by hand.
 ///
-/// **这里照旧把错误回给调用方**——点按钮的人正看着，而且什么都没半途发生。
-/// 但同样报一条告警：留下的后果与挂载失败时一模一样（源挂着、表结构是旧的
-/// 或空的），而点按钮的人未必是需要知道这件事的人。
+/// **Here the error is returned to the caller as before** -- the person who pressed the button
+/// is watching, and nothing happened halfway. But an alert is raised just the same: the
+/// consequences left behind are exactly the same as for a failed mount (the source is mounted
+/// and the table structure is stale or empty), and the person who pressed the button is not
+/// necessarily the person who needs to know about it.
 pub async fn sync_schema(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -210,7 +224,8 @@ pub async fn sync_schema(
     }
 }
 
-/// Agentic 探索：后台任务读挂载源 schema，提议 指标/维度→字段 映射（低置信入 Review）。
+/// Agentic exploration: a background job reads the mounted source's schema and proposes
+/// metric/dimension -> field mappings (low-confidence ones go to Review).
 pub async fn explore(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -227,8 +242,9 @@ pub async fn explore(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 拉 information_schema 生成 markdown，走三路判定摄入（同 key 原地更新）。
-/// 文档挂在 per-KB 的 "Data schemas" folder 来源下。
+/// Pull information_schema, generate markdown, and ingest it through the three-way decision
+/// (updated in place under the same key).
+/// The document hangs off the per-KB "Data schemas" folder source.
 async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::Result<usize> {
     const MAX_TABLES: usize = 200;
     let name = utopia_store::datasources::list(&state.pool)
@@ -269,7 +285,7 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
         ));
     }
 
-    // per-KB "Data schemas" 容器来源（folder：纯容器语义）
+    // The per-KB "Data schemas" container source (folder: pure container semantics)
     let folder = match sqlx::query_as::<_, (Uuid,)>(
         "SELECT id FROM sources WHERE kb_id = $1 AND kind = 'folder' AND name = 'Data schemas'",
     )
@@ -309,15 +325,15 @@ async fn sync_schema_doc(state: &AppState, kb_id: Uuid, ds_id: Uuid) -> anyhow::
 }
 
 // ---------------------------------------------------------------------------
-// 系统层：授权（0014）
+// System level: grants (0014)
 //
-// 授权与挂载是两层，各有各的主人：
-//   授权 = 系统管理员说「这个源可以给哪些工作区用」  ← 这里
-//   挂载 = KB 管理员说「我这个库挂哪几个」          ← 上面那组
-// 两层都是多对多。挂载只能在授权过的集合里挑。
+// Granting and mounting are two layers, each with its own owner:
+//   grant = a system administrator saying "which workspaces may use this source"  <- here
+//   mount = a KB administrator saying "which ones my database mounts"             <- that group
+// Both layers are many-to-many. Mounting can only pick from the granted set.
 // ---------------------------------------------------------------------------
 
-/// 这个源授权给了哪些工作区。
+/// Which workspaces this source has been granted to.
 pub async fn grants(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -352,9 +368,10 @@ pub async fn grant(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 收回授权。**连同该工作区里已挂上的一起卸掉**——只删授权行的话，
-/// 问数读的还是 `kb_data_sources`，撤销就不生效。返回卸掉了几个，
-/// 好让界面说得出「顺带卸了 3 个库」而不是悄悄断人家的连接。
+/// Revoking a grant. **Along with it, unmount the ones already mounted in that workspace** --
+/// delete only the grant row and query-the-data still reads `kb_data_sources`, so the revocation
+/// does not take effect. Returns how many were unmounted, so the UI can say "3 databases were
+/// unmounted along with it" instead of quietly cutting someone's connection.
 pub async fn revoke(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

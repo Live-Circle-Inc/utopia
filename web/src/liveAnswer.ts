@@ -1,23 +1,34 @@
-// 正在生成中的那些回答，活在组件之外。
+// The answers currently being generated, living outside the components.
 //
-// **切走一次就看不见了。** 流式中的 `turns` 从前是 Chat 的组件状态，而离开
-// 对话页会卸载这个组件：状态没了，那个 fetch 还在跑，回调写进的是一个已经
-// 死掉的组件。切回来时组件重新挂载、从库里读——库里要等生成结束才有那一行，
-// 于是只看得见自己问的那句话。等一会儿再回来就正常，因为那时已经落库了。
+// **Navigate away once and it was gone.** The streaming `turns` used to be Chat's
+// component state, and leaving the conversation page unmounts that component: the state
+// was gone, that fetch was still running, and the callbacks wrote into a component that
+// had already died. Coming back remounted the component and read from the database -- and
+// the database has no such row until generation finishes, so all you could see was the
+// line you had asked yourself. Come back a while later and it was fine, because by then
+// it had been persisted.
 //
-// 服务端那半边（生成不随连接消失）是另一条修复；这半边解决的是**回来的时候
-// 看不看得见**。两条缺一不可：服务端保住了答案，这里保住了那条流。
+// The server-side half (generation does not vanish with the connection) is a separate
+// fix; this half solves **whether you can see it when you come back**. Neither can be
+// missing: the server keeps the answer, this keeps the stream.
 //
-// **按会话键控，不是单例。** 这张表从前是一个槽位，依据是「同时只会有一次
-// 进行中的回答」。这个前提不成立，而且是被 Chat 自己否定的——换库不 abort
-// （「换库不该杀掉另一个库里正在写的回答」）、开新对话不 abort（「开一场新的
-// 不等于放弃上一场」）、发送守卫按会话收窄（明确拒绝「发不出消息」的全局封锁）。
-// 三个「不 abort」凑在一起，两场并发是常规可达的状态，而单槽装不下它：第二场
-// start 覆盖槽位，第一场的回调还在往「当前槽位的最后一条」里写，两场回答逐字
-// 交织；先结束的那场把另一场的停止按钮提前收掉，自己从此无人可停。
+// **Keyed by conversation, not a singleton.** This map used to be a single slot, on the
+// grounds that "there is only ever one answer in progress at a time". That premise does
+// not hold, and it was Chat itself that denied it -- switching KBs does not abort
+// ("switching KBs should not kill an answer being written in another KB"), opening a new
+// conversation does not abort ("starting a new one is not the same as giving up on the
+// last one"), and the send guard is narrowed per conversation (explicitly refusing a
+// global lockout that makes messages unsendable). Put those three "does not abort"
+// together and two concurrent answers are a routinely reachable state, which a single
+// slot cannot hold: the second start overwrote the slot, the first one's callbacks kept
+// writing into "the last turn of the current slot", and the two answers interleaved word
+// by word; whichever finished first took the other one's stop button away early, leaving
+// itself with nobody able to stop it.
 //
-// 于是改成一张表：谁开场谁拿句柄，读谁写谁都有名有姓。`send` 的守卫不用改——
-// 它本来问的就是「这一场在不在流」，现在这个问题终于只关于这一场。
+// So it became a map: whoever starts a stream holds the handle, and every read and write
+// has a name on it. The guard in `send` needs no change -- what it was asking all along
+// is "is this conversation streaming", and now that question is finally only about this
+// conversation.
 import type { ChatStep, Source } from "./api";
 
 export interface Turn {
@@ -28,10 +39,12 @@ export interface Turn {
   error?: string;
 }
 
-/** 快照条目：纯数据，给渲染看。abort 不进快照——渲染不该顺手摸到它 */
+/** A snapshot entry: pure data, for rendering to look at. abort does not go into the
+    snapshot -- rendering has no business reaching for it */
 export interface Live {
   kbId: string;
-  /** 新会话在服务端回 id 之前是 null；kbId 用来区分两个都还没拿到 id 的新会话 */
+  /** null for a new conversation until the server returns an id; kbId is what tells two
+      new conversations apart while neither of them has an id yet */
   conversationId: string | null;
   turns: Turn[];
   streaming: boolean;
@@ -45,8 +58,9 @@ interface Slot {
 const lives = new Map<string, Slot>();
 const listeners = new Set<() => void>();
 
-// 快照整体替换：useSyncExternalStore 靠引用相等跳过无关渲染——**别场的任何
-// 变更都不该改变这一场的画面**，这条旧注释在键控之后才字面成立。
+// The snapshot is replaced wholesale: useSyncExternalStore relies on reference equality
+// to skip unrelated renders -- **no change in another conversation should alter this
+// one's picture**, and this old comment only became literally true once it was keyed.
 let snapshot: readonly Live[] = [];
 
 function emit() {
@@ -54,31 +68,39 @@ function emit() {
   listeners.forEach((l) => l());
 }
 
-// 还没拿到 id 的新会话用内部 token 占位；identify 到真 id 时重映射
+// A new conversation with no id yet is held by an internal placeholder token; identify
+// remaps it to the real id
 let pendingSeq = 0;
 
 export interface LiveHandle {
-  /** 新会话从服务端拿到 id：把这个条目从占位 token 重映射到真 id */
+  /** The new conversation got its id from the server: remap this entry from the
+      placeholder token to the real id */
   identify: (conversationId: string) => void;
-  /** 改这场回答的最后一条（助手那一轮）。生成期间只有它在变 */
+  /** Patch the last turn of this answer (the assistant's one). During generation it is
+      the only thing that changes */
   patchLast: (f: (t: Turn) => Turn) => void;
-  /** 结束（正常、出错、或人按了停止）。
+  /** Finish (normally, on error, or because someone pressed stop).
    *
-   * **不清空。** 清空过一版，那一版有个很难看的 bug：切走时组件卸载，
-   * 而「把最终结果交回组件」是调在已经死掉的那个组件上——空操作。于是
-   * store 空了、新组件早前已经认领过这一场因而不会再去读库，切回来
-   * 整场对话一片空白，连自己问的那句都没有。
+   * **Does not clear.** One version did clear, and that version had a very ugly bug:
+   * navigating away unmounts the component, and "hand the final result back to the
+   * component" was called on the component that had already died -- a no-op. So the
+   * store was empty, the new component had already claimed this conversation earlier
+   * and therefore would not go read the database again, and coming back the whole
+   * conversation was blank, without even the line you had asked yourself.
    *
-   * 那一刻这里是唯一还握着这份内容的地方，所以留着：只把 `streaming`
-   * 落下来。下一次 `begin` 会清掉已结束的条目（见 begin），切到别的会话时
-   * 认领不上自然去读库。 */
+   * At that moment this is the only place still holding this content, so it stays: only
+   * `streaming` gets written down. The next `begin` clears out the finished entries
+   * (see begin), and switching to another conversation fails to claim and naturally
+   * reads the database. */
   finish: () => void;
-  /** streamChat 的 abort 要等它返回才有：begin 先给占位，拿到真 abort 再换上 */
+  /** streamChat's abort only exists once it has returned: begin puts in a placeholder
+      first and swaps in the real abort once it has it */
   setAbort: (abort: () => void) => void;
 }
 
 export const liveAnswer = {
-  /** `useSyncExternalStore` 要求同一个快照对象在没变时保持同一引用 */
+  /** `useSyncExternalStore` requires the same snapshot object to keep the same
+      reference as long as it has not changed */
   get: (): readonly Live[] => snapshot,
   subscribe: (l: () => void) => {
     listeners.add(l);
@@ -86,15 +108,19 @@ export const liveAnswer = {
       listeners.delete(l);
     };
   },
-  /** 认领「正在看的这一场」。按会话找；kbId 只在两个都还没拿到 id 的新会话
-      之间起区分作用。找不到就是这一场不在场——展示回落到库里的历史 */
+  /** Claim "the conversation being looked at". Found by conversation; kbId only tells
+      apart two new conversations that neither have an id yet. Not found means this
+      conversation is not here -- the display falls back to the history in the database */
   entry: (kbId: string | null, conversationId: string | null): Live | null =>
     snapshot.find((e) => e.kbId === kbId && e.conversationId === conversationId) ?? null,
-  /** 开一场。同会话追问会替换同 key 的旧条目；同时清掉所有已结束的条目——
+  /** Start one. A follow-up in the same conversation replaces the old entry under the
+   * same key; at the same time every finished entry is cleared --
    *
-   * 清除只在有人发新消息时发生，而被清的会话若再被打开，认领不上、自然去
-   * 读库，内容一致（服务端在 done 时已落库）。不清的话这张表无界增长；
-   * 进行中的条目永不清——那正是本模块存在的意义。 */
+   * Clearing only happens when someone sends a new message, and if a cleared
+   * conversation is opened again it fails to claim, naturally reads the database, and
+   * the content matches (the server persisted it on done). Without clearing, this map
+   * grows without bound; entries in progress are never cleared -- that is precisely
+   * why this module exists. */
   begin: (
     kbId: string,
     conversationId: string | null,
@@ -136,7 +162,8 @@ export const liveAnswer = {
       },
     };
   },
-  /** 停止按钮专用：abort + finish 正在看的这一场。别的场照常写它们自己的条目 */
+  /** For the stop button only: abort + finish the conversation being looked at. The
+      other ones go on writing their own entries as usual */
   stop: (kbId: string, conversationId: string | null) => {
     for (const s of lives.values()) {
       if (s.live.kbId === kbId && s.live.conversationId === conversationId) {

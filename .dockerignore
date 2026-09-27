@@ -1,6 +1,6 @@
-# 构建上下文只需要源码。target/ 与 node_modules/ 不排除的话，
-# 光是把上下文发给 daemon 就要几分钟；node_modules 还会覆盖容器内
-# pnpm install 出来的那份（宿主机若是 Windows/macOS，二进制不兼容）。
+# The build context only needs the source. Without excluding target/ and node_modules/,
+# just sending the context to the daemon takes minutes; node_modules would also clobber the
+# copy pnpm install produced inside the container (incompatible binaries on a Windows/macOS host).
 target/
 **/node_modules/
 .git/

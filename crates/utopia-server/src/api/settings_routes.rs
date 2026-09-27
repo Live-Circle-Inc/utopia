@@ -11,7 +11,7 @@ use crate::error::ApiResult;
 use crate::llm_util;
 use crate::state::AppState;
 
-/// GET：脱敏视图（密钥只回传是否已配置）。
+/// GET: the redacted view (for keys, only whether they are configured is returned).
 pub async fn get(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -36,7 +36,7 @@ pub async fn get(
 #[derive(Deserialize)]
 pub struct PutSettingsReq {
     pub chat_base_url: Option<String>,
-    /// None 或空串 = 保留旧密钥
+    /// None or an empty string = keep the old key
     pub chat_api_key: Option<String>,
     pub chat_model: Option<String>,
     pub embed_base_url: Option<String>,
@@ -73,7 +73,8 @@ pub async fn put(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 连通性测试：对话发一条最小消息；embedding 试算一条并返回维度。
+/// Connectivity test: chat sends one minimal message; embedding computes one and returns the
+/// dimension.
 pub async fn test(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

@@ -1,34 +1,41 @@
-//! R1:物化推导。**这一层会往图里加东西**,所以它的每一条约束都是必要的。
+//! R1: materialised derivation. **This layer adds things to the graph**, so every one of
+//! its constraints is necessary.
 //!
-//! 与 R0 的分水岭:R0 只指出问题,风险面为零;R1 写事实。ADR 0002 把这一步
-//! 单列一档,并且给了三条硬性规矩,下面逐条落在代码里。
+//! The watershed against R0: R0 only points out problems and its risk surface is zero; R1
+//! writes facts. ADR 0002 puts this step in a tier of its own and gives three hard rules,
+//! each of which lands in the code below.
 //!
-//! **一、规则只从本体公理编译。** 没有用户自定义 DSL——那是另一个产品。
-//! 今天能编译的只有 `TransitiveProperty` 与 `SymmetricProperty`:`inverseOf`
-//! 与 `subPropertyOf` 投影侧还没落库,所以这里也就没有。**少一条规则不是
-//! 缺陷,是「没声明就不推」的同一条**。
+//! **One: rules are compiled from ontology axioms only.** No user-defined DSL -- that is a
+//! different product. All that can be compiled today is `TransitiveProperty` and
+//! `SymmetricProperty`: `inverseOf` and `subPropertyOf` are not stored on the projection
+//! side yet, so they are not here either. **One rule short is not a defect, it is the same
+//! "no declaration, no inference"**.
 //!
-//! **二、断言优先于派生,硬性。** 已经断言过的三元组不再派生一遍——不是为了
-//! 省行数,是为了让「这条是谁说的」有唯一答案。
+//! **Two: assertions beat derivations, hard.** A triple that has already been asserted is
+//! not derived a second time -- not to save rows, but so that "who said this one" has a
+//! single answer.
 //!
-//! **三、深度上限 + 环检测,实测必需。** ADR 在真实语料上量过:`part_of` 的
-//! 传递闭包从 185 条膨胀到 828 条且**不收敛**,深度分布第 5 层起振荡而不是
-//! 衰减——那是有环的形状。所以这里既不推自环（`A → A` 是矛盾不是知识,交给
-//! R0 报),也在轮数上封顶。
+//! **Three: a depth cap plus cycle detection, required by measurement.** The ADR measured it
+//! on a real corpus: the transitive closure of `part_of` swelled from 185 rows to 828 and
+//! **did not converge**, the depth distribution oscillating rather than decaying from level 5
+//! onwards -- the shape of a cycle. So this code neither derives self-loops (`A → A` is a
+//! contradiction, not knowledge; R0 reports it) nor leaves the round count unbounded.
 //!
-//! 还有一条 ADR 列在开放问题里、这里必须给出答案的:**有效时间取交集**。
-//! 前提 A `[2020,2023)`、前提 B `[2022,∞)` → 派生 `[2022,2023)`。交集为空
-//! 就不推——两段没有重叠的时候,链本身在任何时刻都不成立。
+//! And one more thing the ADR lists under open questions that has to be answered here:
+//! **validity time is the intersection**. Premise A `[2020,2023)`, premise B `[2022,∞)` →
+//! derivation `[2022,2023)`. An empty intersection derives nothing -- when the two spans do
+//! not overlap, the chain itself does not hold at any point in time.
 
 use crate::{Axioms, Edge, Kind, MAX_DEPTH};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// 单个谓词上派生的条数上限。
+/// Upper bound on how many derivations a single predicate may produce.
 ///
-/// **不是防御性编程,是拿数量过的**:4.5 倍膨胀出现在一个 185 条边的谓词上,
-/// 而膨胀是超线性的。封顶之后被截掉多少条要**说出来**（见 [`Derivation::capped`]）
-/// ——悄悄截断会让「推完了」和「推了一部分」长得一模一样。
+/// **Not defensive programming, this was measured**: the 4.5x blow-up showed up on a
+/// predicate with 185 edges, and the blow-up is superlinear. Once the cap bites, how many
+/// rows were cut off has to be **said out loud** (see [`Derivation::capped`]) -- truncating
+/// silently makes "finished inferring" and "inferred part of it" look exactly alike.
 pub const MAX_DERIVED_PER_PREDICATE: usize = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,10 +44,11 @@ pub enum Rule {
     Transitive,
     /// `A p B` ⟹ `B p A`
     Symmetric,
-    /// `A p B` ∧ `p⁻¹ = q` ⟹ `B q A`。**主宾对调且换谓词**——
-    /// 两件事一起发生，只做一件是这条规则最容易写错的地方
+    /// `A p B` ∧ `p⁻¹ = q` ⟹ `B q A`. **The ends swap and the predicate changes** --
+    /// both happen at once, and doing only one of them is the easiest way to get this rule
+    /// wrong
     Inverse,
-    /// `A p B` ∧ `p ⊑ q` ⟹ `A q B`。主宾不动，只升谓词
+    /// `A p B` ∧ `p ⊑ q` ⟹ `A q B`. The ends stay put; only the predicate is lifted
     SubProperty,
 }
 
@@ -55,50 +63,54 @@ impl Rule {
     }
 }
 
-/// 一条要落地的派生事实,连同它的证明。
+/// One derived fact to be written down, together with its proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Derived {
     pub predicate: Uuid,
-    /// **哪个谓词的声明触发了它。**
+    /// **Which predicate's declaration triggered it.**
     ///
-    /// 传递与对称不换谓词，`via == predicate`；而 `inverseOf` 与
-    /// `subPropertyOf` 换——`ceo_of ⊑ works_at` 推出的事实谓词是 `works_at`，
-    /// 而声明写在 `ceo_of` 上。
+    /// Transitivity and symmetry do not change the predicate, so `via == predicate`; whereas
+    /// `inverseOf` and `subPropertyOf` do -- the fact derived from `ceo_of ⊑ works_at` has
+    /// `works_at` as its predicate, while the declaration sits on `ceo_of`.
     ///
-    /// 落库时按 `via` 找规则行。**这里踩过一次**：原先按 `predicate` 找，
-    /// 前两条规则一直对（两者相同），加了跨谓词的两条之后查不到规则，
-    /// 于是 `continue` 静默丢弃——推出来了却不落库，最难查的那一种。
+    /// The write looks the rule row up by `via`. **We tripped over this once**: it used to
+    /// look up by `predicate`, which stayed right for the first two rules (the two are the
+    /// same), and once the two cross-predicate rules were added the lookup found no rule, so
+    /// `continue` dropped it silently -- derived but never written, the hardest kind to find.
     pub via: Uuid,
     pub subject: Uuid,
     pub object: Uuid,
     pub rule: Rule,
-    /// 用到的前提,按推导顺序。**这是证明树的一层**——R2 展开解释时顺着它走,
-    /// 而前提失效时也靠它知道该让哪些派生跟着失效
+    /// The premises used, in derivation order. **This is one level of the proof tree** -- R2
+    /// follows it when expanding an explanation, and when a premise is invalidated this is
+    /// also how we know which derivations have to be invalidated with it
     pub premises: Vec<Uuid>,
 }
 
-/// 一次推导的产出。
+/// The output of one derivation run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Derivation {
     pub facts: Vec<Derived>,
-    /// 撞上上限、没推完的谓词。**必须回给调用方**:界面上要说得出
-    /// 「这个谓词太密,只推了两万条」,而不是让人以为推完了
+    /// Predicates that hit the cap and were not inferred to completion. **Must be returned
+    /// to the caller**: the interface has to be able to say "this predicate is too dense,
+    /// only twenty thousand rows were derived" rather than letting people think it finished
     pub capped: Vec<Uuid>,
 }
 
-/// 一条参与推导的边,比 [`Edge`] 多带有效期。
+/// One edge taking part in derivation, carrying a validity period on top of [`Edge`].
 ///
-/// 单独一个类型而不是给 `Edge` 加字段:R0 完全用不上时间——公理是否被违反
-/// 与它什么时候成立无关，而 R1 每一步都要算交集。
+/// A type of its own rather than extra fields on `Edge`: R0 has no use for time at all --
+/// whether an axiom is violated is unrelated to when it holds -- while R1 has to compute an
+/// intersection at every step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimedEdge {
     pub edge: Edge,
-    /// 半开区间 `[from, to)`。两端都可为空 = 不知道/一直
+    /// Half-open interval `[from, to)`. Either end may be empty = unknown / always
     pub from: Option<i64>,
     pub to: Option<i64>,
 }
 
-/// 交集。`None` 表示无界那一侧。
+/// Intersection. `None` stands for the unbounded side.
 fn overlap(
     a: (Option<i64>, Option<i64>),
     b: (Option<i64>, Option<i64>),
@@ -113,8 +125,9 @@ fn overlap(
         (Some(x), None) | (None, Some(x)) => Some(x),
         (None, None) => None,
     };
-    // 空交集不推。两段没有重叠时,这条链在任何时刻都不成立——推出来的是一条
-    // 从不为真的事实,比不推更糟
+    // An empty intersection derives nothing. When the two spans do not overlap this chain
+    // does not hold at any point in time -- what comes out is a fact that is never true,
+    // which is worse than deriving nothing
     if let (Some(f), Some(t)) = (from, to) {
         if f >= t {
             return None;
@@ -123,10 +136,10 @@ fn overlap(
     Some((from, to))
 }
 
-/// 从某个主语出发的一条边：(宾语, 起, 止, 事实 id)。
+/// One edge leaving some subject: (object, from, to, fact id).
 type Hop = (Uuid, Option<i64>, Option<i64>, Uuid);
 
-/// 派生的中间态:一个 (主语, 宾语) 对是怎么来的。
+/// The intermediate state of a derivation: how a (subject, object) pair came about.
 #[derive(Clone)]
 struct Reached {
     from: Option<i64>,
@@ -134,47 +147,55 @@ struct Reached {
     premises: Vec<Uuid>,
 }
 
-/// 一条三元组的身份：(谓词, 主语, 宾语)。
+/// The identity of a triple: (predicate, subject, object).
 ///
-/// **谓词进了 key，这是这一版最要紧的改动。** 从前推导按谓词分组、组内自成一体，
-/// 因为传递与对称都不换谓词；而 `inverseOf` 与 `subPropertyOf` 天生跨谓词——
-/// `A works_at B` 推出的是 `B employs A`，落在另一个谓词上。分组一做，这两条
-/// 规则就无处安放。
+/// **The predicate is part of the key, and that is the most important change in this
+/// version.** Derivation used to be grouped by predicate, each group self-contained, because
+/// neither transitivity nor symmetry changes the predicate; whereas `inverseOf` and
+/// `subPropertyOf` cross predicates by nature -- `A works_at B` derives `B employs A`, which
+/// lands on a different predicate. Group by predicate and these two rules have nowhere to
+/// live.
 type Triple = (Uuid, Uuid, Uuid);
 
-/// 拿公理推一遍这批边。
+/// Run the axioms over this batch of edges.
 ///
-/// **全局不动点，不再按谓词分组。** 三条规则会串起来：
+/// **A global fixpoint, no longer grouped by predicate.** The three rules chain together:
 ///
 /// ```text
 /// A ceo_of B  --(subPropertyOf)-->  A works_at B  --(inverseOf)-->  B employs A
 /// ```
 ///
-/// 各谓词各算各的话，这条链在第一步就断了。所以改成半朴素求值扫全集：每一轮拿上
-/// 一轮的新边（frontier）再推一遍，没有新增就停。
+/// If every predicate is computed on its own, this chain breaks at the first step. So it is
+/// now semi-naive evaluation over the whole set: each round takes the previous round's new
+/// edges (the frontier) and infers again, stopping when nothing is added.
 ///
-/// 三条一跳规则（对称／逆／子属性）与传递放在同一轮里，因为它们互为输入——
-/// 逆推出来的边可能让某条传递链接得上，反之亦然。
+/// The three one-hop rules (symmetric / inverse / sub-property) sit in the same round as
+/// transitivity, because they are each other's input -- an edge the inverse produces may let
+/// some transitive chain join up, and vice versa.
 pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation {
     let mut out = Derivation::default();
 
-    // 断言过的三元组。**派生撞上它就让路**——asserted > derived 是硬性的
+    // Triples that have been asserted. **A derivation that runs into one gives way** --
+    // asserted > derived is hard
     let asserted: HashSet<Triple> = edges
         .iter()
         .map(|e| (e.edge.predicate, e.edge.subject, e.edge.object))
         .collect();
 
-    // 已经推出来的 → 怎么来的。同一条只留第一条证明：多条路径都能推出同一件事
-    // 时，展示哪一条对用户没有区别，而全存下来会让证明树的规模跟着路径数走
+    // Already derived → how it came about. Only the first proof is kept for any one triple:
+    // when several paths derive the same thing, which one is shown makes no difference to
+    // the user, while keeping them all makes the proof tree's size track the path count
     let mut reached: HashMap<Triple, Reached> = HashMap::new();
-    // **封顶仍按谓词计**：那个常量的含义没变（一个谓词最多推两万条），
-    // 而 `Derivation::capped` 回的也是谓词列表。跨谓词之后若改成全局一个数，
-    // 界面上「哪个谓词太密」就答不出来了
+    // **The cap is still counted per predicate**: that constant's meaning has not changed
+    // (at most twenty thousand derivations per predicate), and `Derivation::capped` returns
+    // a list of predicates too. Switching to one global number now that rules cross
+    // predicates would leave "which predicate is too dense" unanswerable in the interface
     let mut per_pred: HashMap<Uuid, usize> = HashMap::new();
     let mut capped: HashSet<Uuid> = HashSet::new();
 
-    // 从 (谓词, 主语) 出发能走的边，传递用。派生出来的也进来——它们已经是
-    // 我们的断言了，链上不该因为「来路不同」断掉
+    // The edges walkable from (predicate, subject), used by transitivity. Derived ones come
+    // in too -- they are our assertions now, and a chain should not break because something
+    // "came from somewhere else"
     let mut adj: HashMap<(Uuid, Uuid), Vec<Hop>> = HashMap::new();
     for e in edges {
         adj.entry((e.edge.predicate, e.edge.subject))
@@ -195,12 +216,14 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
             )
         })
         .collect();
-    // 起始 frontier 的顺序跟着入参走，而入参顺序不保证——排一次，
-    // 同一个库两次推导才给得出同一份结果
+    // The starting frontier's order follows the arguments, and the argument order is not
+    // guaranteed -- sort once, so two derivation runs over the same knowledge base can give
+    // the same result
     frontier.sort_by_key(|(t, _)| *t);
 
-    // 轮数上限是**兜底**，真正的界在下面那条 `premises.len() >= MAX_DEPTH`：
-    // 常量的含义是「路径最长 12」，按前提条数算才对得上。轮数只防病态输入
+    // The round cap is a **backstop**; the real bound is the `premises.len() >= MAX_DEPTH`
+    // below: the constant means "paths at most 12 long", and only counting premises matches
+    // that. The round count only guards against pathological input
     for _ in 0..MAX_DEPTH {
         if frontier.is_empty() {
             break;
@@ -212,23 +235,26 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
             let Some(ax) = axioms.get(&pred) else {
                 continue;
             };
-            // 再接一条就超了：这一条不再往下延，但它自己已经产出过
+            // One more hop would go over: this one is not extended any further, but it
+            // has already been produced itself
             if acc.premises.len() >= MAX_DEPTH {
                 continue;
             }
 
-            // ---- 一跳的三条：换主宾（对称）、换谓词（逆 / 子属性）
+            // ---- The three one-hop rules: swap the ends (symmetric), change the
+            // predicate (inverse / sub-property)
             let mut hops: Vec<(Triple, Rule)> = Vec::new();
             if ax.symmetric {
                 hops.push(((pred, obj, subj), Rule::Symmetric));
             }
             if let Some(inv) = ax.inverse_of {
-                // `A p B ⟹ B p⁻¹ A`。主宾对调**且**谓词换掉——两件事一起发生，
-                // 只做一件是这条规则最容易写错的地方
+                // `A p B ⟹ B p⁻¹ A`. The ends swap **and** the predicate changes -- both
+                // happen at once, and doing only one of them is the easiest way to get this
+                // rule wrong
                 hops.push(((inv, obj, subj), Rule::Inverse));
             }
             if let Some(sup) = ax.sub_property_of {
-                // `A p B ∧ p ⊑ q ⟹ A q B`。主宾不动，只升谓词
+                // `A p B ∧ p ⊑ q ⟹ A q B`. The ends stay put; only the predicate is lifted
                 hops.push(((sup, subj, obj), Rule::SubProperty));
             }
             for (t, rule) in hops {
@@ -252,12 +278,13 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
                 }
             }
 
-            // ---- 传递：需要接一条同谓词的出边
+            // ---- Transitivity: needs an outgoing edge on the same predicate to join onto
             if ax.transitive {
                 let outs = adj.get(&(pred, obj)).cloned().unwrap_or_default();
                 for (c, from, to, fact) in outs {
-                    // **不推自环。** `A p A` 在一个传递+反对称的谓词上是矛盾
-                    // 而不是知识，R0 那边会把这个环连路径一起报出来
+                    // **No self-loops.** `A p A` on a transitive + asymmetric predicate
+                    // is a contradiction rather than knowledge, and R0 reports that cycle
+                    // along with its path
                     if subj == c {
                         continue;
                     }
@@ -293,21 +320,25 @@ pub fn derive(edges: &[TimedEdge], axioms: &HashMap<Uuid, Axioms>) -> Derivation
     out
 }
 
-/// 落一条派生，并把它接进邻接表供后续传递使用。返回 true = 这个谓词封顶了。
+/// Record one derivation and wire it into the adjacency table for later transitivity.
+/// Returns true = this predicate hit its cap.
 ///
-/// 参数多得难看，但把它抽出来是必要的：四条规则各自的落地动作一模一样
-/// （查断言、查已推、算区间、记证明、进 frontier、进邻接表），而上一版
-/// 正是因为对称与传递各写一遍，两处的「跳过条件」慢慢长得不一样了。
+/// The parameter list is ugly, but pulling it out was necessary: all four rules do exactly
+/// the same thing when recording (check the assertions, check what is already derived,
+/// compute the interval, record the proof, onto the frontier, into the adjacency table), and
+/// in the previous version symmetry and transitivity each wrote it out separately, so the two
+/// copies of the "skip condition" slowly grew apart.
 #[allow(clippy::too_many_arguments)]
 fn emit(
     t: Triple,
-    // 触发它的那个谓词的声明。四条规则都是「当前展开的这条边的谓词」
+    // The declaration that triggered it. For all four rules this is "the predicate of the
+    // edge currently being expanded"
     via: Uuid,
     rule: Rule,
     acc: &Reached,
     from: Option<i64>,
     to: Option<i64>,
-    // 传递多用掉的那一条前提；一跳规则没有
+    // The extra premise transitivity consumes; the one-hop rules have none
     extra_premise: Option<Uuid>,
     asserted: &HashSet<Triple>,
     reached: &mut HashMap<Triple, Reached>,
@@ -318,12 +349,13 @@ fn emit(
     adj: &mut HashMap<(Uuid, Uuid), Vec<Hop>>,
 ) -> bool {
     let (pred, subj, obj) = t;
-    // 自环不推，任何规则都一样：`A p A` 是矛盾不是知识
+    // No self-loops, whatever the rule: `A p A` is a contradiction, not knowledge
     if subj == obj {
         return false;
     }
-    // 断言优先；已经推过的不重复推——**逆的互指靠这一条收敛**：
-    // `p⁻¹ = q` 且 `q⁻¹ = p` 时，第二轮推回来的那条已经在 reached 里
+    // Assertions win; anything already derived is not derived again -- **this is what makes
+    // mutually pointing inverses converge**: when `p⁻¹ = q` and `q⁻¹ = p`, the edge the
+    // second round derives back is already in reached
     if asserted.contains(&t) || reached.contains_key(&t) {
         return false;
     }
@@ -344,7 +376,7 @@ fn emit(
         premises: premises.clone(),
     };
     reached.insert(t, r.clone());
-    // 派生出来的边也能被后续传递接上
+    // Derived edges can be joined onto by later transitivity too
     if let Some(&first) = premises.first() {
         adj.entry((pred, subj))
             .or_default()
@@ -362,11 +394,12 @@ fn emit(
     false
 }
 
-/// 派生事实的有效期,给落库那一侧用。
+/// The validity period of a derived fact, for the side that writes to the database.
 ///
-/// 与 [`derive`] 分开是因为交集已经在推导过程里算过了,而调用方拿到的
-/// [`Derived`] 只带前提——重算一次比把区间塞进结果里更省事,也更难错:
-/// 前提就是那几条事实,交集是它们的函数。
+/// Kept apart from [`derive`] because the intersection has already been computed during
+/// derivation, while the [`Derived`] the caller gets carries only premises -- recomputing it
+/// is less work than stuffing the interval into the result, and harder to get wrong: the
+/// premises are just those few facts, and the intersection is a function of them.
 pub fn validity(
     premises: &[Uuid],
     by_fact: &HashMap<Uuid, (Option<i64>, Option<i64>)>,
@@ -379,40 +412,45 @@ pub fn validity(
     Some(acc)
 }
 
-// ===================== 矛盾：派生撞上了什么（0017） =====================
+// ================ Contradictions: what a derivation ran into (0017) ================
 
-/// 一条派生撞上了一条断言。
+/// A derivation that ran into an assertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clash {
-    /// `Derivation::facts` 里的下标
+    /// The index into `Derivation::facts`
     pub derived: usize,
-    /// 撞在哪条公理上：`Functional`（含 inverse_functional）、`Asymmetry`、`SelfLoop`
+    /// Which axiom it ran into: `Functional` (including inverse_functional), `Asymmetry`,
+    /// `SelfLoop`
     pub axiom: Kind,
-    /// 被撞的断言。自环没有对方，取派生的最后一条前提
+    /// The assertion that was hit. A self-loop has no counterpart, so the derivation's last
+    /// premise is used
     pub against: Uuid,
 }
 
-/// 两条规则加在一起产出了互相矛盾的派生。
+/// Two rules that together produced derivations contradicting each other.
 ///
-/// **按规则对聚合，不逐对报**：`ceo_of ⊑ works_at` 加 `works_at` functional，每个有
-/// 两个 ceo 的组织就撞一对——根子是那两条声明，逐对进队列只会淹掉 Review。
+/// **Aggregated by rule pair, not reported pair by pair**: `ceo_of ⊑ works_at` plus
+/// `works_at` functional, and every organisation with two ceos clashes once -- the root is
+/// those two declarations, and queueing them pair by pair would only drown Review.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleClash {
-    /// (声明所在的谓词, 规则种类)，两条按 (谓词, 种类) 排过序，a ≤ b
+    /// (the predicate the declaration sits on, the kind of rule), the two sorted by
+    /// (predicate, kind) so a ≤ b
     pub a: (Uuid, Rule),
     pub b: (Uuid, Rule),
     pub axiom: Kind,
-    /// 互撞的派生对，按 `Derivation::facts` 的下标
+    /// The clashing derivation pairs, as indices into `Derivation::facts`
     pub pairs: Vec<(usize, usize)>,
 }
 
-/// 半开区间 `[from, to)`，两端可空
+/// Half-open interval `[from, to)`, either end may be empty
 type Span = (Option<i64>, Option<i64>);
-/// (谓词, 一端) → 另一端的边：(另一端, 事实, 区间)。functional 两个方向各一份
+/// (predicate, one end) → the edges at the other end: (other end, fact, interval).
+/// functional gets one copy per direction
 type ByEnd = HashMap<(Uuid, Uuid), Vec<(Uuid, Uuid, Span)>>;
-/// 一条规则的身份：声明所在的谓词 + 规则种类
+/// The identity of a rule: the predicate the declaration sits on + the kind of rule
 type RuleSide = (Uuid, Rule);
-/// 互撞的派生对，按 (规则 a, 规则 b, 撞在哪条公理上) 分组
+/// The clashing derivation pairs, grouped by (rule a, rule b, which axiom was hit)
 type Grouped = HashMap<(RuleSide, RuleSide, Kind), Vec<(usize, usize)>>;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -422,7 +460,9 @@ pub struct Contradictions {
 }
 
 impl Contradictions {
-    /// 不该落地的派生下标：撞过断言的，和撞过别的派生的。**写图宁少勿错**（0002）
+    /// The indices of derivations that must not be written: the ones that ran into an
+    /// assertion, and the ones that ran into another derivation. **When writing to the graph,
+    /// too few beats wrong** (0002)
     pub fn blocked(&self) -> HashSet<usize> {
         let mut out: HashSet<usize> = self.with_assertions.iter().map(|c| c.derived).collect();
         for rc in &self.between_derivations {
@@ -435,22 +475,28 @@ impl Contradictions {
     }
 }
 
-/// 拿公理量一遍派生：与断言撞的逐条列出，派生之间撞的按规则对聚合。
+/// Measure the derivations against the axioms: the ones clashing with an assertion are
+/// listed one by one, the ones clashing with each other are aggregated by rule pair.
 ///
-/// 只查四类——`functional`（含 inverse）、`asymmetric`、`irreflexive`——因为只有它们
-/// 能由**两条边**判出矛盾；传递环那类要走闭包，派生本身就是闭包的一部分，R0 对断言
-/// 查过就够了。functional 与 asymmetric 都要求**有效区间重叠**：Mira 走了 Devin
-/// 接任，两条 `ceo_of` 区间不交，那是接任，不是矛盾。
+/// Only four kinds are checked -- `functional` (including inverse), `asymmetric`,
+/// `irreflexive` -- because they are the only ones where a contradiction can be judged from
+/// **two edges**; the transitive-cycle kind needs the closure, and since the derivations are
+/// themselves part of the closure, R0 checking the assertions is enough. Both functional and
+/// asymmetric require the **validity intervals to overlap**: Mira left and Devin took over,
+/// so the two `ceo_of` intervals do not intersect -- that is a succession, not a
+/// contradiction.
 ///
-/// 撞上断言的派生一律**不落地**（asserted > derived，硬性）；这一步把「让路」这件事
-/// 从静默变成可见——0002 那张表里写了没做的那一行。
+/// A derivation that runs into an assertion is **never written** (asserted > derived, hard);
+/// this step turns "giving way" from something silent into something visible -- the row in
+/// that table in 0002 that was written down and never done.
 pub fn contradictions(
     derivation: &Derivation,
     edges: &[TimedEdge],
     axioms: &HashMap<Uuid, Axioms>,
     spans: &HashMap<Uuid, (Option<i64>, Option<i64>)>,
 ) -> Contradictions {
-    // 断言的三份索引：(谓词, 主) → 宾；(谓词, 宾) → 主；(谓词, 主, 宾) → 边
+    // Three indices over the assertions: (predicate, subject) → object;
+    // (predicate, object) → subject; (predicate, subject, object) → edge
     let mut by_ps: ByEnd = HashMap::new();
     let mut by_po: ByEnd = HashMap::new();
     let mut by_spo: HashMap<(Uuid, Uuid, Uuid), Vec<(Uuid, Span)>> = HashMap::new();
@@ -472,7 +518,9 @@ pub fn contradictions(
     }
 
     let mut out = Contradictions::default();
-    // 派生的区间：与落库那一侧同一个函数算，算不出的（前提区间不交）本来就不会落
+    // The derivations' intervals: computed with the same function as the write side; the
+    // ones it cannot compute (premise intervals do not intersect) would never be written
+    // anyway
     let derived_spans: Vec<Option<Span>> = derivation
         .facts
         .iter()
@@ -537,7 +585,7 @@ pub fn contradictions(
         }
     }
 
-    // 派生之间：同样三份索引，只不过键的是下标
+    // Between derivations: the same three indices, only keyed by index
     let mut d_ps: HashMap<(Uuid, Uuid), Vec<usize>> = HashMap::new();
     let mut d_po: HashMap<(Uuid, Uuid), Vec<usize>> = HashMap::new();
     let mut d_spo: HashMap<(Uuid, Uuid, Uuid), Vec<usize>> = HashMap::new();
@@ -608,7 +656,7 @@ pub fn contradictions(
             RuleClash { a, b, axiom, pairs }
         })
         .collect();
-    // 输出排过序——这条路的价值有一半在确定性
+    // The output is sorted -- half the value of this path is determinism
     rule_clashes.sort_by(|x, y| {
         (x.a.0, x.a.1.as_str(), x.b.0, x.b.1.as_str()).cmp(&(
             y.a.0,
@@ -631,7 +679,7 @@ mod tests {
     fn f(i: u8) -> Uuid {
         Uuid::from_bytes([i; 16].map(|b| b ^ 0xF0))
     }
-    /// 一条无时间的边
+    /// An edge with no time on it
     fn e(fact: u8, s: u8, o: u8) -> TimedEdge {
         TimedEdge {
             edge: Edge {
@@ -644,7 +692,7 @@ mod tests {
             to: None,
         }
     }
-    /// 一条带区间的边
+    /// An edge with an interval
     fn te(fact: u8, s: u8, o: u8, from: Option<i64>, to: Option<i64>) -> TimedEdge {
         TimedEdge {
             from,
@@ -675,7 +723,8 @@ mod tests {
     fn nothing_declared_derives_nothing() {
         let edges = [e(1, 1, 2), e(2, 2, 3)];
         assert!(derive(&edges, &HashMap::new()).facts.is_empty());
-        // 声明了别的公理也一样——只有 transitive / symmetric 编得出规则
+        // Declaring some other axiom makes no difference -- only transitive / symmetric
+        // compile into rules
         let irr = with(Axioms {
             irreflexive: true,
             ..Default::default()
@@ -685,7 +734,7 @@ mod tests {
 
     #[test]
     fn a_chain_closes() {
-        // 1→2→3→4，传递应推出 1→3、1→4、2→4
+        // 1→2→3→4; transitivity should derive 1→3, 1→4 and 2→4
         let edges = [e(1, 1, 2), e(2, 2, 3), e(3, 3, 4)];
         let d = derive(&edges, &transitive());
         assert_eq!(pairs(&d), vec![(1, 3), (1, 4), (2, 4)]);
@@ -704,29 +753,34 @@ mod tests {
         assert_eq!(
             long.premises,
             vec![f(1), f(2), f(3)],
-            "证明要按推导顺序带上三条前提"
+            "the proof must carry all three premises in derivation order"
         );
         assert_eq!(long.rule, Rule::Transitive);
     }
 
     #[test]
     fn asserted_beats_derived() {
-        // 1→2、2→3 已经推得出 1→3，而 1→3 也被断言过 → 不重复派生
+        // 1→2 and 2→3 already derive 1→3, and 1→3 has been asserted as well → no
+        // duplicate derivation
         let edges = [e(1, 1, 2), e(2, 2, 3), e(3, 1, 3)];
         let d = derive(&edges, &transitive());
-        assert!(d.facts.is_empty(), "断言过的三元组不该再派生一份");
+        assert!(
+            d.facts.is_empty(),
+            "an asserted triple should not get a derived copy"
+        );
     }
 
     #[test]
     fn a_ring_does_not_derive_self_loops_and_does_not_hang() {
-        // 1→2→3→1：环。传递闭包里会推出 1→1，而那是矛盾不是知识
+        // 1→2→3→1: a cycle. The transitive closure would derive 1→1, and that is a
+        // contradiction, not knowledge
         let edges = [e(1, 1, 2), e(2, 2, 3), e(3, 3, 1)];
         let d = derive(&edges, &transitive());
         assert!(
             d.facts.iter().all(|x| x.subject != x.object),
-            "自环不该被推出来——R0 会把这个环连路径一起报"
+            "self-loops should not be derived -- R0 reports that cycle along with its path"
         );
-        // 但环上其余的推导是成立的：1→3、2→1、3→2
+        // But the rest of the derivations around the cycle do hold: 1→3, 2→1, 3→2
         assert_eq!(pairs(&d), vec![(1, 3), (2, 1), (3, 2)]);
     }
 
@@ -741,14 +795,14 @@ mod tests {
         assert_eq!(pairs(&d), vec![(2, 1)]);
         assert_eq!(d.facts[0].rule, Rule::Symmetric);
         assert_eq!(d.facts[0].premises, vec![f(1)]);
-        // 两个方向都断言过 → 无可派生
+        // Both directions asserted → nothing left to derive
         let both = [e(1, 1, 2), e(2, 2, 1)];
         assert!(derive(&both, &sym).facts.is_empty());
     }
 
     #[test]
     fn validity_is_the_intersection() {
-        // 1→2 在 [10,30)，2→3 在 [20,∞) ⟹ 1→3 在 [20,30)
+        // 1→2 over [10,30), 2→3 over [20,∞) ⟹ 1→3 over [20,30)
         let edges = [te(1, 1, 2, Some(10), Some(30)), te(2, 2, 3, Some(20), None)];
         let d = derive(&edges, &transitive());
         assert_eq!(pairs(&d), vec![(1, 3)]);
@@ -761,7 +815,8 @@ mod tests {
 
     #[test]
     fn no_overlap_derives_nothing() {
-        // 1→2 只在 [10,20)，2→3 只在 [30,40) —— 这条链在任何时刻都不成立
+        // 1→2 only over [10,20), 2→3 only over [30,40) -- this chain does not hold at any
+        // point in time
         let edges = [
             te(1, 1, 2, Some(10), Some(20)),
             te(2, 2, 3, Some(30), Some(40)),
@@ -769,13 +824,13 @@ mod tests {
         let d = derive(&edges, &transitive());
         assert!(
             d.facts.is_empty(),
-            "两段不重叠时推出来的是一条从不为真的事实"
+            "when the two spans do not overlap, what comes out is a fact that is never true"
         );
     }
 
     #[test]
     fn a_touching_boundary_is_not_an_overlap() {
-        // [10,20) 与 [20,30)：半开区间，端点相接不算重叠
+        // [10,20) and [20,30): half-open intervals, touching endpoints are not an overlap
         let edges = [
             te(1, 1, 2, Some(10), Some(20)),
             te(2, 2, 3, Some(20), Some(30)),
@@ -785,21 +840,24 @@ mod tests {
 
     #[test]
     fn depth_is_bounded() {
-        // 一条 40 跳的链，深度上限是 12
+        // A 40-hop chain, with a depth cap of 12
         let edges: Vec<TimedEdge> = (1..=40).map(|i| e(i, i, i + 1)).collect();
         let d = derive(&edges, &transitive());
         let longest = d.facts.iter().map(|x| x.premises.len()).max().unwrap();
         assert!(
             longest <= MAX_DEPTH,
-            "证明长度不该超过深度上限，实际 {longest}"
+            "the proof length should not exceed the depth cap; actual {longest}"
         );
-        assert!(!d.facts.is_empty(), "有上限不等于什么都不推");
+        assert!(
+            !d.facts.is_empty(),
+            "having a cap does not mean deriving nothing"
+        );
     }
 
     #[test]
     fn symmetric_feeds_the_transitive_chain() {
-        // 同时声明对称与传递：1→2 与 3→2 断言过，对称推出 2→3，
-        // 于是传递能接上 1→3
+        // Symmetry and transitivity declared together: 1→2 and 3→2 are asserted, symmetry
+        // derives 2→3, and then transitivity can join up 1→3
         let both = with(Axioms {
             symmetric: true,
             transitive: true,
@@ -808,30 +866,37 @@ mod tests {
         let edges = [e(1, 1, 2), e(2, 3, 2)];
         let d = derive(&edges, &both);
         let got = pairs(&d);
-        assert!(got.contains(&(2, 1)) && got.contains(&(2, 3)), "两条对称边");
-        assert!(got.contains(&(1, 3)), "对称推出来的边要能继续参与传递");
+        assert!(
+            got.contains(&(2, 1)) && got.contains(&(2, 3)),
+            "the two symmetric edges"
+        );
+        assert!(
+            got.contains(&(1, 3)),
+            "a symmetry-derived edge must still feed transitivity"
+        );
     }
 
     #[test]
     fn each_predicate_is_closed_on_its_own() {
-        // 99 传递、98 不是：跨谓词不该接成链
+        // 99 is transitive, 98 is not: a chain should not form across predicates
         let mut other = e(2, 2, 3);
         other.edge.predicate = n(98);
         let edges = [e(1, 1, 2), other];
         let d = derive(&edges, &transitive());
-        assert!(d.facts.is_empty(), "1 →(99) 2 →(98) 3 推不出任何东西");
+        assert!(d.facts.is_empty(), "1 →(99) 2 →(98) 3 derives nothing");
     }
 
-    // ---- 跨谓词的两条规则（inverseOf / subPropertyOf）----
+    // ---- The two cross-predicate rules (inverseOf / subPropertyOf) ----
     //
-    // 上面那些用的都是单谓词 `n(99)`；这两条规则天生要三个谓词才说得清，
-    // 所以另起一组常量与构造器
+    // Everything above uses the single predicate `n(99)`; these two rules need three
+    // predicates by nature before they can be stated, so they get their own constants and
+    // constructors
 
     const P: Uuid = Uuid::from_bytes([1; 16]);
     const Q: Uuid = Uuid::from_bytes([2; 16]);
     const R: Uuid = Uuid::from_bytes([3; 16]);
 
-    /// 指定谓词的一条无时间边
+    /// An edge with no time on it, on a given predicate
     fn ep(pred: Uuid, fact: u8, s: u8, o: u8) -> TimedEdge {
         TimedEdge {
             edge: Edge {
@@ -844,7 +909,7 @@ mod tests {
             to: None,
         }
     }
-    /// 指定谓词、带区间
+    /// A given predicate, with an interval
     fn tep(pred: Uuid, fact: u8, s: u8, o: u8, from: Option<i64>, to: Option<i64>) -> TimedEdge {
         TimedEdge {
             from,
@@ -852,7 +917,7 @@ mod tests {
             ..ep(pred, fact, s, o)
         }
     }
-    /// `p⁻¹ = q` 且 `q⁻¹ = p`——互指，收敛性靠它测
+    /// `p⁻¹ = q` and `q⁻¹ = p` -- mutually pointing; convergence is tested with this
     fn inverse_pair() -> HashMap<Uuid, Axioms> {
         HashMap::from([
             (
@@ -882,66 +947,81 @@ mod tests {
         )])
     }
 
-    /// `A works_at B` ⟹ `B employs A`：主宾对调**且**换谓词。
-    /// 只做一件就是这条规则最常见的写错方式，所以两件都断言。
+    /// `A works_at B` ⟹ `B employs A`: the ends swap **and** the predicate changes.
+    /// Doing only one of them is the commonest way to get this rule wrong, so both are asserted.
     #[test]
     fn the_inverse_swaps_the_ends_and_the_predicate() {
         let d = derive(&[ep(P, 1, 1, 2)], &inverse_pair());
-        assert_eq!(d.facts.len(), 1, "一条边只推出一条逆");
+        assert_eq!(d.facts.len(), 1, "one edge derives exactly one inverse");
         let got = &d.facts[0];
-        assert_eq!(got.predicate, Q, "**谓词换了**");
-        assert_eq!((got.subject, got.object), (n(2), n(1)), "**主宾也对调了**");
+        assert_eq!(got.predicate, Q, "**the predicate changed**");
+        assert_eq!(
+            (got.subject, got.object),
+            (n(2), n(1)),
+            "**the ends swapped too**"
+        );
         assert_eq!(got.rule, Rule::Inverse);
-        assert_eq!(got.via, P, "声明写在 P 上，产出落在 Q 上");
-        assert_eq!(got.premises, vec![f(1)], "证明就是那一条原边");
+        assert_eq!(
+            got.via, P,
+            "the declaration sits on P, the output lands on Q"
+        );
+        assert_eq!(
+            got.premises,
+            vec![f(1)],
+            "the proof is just that one original edge"
+        );
     }
 
-    /// `p⁻¹ = q` 且 `q⁻¹ = p` —— 互指。推回来的那条已经断言过，
-    /// 必须收敛而不是来回震荡。
+    /// `p⁻¹ = q` and `q⁻¹ = p` -- mutually pointing. The edge derived back has already been
+    /// asserted, so this must converge instead of bouncing to and fro.
     #[test]
     fn a_mutual_inverse_settles_instead_of_bouncing() {
         let d = derive(&[ep(P, 1, 1, 2), ep(Q, 2, 2, 1)], &inverse_pair());
         assert!(
             d.facts.is_empty(),
-            "两个方向都已经断言过，一条都不该推——**断言优先**"
+            "both directions have already been asserted, nothing should be derived -- **assertions win**"
         );
     }
 
-    /// `p ⊑ q`：断言具体的，通用的也成立。主宾不动。
+    /// `p ⊑ q`: assert the specific one and the general one holds too. The ends stay put.
     #[test]
     fn a_sub_property_lifts_the_predicate_and_keeps_the_ends() {
         let d = derive(&[ep(P, 1, 1, 2)], &sub_property());
         assert_eq!(d.facts.len(), 1);
         let got = &d.facts[0];
-        assert_eq!(got.predicate, Q, "升到父属性");
-        assert_eq!((got.subject, got.object), (n(1), n(2)), "主宾不动");
+        assert_eq!(got.predicate, Q, "lifted to the parent property");
+        assert_eq!((got.subject, got.object), (n(1), n(2)), "the ends stay put");
         assert_eq!(got.rule, Rule::SubProperty);
         assert_eq!(
             got.via, P,
-            "**via 是声明公理的那个谓词**，不是推出来的那个——落库按它找规则行"
+            "**via is the predicate the axiom was declared on**, not the derived one -- the write finds the rule row by it"
         );
     }
 
-    /// **不换谓词的两条规则，`via` 必须等于 `predicate`。**
+    /// **For the two rules that do not change the predicate, `via` must equal `predicate`.**
     ///
-    /// 这条看着是废话，而它正是那个 bug 藏得住的原因：落库从前按 `predicate`
-    /// 找规则行，对传递与对称一直是对的，所以没人发现键选错了。跨谓词的两条
-    /// 一加，`ceo_of ⊑ works_at` 推出的事实就查不到规则、被静默丢弃。
+    /// This looks like a truism, and it is exactly why that bug could hide: the write used to
+    /// find the rule row by `predicate`, which was right for transitivity and symmetry all
+    /// along, so nobody noticed the key was the wrong one. Add the two cross-predicate rules
+    /// and the fact derived from `ceo_of ⊑ works_at` finds no rule and is dropped silently.
     #[test]
     fn for_the_same_predicate_rules_via_is_the_predicate() {
         let d = derive(&[e(1, 1, 2), e(2, 2, 3)], &transitive());
         assert!(!d.facts.is_empty());
         for f in &d.facts {
-            assert_eq!(f.via, f.predicate, "传递不换谓词");
+            assert_eq!(
+                f.via, f.predicate,
+                "transitivity does not change the predicate"
+            );
         }
     }
 
-    /// **这一条是整次改造的理由**：三条规则串起来。
+    /// **This one is the reason for the whole rework**: three rules chained together.
     ///
     /// `A ceo_of B` ∧ `ceo_of ⊑ works_at` ∧ `works_at⁻¹ = employs`
     ///   ⟹ `A works_at B` ⟹ `B employs A`
     ///
-    /// 按谓词分组的旧结构在第一步就断了。
+    /// The old structure, grouped by predicate, broke at the first step.
     #[test]
     fn a_sub_property_feeds_the_inverse() {
         let mut ax = HashMap::new();
@@ -968,19 +1048,23 @@ mod tests {
             .map(|x| (x.predicate, x.subject.as_bytes()[0], x.object.as_bytes()[0]))
             .collect();
         got.sort();
-        assert!(got.contains(&(Q, 1, 2)), "先升成 works_at");
+        assert!(got.contains(&(Q, 1, 2)), "first lifted to works_at");
         assert!(
             got.contains(&(R, 2, 1)),
-            "**再转成 employs 的反方向**——跨了两个谓词，旧结构做不到"
+            "**then turned into employs the other way round** -- across two predicates, which the old structure could not do"
         );
         assert_eq!(got.len(), 2);
-        // 证明要跟着长：第二跳用掉两条前提里的第一条
+        // The proof grows along with it: the second hop consumes the first of the two premises
         let employs = d.facts.iter().find(|x| x.predicate == R).unwrap();
-        assert_eq!(employs.premises, vec![f(1)], "根还是那条原始断言");
+        assert_eq!(
+            employs.premises,
+            vec![f(1)],
+            "the root is still that original assertion"
+        );
     }
 
-    /// 逆推出来的边要能被传递接上：`p` 传递、`q` 是它的逆，
-    /// `B q A` ∧ `C q B` 应当推出 `C q A`（若 q 也传递）。
+    /// An edge the inverse produces must still be joinable by transitivity: `p` transitive,
+    /// `q` its inverse, and `B q A` ∧ `C q B` should derive `C q A` (if q is transitive too).
     #[test]
     fn what_the_inverse_produces_can_still_be_chained() {
         let mut ax = HashMap::new();
@@ -998,7 +1082,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        // A p B、B p C  ⟹  B q A、C q B  ⟹（q 传递）⟹ C q A
+        // A p B, B p C  ⟹  B q A, C q B  ⟹ (q transitive) ⟹ C q A
         let d = derive(&[ep(P, 1, 1, 2), ep(P, 2, 2, 3)], &ax);
         let got: Vec<(Uuid, u8, u8)> = d
             .facts
@@ -1009,11 +1093,11 @@ mod tests {
         assert!(got.contains(&(Q, 3, 2)));
         assert!(
             got.contains(&(Q, 3, 1)),
-            "**逆产出的边要进邻接表**，否则传递接不上它"
+            "**edges the inverse produces must go into the adjacency table**, otherwise transitivity cannot join onto them"
         );
     }
 
-    /// 区间照旧取交集，跨谓词也一样。
+    /// Intervals are intersected as ever, across predicates too.
     #[test]
     fn the_inverse_carries_the_same_span() {
         let d = derive(&[tep(P, 1, 1, 2, Some(10), Some(20))], &inverse_pair());
@@ -1022,10 +1106,14 @@ mod tests {
             &d.facts[0].premises,
             &HashMap::from([(f(1), (Some(10), Some(20)))]),
         );
-        assert_eq!(v, Some((Some(10), Some(20))), "逆不改变有效期");
+        assert_eq!(
+            v,
+            Some((Some(10), Some(20))),
+            "the inverse leaves the validity period alone"
+        );
     }
 
-    /// 自己是自己的逆 = 对称，但不该推出自环。
+    /// Being its own inverse = symmetric, but it still must not derive self-loops.
     #[test]
     fn a_predicate_that_is_its_own_inverse_still_refuses_self_loops() {
         let ax = HashMap::from([(
@@ -1036,12 +1124,15 @@ mod tests {
             },
         )]);
         let d = derive(&[ep(P, 1, 1, 1)], &ax);
-        assert!(d.facts.is_empty(), "`A p A` 的逆还是 `A p A`——自环不推");
+        assert!(
+            d.facts.is_empty(),
+            "the inverse of `A p A` is still `A p A` -- no self-loops"
+        );
     }
 
-    // ---------- 矛盾（0017） ----------
+    // ---------- Contradictions (0017) ----------
 
-    /// 指定谓词的一条带区间的边
+    /// An edge with an interval, on a given predicate
     fn et(pred: Uuid, fact: u8, s: u8, o: u8, from: Option<i64>, to: Option<i64>) -> TimedEdge {
         TimedEdge {
             edge: Edge {
@@ -1062,8 +1153,9 @@ mod tests {
             .collect()
     }
 
-    /// `ceo_of ⊑ works_at`，works_at functional：Mira 的 ceo_of 推出 works_at Acme，
-    /// 而账本里说她 works_at Globex——派生撞上断言，指名道姓
+    /// `ceo_of ⊑ works_at` with works_at functional: Mira's ceo_of derives works_at Acme,
+    /// while the ledger says she works_at Globex -- a derivation runs into an assertion, and
+    /// names it
     #[test]
     fn a_derivation_that_breaks_functional_names_the_assertion_it_hit() {
         let ax = HashMap::from([
@@ -1098,7 +1190,7 @@ mod tests {
         assert_eq!(c.blocked(), HashSet::from([0]));
     }
 
-    /// 区间不交就不是矛盾：前任与继任
+    /// Disjoint intervals are not a contradiction: the predecessor and the successor
     #[test]
     fn disjoint_intervals_are_succession_and_stay_silent() {
         let ax = HashMap::from([
@@ -1126,8 +1218,8 @@ mod tests {
         assert!(c.with_assertions.is_empty(), "{c:?}");
     }
 
-    /// 对称与非对称：`A p B` 对称推出 `B p A`，而 p 又声明 asymmetric——
-    /// 每条断言都撞上自己的镜像
+    /// Symmetric and asymmetric: symmetry derives `B p A` from `A p B`, while p is also
+    /// declared asymmetric -- every assertion runs into its own mirror image
     #[test]
     fn a_symmetric_derivation_hits_the_asymmetric_assertion() {
         let ax = HashMap::from([(
@@ -1146,7 +1238,7 @@ mod tests {
         assert_eq!(c.with_assertions[0].against, f(1));
     }
 
-    /// 两条派生互撞时按规则对聚合，而且都不落地
+    /// When two derivations clash they are aggregated by rule pair, and neither is written
     #[test]
     fn derivations_that_disagree_are_grouped_by_the_rules_that_made_them() {
         let ax = HashMap::from([
@@ -1165,7 +1257,8 @@ mod tests {
                 },
             ),
         ]);
-        // 1 ceo_of 2 与 1 ceo_of 3：两条 works_at 由同一条规则推出，互相排斥
+        // 1 ceo_of 2 and 1 ceo_of 3: two works_at edges derived by the same rule, mutually
+        // exclusive
         let edges = [ep(P, 1, 1, 2), ep(P, 2, 1, 3), ep(P, 3, 4, 5)];
         let d = derive(&edges, &ax);
         assert_eq!(d.facts.len(), 3);
@@ -1177,12 +1270,12 @@ mod tests {
         assert_eq!(rc.b, (P, Rule::SubProperty));
         assert_eq!(rc.axiom, Kind::Functional);
         assert_eq!(rc.pairs.len(), 1);
-        // 第三条（4 works_at 5）没跟谁撞，照常落地
+        // The third one (4 works_at 5) clashes with nobody and is written as usual
         assert_eq!(c.blocked().len(), 2);
         assert!(!c.blocked().contains(&2));
     }
 
-    /// 谓词上没有公理就没有矛盾可言
+    /// With no axioms on the predicate there is no contradiction to speak of
     #[test]
     fn a_predicate_without_axioms_cannot_contradict() {
         let ax = HashMap::from([(

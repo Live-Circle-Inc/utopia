@@ -1,6 +1,7 @@
-/* 全局消息（toast）：模块级单例 + <ToastHost/>（挂在应用根部一次）。
-   任何模块 `import { toast } from "./toast"` 即可弹消息，无需 context 接线。
-   右下角堆叠，success/info 3.8s、error 6s 自动消失，可手动关闭。 */
+/* Global messages (toast): a module-level singleton + <ToastHost/> (mounted once at the app root).
+   Any module can `import { toast } from "./toast"` and pop a message, no context wiring needed.
+   Stacked in the bottom-right corner; success/info disappear after 3.8s and error after 6s, and
+   they can be dismissed by hand. */
 import { useEffect, useState } from "react";
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 

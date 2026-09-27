@@ -49,64 +49,76 @@ import { usePopoverFlip } from "../ui/popoverFlip";
 import { useKb, useKbId } from "../kb";
 import { toast } from "../toast";
 
-/* 画布调色板 —— 结构取自 Semantica GraphWorkspace 源码；基色已中性化：
-   Semantica 原版是钢蓝系（#0B1320/#5A7A9E/#7A92AE），按"chrome 零色偏、
-   彩色只属于数据"的既定原则换成同明度纯灰，类型色混入比例不变 */
-const NODE_SHELL_BASE = "#121212"; // 节点外壳深底（原 #0B1320 的中性化）
-const NODE_CORE_BASE = "#767676"; // 节点核心灰（原 #5A7A9E 的中性化）
-const NODE_BORDER_BASE = "#909090"; // 节点描边（原 #7A92AE 的中性化）
-const NODE_TINT_MIX = 0.14; // 类型色只按 14% 混入外壳（高级感的关键）
-const NODE_CORE_MIX = 0.5; // 核心向类型色的混入比例
-/* 状态环取**节点自己的类型色**，不是两个写死的色相。
+/* Canvas palette -- the structure is taken from the Semantica GraphWorkspace source; the base
+   colours have been neutralised: Semantica's original is steel-blue (#0B1320/#5A7A9E/#7A92AE),
+   and per the established principle "zero colour cast in the chrome, colour belongs to the data
+   only" they are swapped for pure greys of the same lightness; the type-colour mix ratios are
+   unchanged */
+const NODE_SHELL_BASE = "#121212"; // node shell dark base (neutralised #0B1320)
+const NODE_CORE_BASE = "#767676"; // node core grey (neutralised #5A7A9E)
+const NODE_BORDER_BASE = "#909090"; // node border (neutralised #7A92AE)
+const NODE_TINT_MIX = 0.14; // type colour mixes into the shell at only 14% (the key to the refined look)
+const NODE_CORE_MIX = 0.5; // how far the core mixes toward the type colour
+/* The status ring takes **the node's own type colour**, not two hard-coded hues.
 
-   换掉的直接原因是一次撞色：原来的选中金环 `#E7C57C` 就是
-   `rgb(231,197,124)`，与 `EDGE_COLOR_DERIVED` 逐位相同——「这个节点被选中了」
-   和「这条边是推出来的」用同一个颜色说话，而这两件事毫无关系。
-   金色现在专属于「推出来的」。
+   The immediate reason for the change was a colour collision: the old selected gold ring
+   `#E7C57C` is exactly `rgb(231,197,124)`, bit-for-bit identical to `EDGE_COLOR_DERIVED` --
+   "this node is selected" and "this edge was derived" were speaking in the same colour, and the
+   two have nothing to do with each other. Gold now belongs exclusively to "derived".
 
-   往白里混而不是直接用原色：环画在节点自己身上，同色同亮度就看不出是个环。
-   **悬停混得更白、选中混得更少**——悬停时全图不压暗，环要在一片乱线里
-   立刻跳出来；选中时其余都压暗了，节点本来就孤立着，这时候环该说的是
-   「它是谁」，所以更贴近它自己的颜色。 */
-const RING_HOVER_MIX = 0.7; // 悬停：偏白，为的是跳出来
-const RING_SELECT_MIX = 0.35; // 选中：偏本色，为的是认得出
-const EDGE_COLOR = "rgba(163,163,163,0.2)"; // 纯灰（应用户要求，不用钢蓝）
-// 本体没认下的关系：同色更淡。名字来自原文，不该跟词表里的关系看着一样重
+   Mixed toward white rather than used raw: the ring is drawn on the node itself, so at the same
+   colour and the same lightness you cannot tell there is a ring at all.
+   **Hover mixes whiter, selection mixes less** -- on hover nothing else is dimmed, so the ring
+   has to jump straight out of a tangle of lines; on selection everything else is already dimmed
+   and the node stands alone anyway, so what the ring should say then is "who it is", hence
+   closer to its own colour. */
+const RING_HOVER_MIX = 0.7; // hover: toward white, so that it jumps out
+const RING_SELECT_MIX = 0.35; // selected: toward its own colour, so that it is recognisable
+const EDGE_COLOR = "rgba(163,163,163,0.2)"; // pure grey (per user request, no steel blue)
+// Relations the ontology never admitted: same colour, only fainter. The name comes from the
+// source text, so it should not look as heavy as a relation out of the vocabulary
 const EDGE_COLOR_INFERRED = "rgba(163,163,163,0.1)";
-// 推出来的边（R1）。**跟上面两者说的不是一件事**：那两个说「这条边的名字从哪来」，
-// 这个说「这条边根本不是谁说的，是引擎推的」。所以给它自己的色相而不是再淡一档灰——
-// 用户要在余光里就分得出「文档里写的」和「推出来的」
+// Derived edges (R1). **This says something different from the two above**: those two say
+// "where this edge's name came from", this one says "nobody stated this edge at all, the engine
+// derived it". So it gets a hue of its own rather than one more step of faint grey -- the user
+// has to tell "written in a document" from "derived" out of the corner of their eye
 const EDGE_COLOR_DERIVED = "rgba(231,197,124,0.42)";
 const EDGE_COLOR_DERIVED_DIM = "rgba(231,197,124,0.14)";
-/* 争议（0017 §3）：珊瑚橙 `--u-contest`。金是派生、琥珀是警告、粉是危险，
-   它得跟三个都拉开。**整条边换色**——环在节点上、边还是灰的，余光分不出来 */
+/* Contested (0017 §3): coral orange `--u-contest`. Gold is derived, amber is warning, pink is
+   danger, so it has to pull away from all three. **The whole edge changes colour** -- a ring on
+   the node with the edge still grey is indistinguishable in peripheral vision */
 const EDGE_COLOR_CONTEST = "rgba(255,106,61,0.55)";
 const EDGE_FOCUS_CONTEST = "rgba(255,106,61,1)";
 
-/** 相邻两条弧之间的曲率差。太小仍然糊，太大在长边上会甩得离节点很远 */
+/** The curvature difference between two adjacent arcs. Too small and they still smear
+ *  together; too large and on a long edge the arc swings far away from the nodes */
 const EDGE_CURVATURE_STEP = 0.18;
 
-/** 一条边画在哪条弧上；`curvature === 0` = 直线。 */
+/** Which arc an edge is drawn on; `curvature === 0` = a straight line. */
 interface PlacedEdge {
   edge: GraphEdge;
   curvature: number;
-  /** 并进这条边的别的说法（逆关系），悬停时一并显示 */
+  /** The other phrasings folded into this edge (inverse relations), shown along with it on hover */
   alsoLabels: string[];
 }
 
-/** 同一对节点之间的边，画在各自的弧上；逆关系推出来的那些先并掉。
+/** Edges between the same pair of nodes, each drawn on its own arc; the ones derived from
+ *  inverse relations are folded away first.
  *
- *  **两件事，顺序有讲究：先减后分。**
+ *  **Two things, and the order matters: subtract first, then fan out.**
  *
- *  一、`A works_at B` 与它推出的 `B employs A` 是**同一件事的两种说法**，
- *  不是两条知识。画成两条弧只是把冗余画得好看一点。所以逆关系推出来的边
- *  并进它的来源边，说法挂在那条边上。`sub_property`（`ceo_of ⊑ works_at`）
- *  不并——那是两条粒度不同的事实，各自成立。
+ *  One. `A works_at B` and the `B employs A` derived from it are **two phrasings of the same
+ *  thing**, not two pieces of knowledge. Drawing them as two arcs only makes the redundancy look
+ *  prettier. So an edge derived from an inverse relation is folded into its source edge, and the
+ *  phrasing is hung on that edge. `sub_property` (`ceo_of ⊑ works_at`) is not folded -- those are
+ *  two facts at different granularities, each standing on its own.
  *
- *  二、剩下的按**无向对**分组扇开。无向是要点：一条边和它的反向边起终点相反，
- *  按有向对分组会各自成组、各自以为自己是独苗，于是又叠回同一条直线上。
- *  分组用 min/max，而落到弧上时按边自己的方向翻符号——sigma 的曲率是相对
- *  source→target 的，不翻的话反向的弧会绕到同一侧。 */
+ *  Two. The rest are grouped by **undirected pair** and fanned out. Undirected is the point: an
+ *  edge and its reverse have source and target swapped, so grouping by directed pair puts each
+ *  in a group of its own, each thinking itself an only child, and they stack back onto the same
+ *  straight line. Grouping uses min/max, and when landing on an arc the sign is flipped by the
+ *  edge's own direction -- sigma's curvature is relative to source→target, and without the flip
+ *  the reverse edge's arc would bend to the same side. */
 function layOutParallelEdges(edges: GraphEdge[]): {
   edges: PlacedEdge[];
   folded: number;
@@ -118,17 +130,19 @@ function layOutParallelEdges(edges: GraphEdge[]): {
     else m.set(k, [e]);
   };
 
-  // ---- 一、并掉逆关系推出来的边
+  // ---- One. Fold away the edges derived from inverse relations
   const survivors: GraphEdge[] = [];
   const inverses: GraphEdge[] = [];
   for (const e of edges) {
     if (e.derived && e.rule === "inverse") inverses.push(e);
     else survivors.push(e);
   }
-  /* **按前提找来源边，不是按节点对。**
-     一度写成「取那一对节点上的第一条边」，于是 `contains` 挂到了恰好也连着
-     那两点的 `allied_with` 上——而 `contains` 属于 `part_of`。挂错之后
-     界面上看着完全正常，是最难发现的那一种。前提是服务端算出来的，用它。 */
+  /* **Find the source edge by premise, not by node pair.**
+     This was once written as "take the first edge on that pair of nodes", and so `contains`
+     ended up hung on an `allied_with` that happened to connect the same two points -- while
+     `contains` belongs to `part_of`. Once it is hung on the wrong edge the UI looks completely
+     normal, which is the hardest kind to spot. The premises are computed on the server; use
+     them. */
   const onScreen = new Map<string, GraphEdge>();
   for (const e of survivors) onScreen.set(e.id, e);
 
@@ -137,21 +151,24 @@ function layOutParallelEdges(edges: GraphEdge[]): {
   for (const e of inverses) {
     const host = (e.premises ?? []).map((p) => onScreen.get(p)).find(Boolean);
     if (!host) {
-      // 来源边不在这一屏（时间轴筛掉了，或它自己也是推出来的而被过滤了）。
-      // **那就留着它**——并进一条不存在的边等于把这条知识删了
+      // The source edge is not on this screen (the timeline filtered it out, or it is itself
+      // derived and got filtered away).
+      // **Then keep it** -- folding into an edge that does not exist is the same as deleting
+      // this piece of knowledge
       survivors.push(e);
       continue;
     }
     const list = also.get(host.id) ?? [];
-    // 去重：传递推出来的几条 `part_of` 各有各的逆，而前提链都回到同一条边上，
-    // 于是同一个说法会被挂三遍。**说法是名字，不是计数**
+    // Dedupe: several transitively derived `part_of` edges each have their own inverse, and
+    // their premise chains all lead back to the same edge, so the same phrasing gets hung three
+    // times over. **A phrasing is a name, not a count**
     const name = e.label ?? e.predicate ?? "";
     if (!list.includes(name)) list.push(name);
     also.set(host.id, list);
     folded++;
   }
 
-  // ---- 二、剩下的按无向对扇开
+  // ---- Two. Fan the rest out by undirected pair
   const groups = new Map<string, GraphEdge[]>();
   for (const e of survivors) push(groups, pairKey(e.source, e.target), e);
 
@@ -159,7 +176,7 @@ function layOutParallelEdges(edges: GraphEdge[]): {
   for (const group of groups.values()) {
     const n = group.length;
     group.forEach((e, i) => {
-      // 围绕直线对称铺开：n=1 → [0]；n=2 → [-0.5, 0.5]；n=3 → [-1, 0, 1]
+      // Spread out symmetrically around the line: n=1 → [0]; n=2 → [-0.5, 0.5]; n=3 → [-1, 0, 1]
       const offset = n === 1 ? 0 : i - (n - 1) / 2;
       const sign = e.source < e.target ? 1 : -1;
       placed.push({
@@ -171,51 +188,66 @@ function layOutParallelEdges(edges: GraphEdge[]): {
   }
   return { edges: placed, folded };
 }
-// 呼吸周期。动画不是为了好看，是因为静态的一个色差在几百条边里根本注意不到
+// The breathing period. The animation is not there to look good -- a static colour difference
+// simply goes unnoticed among several hundred edges
 const DERIVED_PULSE_MS = 2200;
-// 超过这个数就只上色不动画。**写出来而不是悄悄降级**：每帧重算几千条边的颜色，
-// 换来的是拖不动图，而那时候用户要的是能拖得动
+// Past this count, colour only, no animation. **Stated outright rather than degraded quietly**:
+// recomputing the colour of thousands of edges every frame buys you a graph you cannot drag, and
+// at that point what the user wants is to be able to drag it
 const DERIVED_ANIMATE_MAX = 400;
-// 开关的淡入淡出时长。**比 FADE_MS(320) 略长**：播放淡入是一批边陆续到位，
-// 这个是一整批边同时进出，走慢一点才看得清「那批金线是一起退场的」
+// Fade duration for the toggle. **Slightly longer than FADE_MS(320)**: the playback fade is a
+// batch of edges arriving one after another, this is a whole batch entering or leaving at once,
+// and only at a slower pace can you see that "that batch of gold lines left together"
 const DERIVED_TOGGLE_MS = 420;
-/* 推出来的边**比事实晚一点进来**，然后整体淡入。
+/* Derived edges **arrive a little later than the facts**, then fade in as a whole.
 
-   试过把推导过程演出来：前提按顺序点亮、最后点亮结论。做了两版都读不懂——
-   第一版前提闪一下就灭，等结论出现时前提早暗了；第二版改成整组同亮同收，
-   仍然是几十组在图上此起彼伏，谁属于谁根本分不出。
-   **一张几百条边的图不是讲因果链的地方**——那件事侧栏的 Derived 页
-   一条一条写着，看得清楚得多。这里只需要交代一件事：这些边是后来的、
-   跟别人写下的不是一回事。晚一点进来 + 自己的颜色，已经说完了。 */
-const DERIVE_SETTLE_MS = 500; // 事实落位之后，隔多久轮到推出来的
-const DERIVE_FADE_MS = 620; // 整体淡入的时长，比开关那一档慢，是"入场"不是"切换"
-// 图例最多摆几个胶囊，其余收进「+N 个类」。**这一排是横向排布的，
-// 类一多就会换行、把画布顶到下面去**；而且十几个同样的胶囊排开，
-// 谁也读不出哪个重要。收起来的那些从「+N」里搜得到
+   Tried animating the derivation itself: light up the premises in order, then light up the
+   conclusion last. Two versions were built and neither was readable -- in the first the premises
+   flashed and died, so by the time the conclusion appeared the premises were long dark; the
+   second lit and released each whole group together, and it was still dozens of groups rising
+   and falling all over the graph with no way to tell which belonged to which.
+   **A graph of several hundred edges is not the place to tell a causal chain** -- the sidebar's
+   Derived tab writes them out one by one, and far more legibly. All that is needed here is one
+   thing: these edges came later, and they are not the same kind of thing as what somebody wrote
+   down. Arriving a little later + a colour of their own already says it all. */
+const DERIVE_SETTLE_MS = 500; // how long after the facts land before the derived ones follow
+const DERIVE_FADE_MS = 620; // overall fade-in, slower than the toggle: an "entrance", not a "switch"
+// How many chips the legend lays out at most; the rest go into "+N types". **This row is laid
+// out horizontally, so with many types it wraps and pushes the canvas down**; and with a dozen
+// identical chips in a row nobody can read which one matters. The collapsed ones can still be
+// found from "+N"
 const LEGEND_MAX = 6;
-/* 画多少个节点的可选档位。**给档位而不是给输入框**：这个数没有「精确」可言
-   ——它只影响看得清还是拖得动，用户要的是「多点/少点」，不是 237 这个数。
-   最大值与后端 GRAPH_NODE_CAP_MAX 对齐；再高先垮的是拖动，不是清晰度 */
+/* The selectable steps for how many nodes to draw. **Steps rather than a text field**: there is
+   no such thing as "precise" for this number -- it only affects whether you can see clearly or
+   can still drag, and what the user wants is "more/fewer", not the number 237.
+   The maximum matches the backend's GRAPH_NODE_CAP_MAX; above that what breaks first is
+   dragging, not clarity */
 const NODE_BUDGETS: number[] = [150, 300, 600, 1000];
-// 注意：sigma 边着色器在预乘混合(ONE, ONE_MINUS_SRC_ALPHA)下不预乘 RGB，
-// alpha 无法压暗边——暗度必须编码进 RGB（不透明近背景色）
+// Note: sigma's edge shader does not premultiply RGB under premultiplied blending
+// (ONE, ONE_MINUS_SRC_ALPHA), so alpha cannot dim an edge -- the dimness has to be encoded into
+// the RGB (an opaque near-background colour)
 const EDGE_DIM = "#141414";
-/* 幽灵边：没落地的派生。同一个色相往 EDGE_DIM 混（预乘混合下 alpha 压不暗边），
-   更细。sigma 默认的边程序画不了虚线，也不为此另写一个 */
+/* Ghost edges: derivations that never landed. The same hue mixed toward EDGE_DIM (under
+   premultiplied blending alpha cannot dim an edge), and thinner. Sigma's default edge program
+   cannot draw dashes, and it is not worth writing another one just for this */
 const EDGE_GHOST = lerpColor("rgba(255,106,61,1)", EDGE_DIM, 0.55);
 const EDGE_GHOST_FOCUS = lerpColor("rgba(255,106,61,1)", EDGE_DIM, 0.2);
 const EDGE_FOCUS = "rgba(255,255,255,0.55)";
-// 选中/悬停时的派生边。**不能跟着走白**：选中恰恰是看得最仔细的时候，
-// 而这时候「这条边是推出来的、没人写过」比任何时候都该说清楚。
-// 从前一律 EDGE_FOCUS，一选中金线就变白，等于把来历抹掉了。
-// 比常态的金更亮更实——它同样要表达「被选中了」
+// Derived edges when selected/hovered. **They must not go white along with everything else**:
+// selection is exactly the moment of closest inspection, and that is when "this edge was
+// derived, nobody ever wrote it" needs saying more than at any other time.
+// This used to be EDGE_FOCUS across the board, so selecting turned the gold lines white, which
+// erased where they came from.
+// Brighter and more solid than the normal gold -- it still has to express "selected"
 const EDGE_FOCUS_DERIVED = "rgba(255,214,140,0.95)";
 const MUTED_SHELL = "#151515";
-/* 悬停时其余的压暗程度。**比选中轻**（选中是压到底）：
-   悬停是随鼠标走的、每划过一个节点就换一次，压到底会让整张画布不停明灭；
-   而且两者压得一样重的话，"我只是路过"和"我选中了它"就成了同一个画面。
-   所以留一档差：压得深，但不到底——看得出焦点，也看得出这只是路过。
-   （试过 0.55，太浅，焦点不够跳）*/
+/* How far everything else is dimmed on hover. **Lighter than selection** (selection dims to the
+   floor): hover follows the mouse and changes every time you sweep across a node, so dimming to
+   the floor would make the whole canvas flicker without end; and if the two dimmed equally hard,
+   "I am just passing by" and "I selected it" would be the same picture.
+   So a step is left between them: dimmed deeply, but not to the floor -- you can see the focus,
+   and you can also see that this is only passing by.
+   (Tried 0.55: too shallow, the focus did not stand out enough)*/
 const HOVER_MUTE = 0.78;
 const PILL_BG = "rgba(12,12,12,0.9)";
 const PILL_BORDER = "rgba(255,255,255,0.14)";
@@ -230,7 +262,7 @@ function hexToRgb(hex: string): [number, number, number] {
   return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
 }
 
-/** c1 向 c2 按 t 比例混色 */
+/** Mix c1 toward c2 by the ratio t */
 function mix(c1: string, c2: string, t: number): string {
   const [r1, g1, b1] = hexToRgb(c1);
   const [r2, g2, b2] = hexToRgb(c2);
@@ -238,7 +270,7 @@ function mix(c1: string, c2: string, t: number): string {
   return `rgb(${f(r1, r2)},${f(g1, g2)},${f(b1, b2)})`;
 }
 
-/* 播放淡入：解析 hex / rgb / rgba（含 alpha）并线性插值 */
+/* Playback fade: parse hex / rgb / rgba (alpha included) and interpolate linearly */
 function parseRgba(c: string): [number, number, number, number] {
   if (c.startsWith("#")) {
     const [r, g, b] = hexToRgb(c);
@@ -256,13 +288,15 @@ function lerpColor(from: string, to: string, t: number): string {
   const f = (i: number) => a[i] + (b[i] - a[i]) * t;
   return `rgba(${Math.round(f(0))},${Math.round(f(1))},${Math.round(f(2))},${f(3).toFixed(3)})`;
 }
-/** 播放中新元素的淡入时长 */
+/** Fade-in duration for elements that are new during playback */
 const FADE_MS = 320;
 
-/* 世界坐标网格：随相机平移/缩放（Figma/tldraw 式无限画布惯例）。
-   4 倍细分 LOD：每层 alpha 随其屏幕间距连续淡入（13px 进场 → 52px 满亮 5.5%），
-   粗层与细层线重合处自然叠亮，形成"大小格"层次；无任何跳变。 */
-const GRID_BASE_WORLD = 24; // 基准世界格距（匹配 ~300 尺度的布局）
+/* World-coordinate grid: pans/zooms with the camera (the Figma/tldraw infinite-canvas
+   convention). 4x subdivision LOD: each level's alpha fades in continuously with its on-screen
+   spacing (entering at 13px → full 5.5% at 52px), and where the coarse and fine lines coincide
+   they stack brighter of their own accord, forming a "major/minor cell" hierarchy; no jumps
+   anywhere. */
+const GRID_BASE_WORLD = 24; // base world cell spacing (matches the ~300-scale layout)
 const GRID_FADE_IN_PX = 13;
 const GRID_FULL_PX = 52;
 const GRID_MAX_LEVEL_PX = 480;
@@ -283,13 +317,14 @@ function drawWorldGrid(canvas: HTMLCanvasElement, sigma: Sigma): void {
   ctx.clearRect(0, 0, width, height);
   if (width <= 0 || height <= 0) return;
 
-  // 世界→屏幕：两个探针点求每世界单位像素数与原点位置（无相机旋转场景）
+  // World→screen: two probe points give the pixels per world unit and the origin's position
+  // (no camera rotation in this scene)
   const p0 = sigma.graphToViewport({ x: 0, y: 0 });
   const p1 = sigma.graphToViewport({ x: 1, y: 0 });
   const ppw = p1.x - p0.x;
   if (!Number.isFinite(ppw) || ppw <= 0) return;
 
-  // 最细可见层级：屏幕间距 ≥ 淡入阈值的最小 4 幂格距
+  // Finest visible level: the smallest power-of-4 spacing whose screen gap ≥ the fade-in threshold
   let spacing = GRID_BASE_WORLD;
   while (spacing * ppw < GRID_FADE_IN_PX) spacing *= 4;
   while (spacing * ppw >= GRID_FADE_IN_PX * 4) spacing /= 4;
@@ -320,7 +355,7 @@ function drawWorldGrid(canvas: HTMLCanvasElement, sigma: Sigma): void {
   }
 }
 
-/* 胶囊标签：深色圆角底 + 柔和文字（学 Semantica 的浮签风格） */
+/* Chip label: dark rounded backing + soft text (borrowing Semantica's floating-tag style) */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function drawPillLabel(
   ctx: CanvasRenderingContext2D,
@@ -328,9 +363,11 @@ function drawPillLabel(
   settings: any,
 ): void {
   if (!data.label) return;
-  // hover 时悬浮卡（drawHoverCard）接管展示，底层 pill 隐去，避免双层标签
+  // On hover the hover card (drawHoverCard) takes over the display and the underlying pill is
+  // hidden, to avoid two layers of label
   if (data.hideBaseLabel) return;
-  // Semantica chip: fontSize=clamp(10, size*0.25, 11), pad 6/3, radius 6, 位于节点上方，投影 blur 12
+  // Semantica chip: fontSize=clamp(10, size*0.25, 11), pad 6/3, radius 6, above the node,
+  // shadow blur 12
   const size = Math.max(10, Math.min(11, data.size * 0.25));
   ctx.font = `500 ${size}px Geist, Inter, "Noto Sans SC", sans-serif`;
   ctx.textBaseline = "middle";
@@ -356,7 +393,7 @@ function drawPillLabel(
   ctx.restore();
 }
 
-/* Hover 悬浮卡（Semantica hoverCard 规格）：径向柔光 + 名称 + 类型行 */
+/* Hover card (the Semantica hoverCard spec): radial glow + name + type line */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function drawHoverCard(
   ctx: CanvasRenderingContext2D,
@@ -366,7 +403,7 @@ function drawHoverCard(
   if (!data.label) return;
   ctx.save();
 
-  // 柔光: 半径 max(size*4.8, 16), 类型色 alpha 0.18 → 0
+  // Glow: radius max(size*4.8, 16), type colour alpha 0.18 → 0
   const glowR = Math.max(data.size * 4.8, 16);
   const [r, g, b] = hexToRgb((data.typeColor as string) ?? "#888888");
   const grad = ctx.createRadialGradient(
@@ -384,7 +421,7 @@ function drawHoverCard(
   ctx.arc(data.x, data.y, glowR, 0, Math.PI * 2);
   ctx.fill();
 
-  // 卡片: 标题 700/13 + 类型行 500/10 大写
+  // Card: title 700/13 + type line 500/10 uppercase
   const titleSize = 13;
   const metaSize = 10;
   const padX = 10;
@@ -424,10 +461,10 @@ function drawHoverCard(
 export function Graph() {
   const kbId = useKbId();
   const { kb } = useKb();
-  /* 地址栏与画面**双向**同步。
-     从前只有"进"这一半：`?entity=` 在挂载时读一次就再不管了——
-     别人给的链接能用，而你自己看到的东西却没法分享，因为地址栏一直停在
-     光秃秃的 /graph。 */
+  /* The address bar and the view stay in sync **both ways**.
+     There used to be only the "in" half: `?entity=` was read once on mount and then ignored --
+     a link somebody else gave you worked, but what you were looking at yourself could not be
+     shared, because the address bar stayed parked on a bare /graph. */
   const search = useSearch({ from: "/app/kb/$kbId/graph" });
   const navigate = useNavigate();
   const entityParam = search.entity;
@@ -438,25 +475,32 @@ export function Graph() {
   const [searchInput, setSearchInput] = useState("");
   const [searchQ, setSearchQ] = useState("");
   const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set());
-  // 推出来的边显不显示。默认显示——推理默认关着，有派生就意味着用户开过开关
+  // Whether derived edges are shown. Shown by default -- inference is off by default, so having
+  // any derivations at all means the user turned the switch on at some point
   const [showDerived, setShowDerived] = useState(true);
-  // 信息窗默认收起：它答的是「什么时候推的」，那是偶尔才问的问题
-  /* Inference 也用原地展开，与「+N 个类」、通知、用户菜单同一套。
-     **贴左下角**：塔在画布左下，面板要从那个 ⋯ 按钮往右上长开 */
+  // The info window is collapsed by default: it answers "when was this derived", and that is a
+  // question only asked occasionally
+  /* Inference expands in place too, the same mechanism as "+N types", the notifications and the
+     user menu. **Anchored to the bottom left corner**: the tower sits at the canvas's bottom
+     left, so the panel has to grow up and to the right out of that ⋯ button */
   const derivedPop = usePopoverFlip<HTMLButtonElement, HTMLDivElement>(
     "bottom left",
   );
-  /* 「+N 个类」用与通知/用户卡片同一套原地展开：面板压到 chip 的真实边界
-     （圆角 999px）再长成卡片。**贴左边，所以锚点角是 top left** */
+  /* "+N types" uses the same in-place expansion as the notification/user cards: the panel
+     collapses onto the chip's real bounds (999px radius) and then grows into a card.
+     **It hugs the left edge, so the anchor corner is top left** */
   const legendPop = usePopoverFlip<HTMLButtonElement, HTMLDivElement>(
     "top left",
   );
   const [legendQ, setLegendQ] = useState("");
-  /* 正在退场的实体。**面板不能一取消选中就卸载**——那样它是瞬间消失的。
-     先留在原地演完退场，再真的移除。用 selectedRef 取当前值而不是把
-     setState 写成带副作用的 updater：那种写法在 StrictMode 下会跑两遍 */
+  /* The entity currently leaving. **The panel must not unmount the moment selection is
+     cleared** -- that way it simply vanishes. It stays where it is until the exit animation has
+     played out, and only then is it really removed. The current value is read through
+     selectedRef rather than by writing setState as an updater with side effects: that form runs
+     twice under StrictMode */
   const [exiting, setExiting] = useState<string | null>(null);
-  // 打开面板时想停在哪一档、展开哪一行——幽灵边点进来时用
+  // Which tab to land on and which row to expand when the panel opens -- used when arriving by
+  // clicking a ghost edge
   const panelIntentRef = useRef<{ view: "derived"; open: string } | null>(null);
   const deselect = useCallback(() => {
     const cur = selectedRef.current;
@@ -465,11 +509,13 @@ export function Graph() {
     setSelected(null);
     window.setTimeout(() => setExiting(null), 170);
   }, []);
-  /** null = 全时段；数值 = as-of 时刻(ms)。
-      默认 as-of 今天：时态平台的图谱默认呈现"现在的世界"，
-      已闭合的事实不该与现行事实无差别并列（All time 是显式选择） */
-  /* 时间轴。URL 里带了就用它：`all` = 全时段，否则按 YYYY-MM-DD 解析
-     （与数据的 day 级精度一致，也比一串毫秒好读） */
+  /** null = all time; a number = the as-of instant (ms).
+      As-of today by default: a temporal platform's graph presents "the world as it is now" by
+      default, and closed facts should not sit indistinguishably alongside current ones
+      (All time is an explicit choice) */
+  /* The timeline. If the URL carries one, use it: `all` = all time, otherwise parsed as
+     YYYY-MM-DD (matching the data's day-level precision, and easier to read than a run of
+     milliseconds) */
   const [timeT, setTimeT] = useState<number | null>(() => {
     if (search.at === "all") return null;
     if (search.at) {
@@ -480,27 +526,28 @@ export function Graph() {
   });
   const [activeCount, setActiveCount] = useState(0);
   const [stabilizing, setStabilizing] = useState(false);
-  /* 播放态提升到此层：reducer 需区分"播放推进"（淡入）与"手动拖动"（瞬切） */
+  /* Playback state is lifted to this level: the reducer has to distinguish "playback advancing"
+     (fade in) from "manual dragging" (instant switch) */
   const [playing, setPlaying] = useState(false);
 
-  /* 画面 → 地址栏。**replace 不是 push**：点节点是浏览不是导航，
-     堆进历史会把「后退」变成逐个撤销点击。
-     播放中整段跳过——每帧写一次 URL 是灾难 */
+  /* View → address bar. **replace, not push**: clicking a node is browsing, not navigating, and
+     piling it into history would turn "back" into undoing clicks one at a time.
+     Skipped wholesale during playback -- writing the URL once per frame is a disaster */
   useEffect(() => {
     if (playing) return;
     const at =
       timeT === null
         ? "all"
-        : // 停在「现在」就不写。否则每次打开都在地址栏拖一串今天的日期，
-          // 而那本来就是默认值
+        : // If it is parked at "now", write nothing. Otherwise every visit drags a run of
+          // today's date through the address bar, and that was the default value anyway
           Math.abs(timeT - Date.now()) < DAY_MS
           ? undefined
           : new Date(timeT).toISOString().slice(0, 10);
     const next = {
       entity: selected ?? undefined,
-      // **与 entity 相同就不写**：点搜索结果会同时设这两个，
-      // 照直写出来地址栏里就是同一串 UUID 出现两遍。
-      // 只有"聚焦在 A 的邻域、却选中了 B"时它才带信息
+      // **Omitted when it is identical to entity**: clicking a search result sets both of them,
+      // and written out literally the address bar shows the same UUID twice over.
+      // It only carries information when "focused on A's neighbourhood but B is selected"
       focus:
         focusEntity && focusEntity !== selected ? focusEntity : undefined,
       at,
@@ -528,22 +575,23 @@ export function Graph() {
     navigate,
   ]);
 
-  /* 地址栏 → 画面。**这一半是给后退/前进用的**：没有它，浏览器回退
-     只改地址不改画面，看起来像后退失灵。两个方向都先比较再动手，所以不会打架 */
+  /* Address bar → view. **This half is what back/forward run on**: without it the browser's
+     back button changes the address but not the view, which looks like back is broken. Both
+     directions compare before acting, so they do not fight each other */
   useEffect(() => {
     const e = search.entity ?? null;
     const f = search.focus ?? null;
     setSelected((cur) => (cur === e ? cur : e));
     setFocusEntity((cur) => (cur === f ? cur : f));
   }, [search.entity, search.focus]);
-  /* 布局模式：force = FA2 斥力；circular = 圆环；pack = 按类型圆填充聚簇 */
+  /* Layout modes: force = FA2 repulsion; circular = ring; pack = circle-packed clusters by type */
   type LayoutMode = "force" | "circular" | "pack";
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("force");
   const layoutModeRef = useRef<LayoutMode>("force");
   const layoutCtlRef = useRef<{ apply: (m: LayoutMode) => void } | null>(null);
 
-  /* 画多少个。**进 queryKey**——不进的话调了档位不会重新取数，
-     界面看着变了实际还是老数据 */
+  /* How many to draw. **It goes into the queryKey** -- without that, changing the step does not
+     refetch, and the UI looks changed while the data underneath is still the old data */
   const [nodeBudget, setNodeBudget] = useState<number>(NODE_BUDGETS[0]);
 
   const data = useQuery({
@@ -555,10 +603,12 @@ export function Graph() {
     enabled: !!kb,
   });
 
-  // 全图模式走全库实体搜索；子图模式只在已加载的子图内客户端过滤
+  // Overview mode searches entities across the whole KB; subgraph mode filters client-side
+  // within the already-loaded subgraph
   const inSubgraph = !!focusEntity;
-  // 搜到的条数上限。**「加载更多」而不是翻页**：这是个下拉建议框，
-  // 用户在找一个具体的实体，翻页会让他丢掉刚才扫过的那几条
+  // The cap on how many hits come back. **"Load more" rather than pagination**: this is a
+  // suggestion dropdown, the user is hunting for one specific entity, and paging would make them
+  // lose the few rows they just scanned
   const [searchLimit, setSearchLimit] = useState(10);
   useEffect(() => setSearchLimit(10), [searchQ]);
   const candidates = useQuery({
@@ -585,17 +635,18 @@ export function Graph() {
   const containerRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<HTMLCanvasElement>(null);
   const sigmaRef = useRef<Sigma | null>(null);
-  /* 焦点 = hover 优先于选中；样式在 reducer 里统一处理 */
+  /* Focus = hover takes precedence over selection; styling is handled uniformly in the reducer */
   const selectedRef = useRef<string | null>(null);
   const hoverRef = useRef<string | null>(null);
-  /** 鼠标停在哪条边上。用来把并进它的逆关系说法亮出来 */
+  /** Which edge the mouse is resting on. Used to surface the inverse phrasings folded into it */
   const hoverEdgeRef = useRef<string | null>(null);
   const filterRef = useRef<{
     hiddenTypes: Set<string>;
     activeNodes: Set<string> | null;
     activeEdges: Set<string> | null;
-    /** 推出来的边显不显示。**默认显示**——推理默认是关的，所以有派生边就意味着
-     *  用户主动开过开关；但要能一键藏起来，看「只有人说过的那张图」长什么样 */
+    /** Whether derived edges are shown. **Shown by default** -- inference is off by default, so
+     *  having derived edges at all means the user turned the switch on themselves; but it has to
+     *  be hideable in one click, to see what "the graph of only what people said" looks like */
     showDerived: boolean;
   }>({
     hiddenTypes: new Set(),
@@ -604,7 +655,8 @@ export function Graph() {
     showDerived: true,
   });
   const playingRef = useRef(false);
-  /* 播放淡入表：本轮新激活的节点/边 id → 激活时刻（rAF 循环驱动至到位） */
+  /* Playback fade table: the ids of nodes/edges newly activated this round → the instant of
+     activation (an rAF loop drives them to completion) */
   const fadeRef = useRef<Map<string, number>>(new Map());
   const fadeRafRef = useRef(0);
 
@@ -625,7 +677,7 @@ export function Graph() {
   useEffect(() => {
     playingRef.current = playing;
     if (!playing) {
-      // 停止播放：未完成的淡入直接到位
+      // Playback stopped: unfinished fades snap straight to completion
       fadeRef.current.clear();
       sigmaRef.current?.refresh();
     }
@@ -639,8 +691,9 @@ export function Graph() {
       { label: string; color: string; shape: string; count: number }
     >();
     for (const n of data.data?.nodes ?? []) {
-      // 没判出类型的归到空 key 一档（0009）。真实 key 由 IRI 派生，不可能为空，
-      // 所以它撞不着任何一个类；标签走 i18n，别把 null 画到图例上
+      // Nodes whose type was never determined go under the empty key (0009). Real keys are
+      // derived from IRIs and can never be empty, so it cannot collide with any type; the label
+      // goes through i18n -- do not draw a null onto the legend
       const key = n.type_key ?? "";
       const cur = map.get(key);
       if (cur) cur.count++;
@@ -652,29 +705,32 @@ export function Graph() {
           count: 1,
         });
     }
-    // **按出现次数排，不是按遇到的先后**。图例只摆得下几个，那几个位置该给
-    // 画面上最多的类；从前是节点到达顺序，等于随机。次数相同按标签排——
-    // 否则同样的数据每次刷新顺序都在抖
+    // **Sorted by occurrence count, not by the order they were met in**. The legend only fits a
+    // few, and those slots should go to the types that dominate the picture; it used to be node
+    // arrival order, which is effectively random. Ties break on the label -- otherwise the same
+    // data jitters into a different order on every refresh
     return [...map.entries()].sort(
       (a, b) => b[1].count - a[1].count || a[1].label.localeCompare(b[1].label),
     );
   }, [data.data]);
 
-  /* 摆得下的 / 收起来的。收起来的那些仍然可以在「+N」里搜到并切换 */
+  /* The ones that fit / the ones collapsed away. The collapsed ones can still be found and
+     toggled from "+N" */
   const legendShown = types.slice(0, LEGEND_MAX);
   const legendRest = types.slice(LEGEND_MAX);
-  // 被收起来的类里有没有正被隐藏的。**没有这个标记就是无声过滤**——
-  // 在面板里关掉一个类、把面板一收，界面上再没有任何东西说它被关了
+  // Whether any of the collapsed types is currently hidden. **Without this marker it is silent
+  // filtering** -- turn a type off inside the panel, collapse the panel, and nothing in the UI
+  // says any longer that it is off
   const hiddenInRest = legendRest.filter(([k]) => hiddenTypes.has(k)).length;
 
-  // 有几条推出来的边。**为零时那个开关整个不出现**——一个没开推理的库不该
-  // 看到一个永远切换不出任何变化的按钮
+  // How many derived edges there are. **At zero the switch does not appear at all** -- a KB
+  // with inference off should not be shown a button that never toggles anything visible
   const derivedCount = useMemo(
     () => (data.data?.edges ?? []).filter((e) => e.derived).length,
     [data.data],
   );
 
-  /* 时间过滤：计算 T 时刻的活跃边/节点集合 */
+  /* Time filtering: compute the set of active edges/nodes at the instant T */
   const recomputeActive = useCallback(
     (t: number | null) => {
       const d = data.data;
@@ -702,9 +758,10 @@ export function Graph() {
             nodes.add(e.target);
           }
         }
-        // 没有任何边的孤立节点保持可见
+        // Isolated nodes with no edges at all stay visible
         for (const n of d.nodes) if (!touched.has(n.id)) nodes.add(n.id);
-        // 播放推进时新出现的元素淡入登场；手动拖动保持瞬时切换
+        // Elements newly appearing as playback advances fade in; manual dragging keeps the
+        // instant switch
         if (playingRef.current) {
           const now = performance.now();
           for (const id of edges)
@@ -729,10 +786,12 @@ export function Graph() {
   }, [hiddenTypes, showDerived]);
 
   const deriveRafRef = useRef(0);
-  /* 演完之前派生边不出现。**开关是"要不要显示"，这个是"演到了没有"**——
-     两件事，混成一个会让关掉再打开时少演一遍 */
+  /* Derived edges do not appear until the entrance has played. **The switch is "should they be
+     shown", this is "has the entrance played yet"** -- two different things, and merging them
+     means one entrance is skipped when you switch off and on again */
   const [derivedRevealed, setDerivedRevealed] = useState(false);
-  /* reducer 是每帧跑的闭包，读 state 会读到旧值——它只认 ref */
+  /* The reducer is a closure that runs every frame, and reading state there reads a stale
+     value -- it only understands refs */
   const derivedRevealedRef = useRef(false);
   useEffect(() => {
     derivedRevealedRef.current = derivedRevealed;
@@ -741,7 +800,8 @@ export function Graph() {
 
   const revealDerived = useCallback(() => {
     setDerivedRevealed(true);
-    // 复用开关那套淡入：方向为"开"，从近背景色亮到常态
+    // Reuse the toggle's fade: direction "on", brightening from the near-background colour up to
+    // normal
     derivedToggleRef.current = { at: performance.now(), on: true };
     const step = () => {
       const tr = derivedToggleRef.current;
@@ -756,30 +816,34 @@ export function Graph() {
 
   useEffect(() => () => cancelAnimationFrame(deriveRafRef.current), []);
 
-  /* 开关的淡入淡出：{ 起始时刻, 朝哪个方向 }；null = 没有过渡在飞 */
+  /* The toggle's fade: { start instant, which direction }; null = no transition in flight */
   const derivedToggleRef = useRef<{ at: number; on: boolean } | null>(null);
   const derivedRafRef = useRef(0);
-  /* 上一次的开关值。**判「是不是真的切换了」只能靠它**——effect 的依赖里
-     还有 derivedCount，而「Run now 推出新边」会改 count 却没碰开关；
-     只看 effect 触发就淡一次，那是一次没人要求的动画 */
+  /* The previous value of the switch. **It is the only thing that can tell "did it really
+     toggle"** -- the effect's deps also contain derivedCount, and "Run now derives new edges"
+     changes the count without touching the switch; fading once for every effect firing would be
+     an animation nobody asked for */
   const prevShowDerived = useRef(showDerived);
 
-  // 切换时走一段渐变，而不是瞬间消失。**得自己驱动重绘**——关掉时下面那个
-  // 呼吸定时器不转了，没人推 sigma 重画，淡出就会卡在第一帧
+  // Toggling runs a transition rather than vanishing outright. **It has to drive the repaint
+  // itself** -- once switched off the breathing timer below stops running, nobody pushes sigma to
+  // redraw, and the fade-out sticks on its first frame
   useEffect(() => {
     const changed = prevShowDerived.current !== showDerived;
     prevShowDerived.current = showDerived;
-    // 首次挂载与「只有 count 变了」都不是切换：
-    // 进页面时、以及推理跑完刷新计数时，都不该看到一段莫名其妙的淡入
+    // Neither the first mount nor "only the count changed" is a toggle:
+    // on entering the page, and when inference finishes and refreshes the count, you should not
+    // see some inexplicable fade
     if (!changed) return;
-    // 数量太多时不淡：与呼吸同一条线——每帧重算几千条边的颜色换来的是卡顿。
-    // **写出来而不是悄悄降级**
+    // No fade when there are too many of them: the same line as the breathing -- recomputing the
+    // colour of thousands of edges every frame buys you stutter.
+    // **Stated outright rather than degraded quietly**
     if (derivedCount > DERIVED_ANIMATE_MAX) return;
 
     const now = performance.now();
     const prev = derivedToggleRef.current;
-    // 半途反向（用户连点两下）：从当前进度接着走，而不是从头开始——
-    // 否则会看见一次亮度的跳变
+    // Reversing midway (the user clicks twice in a row): carry on from the current progress
+    // rather than starting over -- otherwise you see a jump in brightness
     const at =
       prev && prev.on !== showDerived
         ? now - Math.max(0, DERIVED_TOGGLE_MS - (now - prev.at))
@@ -795,19 +859,23 @@ export function Graph() {
     };
     cancelAnimationFrame(derivedRafRef.current);
     derivedRafRef.current = requestAnimationFrame(step);
-    // **不在这里挂清理**：清理会在依赖变化时也跑一遍，而依赖里有 derivedCount
-    // ——推理恰好在这 420ms 中途跑完，动画就被掐在半路（画面停在一半亮度，
-    // 要等下一次任意重绘才归位）。循环自己会终止；取消只该发生在卸载时
+    // **No cleanup is hung here**: cleanup would also run whenever a dep changes, and
+    // derivedCount is one of the deps -- if inference happens to finish in the middle of these
+    // 420ms the animation gets pinched off halfway (the picture stops at half brightness and
+    // only settles on the next arbitrary repaint). The loop terminates on its own; cancelling
+    // should only happen on unmount
   }, [showDerived, derivedCount]);
 
-  // 卸载时收掉可能在飞的那一帧
+  // On unmount, collect the frame that may still be in flight
   useEffect(() => () => cancelAnimationFrame(derivedRafRef.current), []);
 
-  /* 什么时候进场。两个入口共用一段延时：进页面、以及手动打开开关。
-     **不等布局收敛**——收敛要 2.5 秒，等完人早就在看别处了。
+  /* When the entrance happens. Two entry points share one delay: entering the page, and turning
+     the switch on by hand. **It does not wait for the layout to converge** -- converging takes
+     2.5 seconds, and by the time it is done the person is long since looking elsewhere.
 
-     **顺序本身是内容**：先落位的是人写下的边，然后才轮到推出来的。
-     一起出现就分不清谁在前 */
+     **The order is itself content**: what settles first is the edges people wrote down, and only
+     then do the derived ones get their turn. Appearing together and you cannot tell which came
+     first */
   useEffect(() => {
     if (!showDerived || !data.data) {
       if (!showDerived) setDerivedRevealed(false);
@@ -818,12 +886,14 @@ export function Graph() {
     return () => window.clearTimeout(t);
   }, [showDerived, data.data, derivedRevealed, revealDerived]);
 
-  // 派生边的呼吸。**只在有派生边、且开着显示、且数量不多时才转**——
-  // 一个没开推理的库不该为这件事每两秒重画一次
+  // The derived edges' breathing. **It only runs when there are derived edges, they are being
+  // shown, and there are not too many of them** -- a KB with inference off should not repaint
+  // every two seconds for this
   useEffect(() => {
     const n = derivedCount;
     if (!showDerived || n === 0 || n > DERIVED_ANIMATE_MAX) return;
-    // 与 sigma 的重绘同频即可，不必每帧：呼吸是慢动作，30 fps 看不出差别
+    // Matching sigma's repaint rate is enough, no need for every frame: breathing is slow
+    // motion, and at 30 fps you cannot see the difference
     const timer = setInterval(() => sigmaRef.current?.refresh(), 1000 / 30);
     return () => clearInterval(timer);
   }, [showDerived, derivedCount]);
@@ -844,7 +914,8 @@ export function Graph() {
       if (!g.hasNode(n.id)) {
         g.addNode(n.id, {
           label: n.name,
-          // Semantica 配方：深壳 + 14% 类型 tint，核心 50% tint，钢灰描边微 tint
+          // The Semantica recipe: dark shell + 14% type tint, core at 50% tint, steel-grey
+          // border with a slight tint
           color: mix(NODE_CORE_BASE, n.color, NODE_CORE_MIX),
           shellColor: mix(NODE_SHELL_BASE, n.color, NODE_TINT_MIX),
           borderColor: mix(NODE_BORDER_BASE, n.color, 0.3),
@@ -862,7 +933,8 @@ export function Graph() {
     );
     for (const { edge: e, curvature, alsoLabels } of placed.edges) {
       g.addEdgeWithKey(e.id, e.source, e.target, {
-        // 争议的边标签前置 ⚠：颜色之外再给一个不靠色觉的记号
+        // Contested edge labels are prefixed with ⚠: on top of the colour, a mark that does not
+        // rely on colour vision
         label: (e.contested ? "⚠ " : "") + (e.label?.toUpperCase() ?? ""),
         size: e.blocked ? 0.7 : 1,
         color: e.blocked
@@ -876,28 +948,31 @@ export function Graph() {
                 : EDGE_COLOR,
         contested: e.contested,
         blocked: e.blocked,
-        // 独一条就走直线：曲线是为了把重叠分开，没有重叠就不必弯
+        // A lone edge goes straight: curves exist to pull overlaps apart, and with no overlap
+        // there is nothing to bend
         type: curvature === 0 ? "line" : "curved",
         curvature,
-        // 并进来的逆关系说法，悬停时连着本名一起显示
+        // The inverse phrasings folded in, shown together with its own name on hover
         alsoLabels,
-        // reducer 每帧读它：决定要不要藏、要不要呼吸
+        // The reducer reads this every frame: whether to hide it, whether to breathe
         derived: e.derived,
       });
     }
-    // 布局：先静态铺开，再用 worker 动画稳定 ~2.5s（Semantica 式 stabilizing）
+    // Layout: lay it out statically first, then let the worker animate to stability over ~2.5s
+    // (Semantica-style stabilizing)
     let fa2: InstanceType<typeof FA2Layout> | null = null;
     let stabilizeTimer: ReturnType<typeof setTimeout> | null = null;
-    // 拖拽状态先于 fa2 声明：outputReducer 闭包引用它们
+    // The drag state is declared ahead of fa2: the outputReducer closure references it
     let dragged: string | null = null;
     let dragPos: { x: number; y: number } | null = null;
     let fa2Settings: ReturnType<typeof forceAtlas2.inferSettings> | null = null;
     if (g.order > 0) {
       circular.assign(g, { scale: 300 });
-      /* 试过按规模缩放（gravity 0.12–0.22 / scalingRatio 11–16 + 加大阻尼），
-         拿真实的图一看就否了：散是散开了，但那种"被推开"的张力没了，
-         整张图显得瘫。**这一组是既有的、刻意偏大的**——要的是节点之间
-         互相顶着的感觉，不是最省力的排布 */
+      /* Tried scaling with graph size (gravity 0.12-0.22 / scalingRatio 11-16 + heavier damping),
+         and one look at a real graph killed it: it did spread out, but that tension of "being
+         pushed apart" was gone and the whole graph looked limp. **This set is the existing one
+         and is deliberately on the large side** -- what we want is the feeling of nodes pressing
+         against each other, not the least-effort arrangement */
       const settings = {
         ...forceAtlas2.inferSettings(g),
         gravity: 0.35,
@@ -908,8 +983,9 @@ export function Graph() {
       forceAtlas2.assign(g, { iterations: 60, settings });
       fa2 = new FA2Layout(g, {
         settings,
-        // 关键：回写时把被拖节点钉回光标（不闪）；且提供 outputReducer 后
-        // supervisor 每帧 readGraphPositions —— 光标位置持续进入力模拟
+        // The key: on write-back, pin the dragged node back onto the cursor (no flicker); and
+        // once an outputReducer is supplied the supervisor calls readGraphPositions every frame
+        // -- the cursor position keeps feeding into the force simulation
         outputReducer: (node, attr) => {
           if (dragged && node === dragged && dragPos) {
             attr.x = dragPos.x;
@@ -926,11 +1002,12 @@ export function Graph() {
       }, 2500);
     }
 
-    // 数据重建后布局回到 force（世界重新长出来）
+    // After a data rebuild the layout returns to force (the world grows out again)
     setLayoutMode("force");
     layoutModeRef.current = "force";
 
-    // 任意布局结果统一缩放到 FA2 同量级世界（±target），相机 reset 观感一致
+    // Any layout's result is rescaled to a world of the same magnitude as FA2's (±target), so a
+    // camera reset feels the same either way
     const rescaleWorld = (target = 300) => {
       let minX = Infinity,
         maxX = -Infinity,
@@ -953,7 +1030,8 @@ export function Graph() {
       }));
     };
 
-    // 布局切换控制（挂到 ref 供组件层按钮调用；闭包内直握 g / fa2）
+    // Layout switching control (hung on a ref for the component layer's buttons to call; inside
+    // the closure it holds g / fa2 directly)
     layoutCtlRef.current = {
       apply: (mode) => {
         if (g.order === 0) return;
@@ -974,7 +1052,7 @@ export function Graph() {
         } else if (mode === "circular") {
           circular.assign(g, { scale: 300 });
         } else {
-          // 按实体类型聚簇：同类型挤进同一个圆
+          // Cluster by entity type: nodes of the same type crowd into the same circle
           circlepack.assign(g, { hierarchyAttributes: ["typeKey"] });
           rescaleWorld(300);
         }
@@ -989,7 +1067,7 @@ export function Graph() {
       allowInvalidContainer: true,
       defaultNodeType: "shell",
       nodeProgramClasses: {
-        // Semantica 节点解剖：状态环 → 描边 → 深色壳 → 微彩核心
+        // Semantica node anatomy: status ring → border → dark shell → faintly coloured core
         shell: createNodeBorderProgram({
           borders: [
             { size: { value: 0.1 }, color: { attribute: "ringColor" } },
@@ -1002,12 +1080,13 @@ export function Graph() {
       },
       renderEdgeLabels: true,
       defaultEdgeType: "line",
-      /* 平行边扇成弧（见 `layOutParallelEdges`）。直线那一版把同一对节点之间
-         的每条边画在同一条线段上，于是几个标签逐字符叠成乱码——实测一对节点
-         之间最多压着六条 */
+      /* Parallel edges are fanned into arcs (see `layOutParallelEdges`). The straight-line
+         version drew every edge between the same pair of nodes onto the same segment, so several
+         labels stacked character over character into gibberish -- measured at up to six edges
+         piled between one pair of nodes */
       edgeProgramClasses: { curved: EdgeCurveProgram },
-      // 边的悬停事件默认是关的。开它是为了 `enterEdge`：并进去的那些说法
-      // 要有地方看得见（见 edgeReducer）
+      // Edge hover events are off by default. This turns them on for `enterEdge`: the phrasings
+      // folded in need somewhere they can be seen (see edgeReducer)
       enableEdgeEvents: true,
       labelFont: '"Geist", "Inter", "Noto Sans SC", sans-serif',
       labelSize: 11,
@@ -1026,13 +1105,13 @@ export function Graph() {
         const f = filterRef.current;
         const res = { ...attrs };
         const base = attrs.size as number;
-        // 状态环取节点自己的类型色（见 RING_*_MIX 处的理由）
+        // The status ring takes the node's own type colour (see the reasoning at RING_*_MIX)
         const ownColor = (attrs.typeColor as string) ?? NODE_CORE_BASE;
         if (f.hiddenTypes.has(attrs.typeKey as string)) {
           res.hidden = true;
           return res;
         }
-        // Semantica 状态表: muted { ×0.52, 全层压暗 }
+        // Semantica state table: muted { ×0.52, every layer dimmed }
         const muteNode = () => {
           res.size = base * 0.52;
           res.color = mix(MUTED_SHELL, NODE_CORE_BASE, 0.3);
@@ -1042,8 +1121,9 @@ export function Graph() {
           res.label = "";
           res.zIndex = 0;
         };
-        /* 悬停时其余的按 HOVER_MUTE 压一档（选中是压到底）。
-           邻居不压——悬停要回答的是"它连着谁"，把邻居也压掉就等于没回答 */
+        /* On hover everything else is dimmed one step by HOVER_MUTE (selection dims to the
+           floor). The neighbours are not dimmed -- what hover has to answer is "what is it
+           connected to", and dimming the neighbours too is the same as not answering */
         const softMute = () => {
           res.size = base * (1 - 0.48 * HOVER_MUTE);
           res.color = lerpColor(
@@ -1064,13 +1144,15 @@ export function Graph() {
         if (hoverRef.current === node) {
           res.size = Math.max(base * 1.08, 10.4);
           res.ringColor = mix(ownColor, "#ffffff", RING_HOVER_MIX);
-          // 悬浮卡接管标签展示；label 本身保留（悬浮卡靠它渲染标题）
+          // The hover card takes over label display; label itself is kept (the hover card uses
+          // it to render the title)
           res.hideBaseLabel = true;
           res.zIndex = 4;
           return res;
         }
         const hov = hoverRef.current;
-        // 选中实体可能不在当前画布（侧栏跳转/邻域重载间隙）——不在则跳过聚焦压暗逻辑
+        // The selected entity may not be on the current canvas (sidebar navigation / the gap
+        // during a neighbourhood reload) -- if it is not, skip the focus-dimming logic
         const sel =
           selectedRef.current && g.hasNode(selectedRef.current)
             ? selectedRef.current
@@ -1092,10 +1174,12 @@ export function Graph() {
             return res;
           }
         } else if (hov && hov !== node && !g.areNeighbors(hov, node)) {
-          // **悬停也压暗其余**，只是比选中轻一档（见 HOVER_MUTE）。
-          // 邻居留着：悬停要回答的正是"它连着谁"。
-          // **此刻还不存在的节点直接压到底**：这个分支会提前 return，
-          // 绕过下面那道时间过滤，只压一半的话它反而比不 hover 时更亮
+          // **Hover dims everything else too**, just one step lighter than selection (see
+          // HOVER_MUTE). The neighbours are kept: what hover has to answer is precisely "what is
+          // it connected to".
+          // **Nodes that do not exist at this instant are dimmed to the floor**: this branch
+          // returns early and bypasses the time filter below, so dimming them only halfway would
+          // leave them brighter than when nothing is hovered at all
           if (f.activeNodes && !f.activeNodes.has(node)) muteNode();
           else softMute();
           return res;
@@ -1107,7 +1191,8 @@ export function Graph() {
           muteNode();
           return res;
         }
-        // 播放淡入：从 muted 形态渐变到本帧算出的正常形态
+        // Playback fade: transition from the muted form to the normal form computed for this
+        // frame
         const fs = fadeRef.current.get(node);
         if (fs !== undefined) {
           const t = Math.min(1, (performance.now() - fs) / FADE_MS);
@@ -1135,13 +1220,16 @@ export function Graph() {
         const f = filterRef.current;
         const res = { ...attrs };
         const [s, t] = g.extremities(edge);
-        /* 并进这条边的逆关系说法，接在本名后面：`PART OF ⁻¹ CONTAINS`。
-           **只在关注它的时候显示**——常驻会把标签拉长一倍，而标签太长
-           正是这次要治的毛病。
-           两个触发点，因为**边只有一像素宽，精确悬停对人也很难命中**：
-           鼠标压在这条边上，或者压在它两端任一个节点上。后者才是实际
-           用得上的那个，前者留着是因为有时人就是要指那一条。
-           放在隐藏/压暗逻辑之前：说法是显示的事，不是可见性的事 */
+        /* The inverse phrasings folded into this edge, appended after its own name:
+           `PART OF ⁻¹ CONTAINS`.
+           **Only shown while it has attention** -- showing it permanently doubles the label's
+           length, and over-long labels are exactly the ailment being treated here.
+           Two triggers, because **an edge is only one pixel wide and precise hovering is hard
+           for a human to hit**: the mouse is on this edge, or on either of the nodes at its
+           ends. The latter is the one that actually gets used; the former stays because
+           sometimes a person really does mean to point at that one edge.
+           Placed before the hide/dim logic: a phrasing is a matter of display, not of
+           visibility */
         const also = attrs.alsoLabels as string[] | undefined;
         if (also && also.length > 0) {
           const focused =
@@ -1162,12 +1250,14 @@ export function Graph() {
           res.hidden = true;
           return res;
         }
-        // 推出来的边：先看藏不藏，再决定呼吸到哪一档。
-        // **放在最前面**——藏起来的边不必再算后面那些提亮/压暗
+        // Derived edges: first whether they are hidden, then where the breathing sits.
+        // **Placed right at the front** -- a hidden edge does not need the brightening/dimming
+        // below computed at all
         const isDerived = attrs.derived === true;
 
         if (isDerived) {
-          // 还没轮到它进场：先不画。**事实先落位，推出来的后到**
+          // Its turn to enter has not come yet: do not draw it. **Facts settle first, the
+          // derived ones arrive after**
           if (!derivedRevealedRef.current) {
             res.hidden = true;
             return res;
@@ -1176,20 +1266,24 @@ export function Graph() {
           const k = tr
             ? Math.min(1, (performance.now() - tr.at) / DERIVED_TOGGLE_MS)
             : 1;
-          // 关掉了：只有「淡出尚未走完」这一种情况还留着不藏
+          // Switched off: the only case still left unhidden is "the fade-out has not finished
+          // running"
           if (!f.showDerived) {
             if (!tr || tr.on || k >= 1) {
               res.hidden = true;
               return res;
             }
-            /* 由当前颜色渐灭到近背景色。**暗度必须编码进 RGB**
-               （见 EDGE_DIM 处的注释：预乘混合下 alpha 压不暗边），
-               所以是往 EDGE_DIM 混而不是降 alpha。
+            /* Fade out from the current colour to the near-background colour. **The dimness has
+               to be encoded into the RGB** (see the comment at EDGE_DIM: under premultiplied
+               blending alpha cannot dim an edge), so this mixes toward EDGE_DIM rather than
+               lowering alpha.
 
-               **起点不能一律写死成满亮的金**：这个分支在悬停/选中的压暗逻辑
-               之前就 return 了，于是一条本来被压成暗色的无关派生边，
-               会先跳回满亮再淡出——那一跳就是"关派生时无关的边闪一下"。
-               起点得取它此刻本来的样子 */
+               **The starting point must not be hard-coded to full-brightness gold across the
+               board**: this branch returns before the hover/selection dimming logic, so an
+               unrelated derived edge that was dimmed dark would jump back to full brightness
+               first and then fade out -- that jump is the "unrelated edges flash when you turn
+               derivations off". The start has to be taken from how it actually looks right
+               now */
             const selNow =
               selectedRef.current && g.hasNode(selectedRef.current)
                 ? selectedRef.current
@@ -1210,23 +1304,26 @@ export function Graph() {
             res.label = "";
             return res;
           }
-          // 幽灵边不呼吸：它不是知识，是一条没走通的路
+          // Ghost edges do not breathe: they are not knowledge, they are a path that did not
+          // go through
           const pulse = attrs.blocked === true
             ? EDGE_GHOST
             : lerpColor(
             EDGE_COLOR_DERIVED_DIM,
             EDGE_COLOR_DERIVED,
-            // 三角波而不是正弦：两端各停一瞬，看起来是「呼吸」不是「闪」
+            // A triangle wave rather than a sine: it pauses for an instant at each end, so it
+            // reads as "breathing" and not as "blinking"
             Math.abs(
               ((performance.now() % DERIVED_PULSE_MS) / DERIVED_PULSE_MS) * 2 -
                 1,
             ),
           );
-          // 打开：从近背景色亮起来，接上呼吸
+          // Switched on: brighten up from the near-background colour and join the breathing
           res.color =
             tr && tr.on && k < 1 ? lerpColor(EDGE_DIM, pulse, k) : pulse;
         }
-        // hover: 只提亮关联边；selected: 提亮关联边 + 压暗其余
+        // hover: only brighten the incident edges; selected: brighten the incident edges + dim
+        // everything else
         const hov = hoverRef.current;
         const sel =
           selectedRef.current && g.hasNode(selectedRef.current)
@@ -1244,17 +1341,19 @@ export function Graph() {
           res.size = Math.max((attrs.size as number) * 1.42, 1.85);
           res.zIndex = 5;
         };
-        /* **时间轴停在某一刻时，这条边此刻存不存在**。
-           悬停的两条分支都会提前 return，绕过下面那道时间过滤——
-           不带上它的话，一 hover，所有"还没长出来"的边会从近背景色
-           跳到常态色的 45%，看起来是被点亮了。实测就是这么亮的 */
+        /* **Whether this edge exists at the instant the timeline is parked on.**
+           Both hover branches return early and bypass the time filter below -- without carrying
+           this along, one hover makes every edge that "has not grown yet" jump from the
+           near-background colour to 45% of its normal colour, which looks like it was lit up.
+           That is exactly how brightly it lit up in practice */
         const liveNow = !f.activeEdges || f.activeEdges.has(edge);
         if (hov && (s === hov || t === hov) && liveNow) {
           boost();
         } else if (hov && !sel) {
-          // 悬停时其余的边也退下去，但**只退一半**——与节点那边同一个 HOVER_MUTE。
-          // 压到底是选中才有的待遇。此刻不存在的边**本来就该是暗的**，
-          // 从 EDGE_DIM 起混等于原地不动
+          // On hover the other edges recede too, but **only halfway** -- the same HOVER_MUTE as
+          // on the node side. Dimming to the floor is a privilege of selection. Edges that do
+          // not exist at this instant **should be dark anyway**, and mixing from EDGE_DIM leaves
+          // them exactly where they were
           const from = liveNow ? String(res.color) : EDGE_DIM;
           res.color = lerpColor(from, EDGE_DIM, HOVER_MUTE);
           res.size = (attrs.size as number) * (1 - 0.4 * HOVER_MUTE);
@@ -1275,7 +1374,8 @@ export function Graph() {
           res.label = "";
           return res;
         }
-        // 播放淡入：边从近背景色渐亮到常规色（alpha 同步插值）
+        // Playback fade: the edge brightens from the near-background colour to its normal colour
+        // (alpha interpolated along with it)
         const fs = fadeRef.current.get(edge);
         if (fs !== undefined) {
           const t = Math.min(1, (performance.now() - fs) / FADE_MS);
@@ -1286,7 +1386,8 @@ export function Graph() {
       },
     });
     sigma.on("clickNode", ({ node }) => setSelected(node));
-    // 幽灵边点一下：打开它主语的面板，停在「推出来的」那一档、展开那一行（0017 §3）
+    // Clicking a ghost edge: open its subject's panel, land on the "derived" tab and expand
+    // that row (0017 §3)
     sigma.on("clickEdge", ({ edge }) => {
       if (g.getEdgeAttribute(edge, "blocked") !== true) return;
       const [s] = g.extremities(edge);
@@ -1307,11 +1408,12 @@ export function Graph() {
       hoverRef.current = null;
       sigma.refresh();
     });
-    /* 悬停一条边，把并进来的说法亮出来。
-       逆关系的边被并掉了（见 `layOutParallelEdges`），少画一条是对的，
-       但那个名字不该就此消失：`part_of` 反过来叫 `contains` 是本体里
-       写着的东西，人有权看见。**只在悬停时显示**——常驻会把标签拉长一倍，
-       而拉长标签正是这次要治的毛病 */
+    /* Hovering an edge surfaces the phrasings folded into it.
+       The inverse edge was folded away (see `layOutParallelEdges`), and drawing one fewer edge
+       is right, but that name should not disappear along with it: that `part_of` reversed is
+       called `contains` is something written down in the ontology, and people have a right to
+       see it. **Only shown on hover** -- showing it permanently doubles the label's length, and
+       over-long labels are exactly the ailment being treated here */
     sigma.on("enterEdge", ({ edge }) => {
       hoverEdgeRef.current = edge;
       sigma.refresh();
@@ -1320,13 +1422,14 @@ export function Graph() {
       hoverEdgeRef.current = null;
       sigma.refresh();
     });
-    // 边标签只在放大后出现（默认视距下太密，Semantica 同样克制）
+    // Edge labels only appear once zoomed in (at the default viewing distance they are too
+    // dense; Semantica is equally restrained)
     const updateEdgeLabels = () =>
       sigma.setSetting("renderEdgeLabels", sigma.getCamera().ratio < 0.7);
     sigma.getCamera().on("updated", updateEdgeLabels);
     updateEdgeLabels();
 
-    // 世界坐标网格：相机变动/容器尺寸变动时重绘
+    // World-coordinate grid: redrawn when the camera moves or the container is resized
     const renderGrid = () => {
       if (gridRef.current) drawWorldGrid(gridRef.current, sigma);
     };
@@ -1334,9 +1437,10 @@ export function Graph() {
     sigma.on("resize", renderGrid);
     renderGrid();
 
-    // 节点拖拽 + 活的力导反馈。按下只记候选：视口位移 >4px 才升格为拖拽
-    //（否则纯点选也会误启 FA2）；被拖节点由 fa2 的 outputReducer 钉在光标上（见上），
-    // 松手后稳定 ~1.2s 停机
+    // Node dragging + live force feedback. Pressing down only records a candidate: only a
+    // viewport displacement of >4px promotes it to a drag
+    // (otherwise a plain click would start FA2 by mistake); the dragged node is pinned onto the
+    // cursor by fa2's outputReducer (see above), and after release it settles for ~1.2s and stops
     let settleTimer: ReturnType<typeof setTimeout> | null = null;
     let dragCandidate: string | null = null;
     let downPoint: { x: number; y: number } | null = null;
@@ -1349,20 +1453,21 @@ export function Graph() {
       if (!dragged) {
         if (!downPoint || Math.hypot(e.x - downPoint.x, e.y - downPoint.y) < 4)
           return;
-        // 升格为拖拽
+        // Promoted to a drag
         dragged = dragCandidate;
         if (settleTimer) clearTimeout(settleTimer);
-        // 静态布局（circular/pack）下拖拽不唤醒力模拟——否则一碰就散架
+        // Under a static layout (circular/pack) dragging does not wake the force simulation --
+        // otherwise one touch and it falls apart
         if (layoutModeRef.current === "force" && fa2 && !fa2.isRunning())
           fa2.start();
-        // 固定当前包围盒，避免拖拽时相机自动跟随缩放
+        // Freeze the current bounding box so the camera does not auto-zoom along with the drag
         if (!sigma.getCustomBBox()) sigma.setCustomBBox(sigma.getBBox());
       }
       const pos = sigma.viewportToGraph(e);
       dragPos = pos;
       g.setNodeAttribute(dragged, "x", pos.x);
       g.setNodeAttribute(dragged, "y", pos.y);
-      // 阻止相机平移
+      // Prevent the camera from panning
       e.preventSigmaDefault();
       e.original.preventDefault();
       e.original.stopPropagation();
@@ -1378,7 +1483,7 @@ export function Graph() {
     sigma.getMouseCaptor().on("mouseup", endDrag);
     sigmaRef.current = sigma;
     if (import.meta.env.DEV) {
-      // 调试句柄（仅 dev）：无头环境下检查 reducer 输出
+      // Debug handles (dev only): inspect the reducer's output in a headless environment
       (window as unknown as Record<string, unknown>).__g = g;
       (window as unknown as Record<string, unknown>).__sigma = sigma;
       (window as unknown as Record<string, unknown>).__sel = selectedRef;
@@ -1401,15 +1506,16 @@ export function Graph() {
   const empty = data.isSuccess && data.data.nodes.length === 0;
   const nodeCount = data.data?.nodes.length ?? 0;
   const edgeCount = data.data?.edges.length ?? 0;
-  // 库里一共有多少。**与画上去的不是一回事**——邻域视图没有总数（它本来就只
-  // 是一小片），所以缺省回落到画上去的那个数，不会显示成「共 0 个」
+  // How many there are in the KB altogether. **Not the same thing as how many were drawn** --
+  // the neighbourhood view has no total (it is only ever a small slice), so it falls back to the
+  // drawn count and will not read "0 in total"
   const totalNodes = data.data?.total_nodes ?? nodeCount;
   const totalEdges = data.data?.total_edges ?? edgeCount;
   const capped = totalNodes > nodeCount;
 
   return (
     <div className="h-full relative">
-      {/* 顶部悬浮条：搜索 + 图例 + 状态 */}
+      {/* Top floating bar: search + legend + status */}
       <div className="absolute top-3 left-3 right-3 z-10 flex items-start gap-2 pointer-events-none">
         <div className="relative pointer-events-auto">
           <input
@@ -1429,7 +1535,8 @@ export function Graph() {
                 <button
                   key={c.id}
                   onClick={() => {
-                    // 子图内命中：只选中（已在视野里）；全图搜索：跳到该实体邻域
+                    // A hit inside the subgraph: just select it (it is already in view); a
+                    // whole-graph search: jump to that entity's neighbourhood
                     if (!inSubgraph) setFocusEntity(c.id);
                     setSelected(c.id);
                     setSearchInput("");
@@ -1452,9 +1559,10 @@ export function Graph() {
                   </span>
                 </button>
               ))}
-              {/* 还有更多没显示。**说清剩多少**——从前固定十条，想找的那个
-                  不在这十条里的时候，界面上一点线索都没有。子图内搜索是客户端
-                  过滤，没有「更多」这回事 */}
+              {/* There are more that are not shown. **Say how many are left** -- it used to be
+                  a fixed ten, and when the one you were after was not among those ten the UI
+                  gave no hint whatsoever. Searching inside a subgraph is client-side filtering,
+                  where there is no such thing as "more" */}
               {!inSubgraph &&
                 (candidates.data?.total ?? 0) > searchHits.length && (
                   <button
@@ -1478,9 +1586,10 @@ export function Graph() {
           </button>
         )}
 
-        {/* 图例（点击切换类型显隐）。**只摆前 LEGEND_MAX 个**，其余收进
-            「+N 个类」——那一排横着长，类一多就换行把画布顶下去；而且十几个
-            一模一样的胶囊排开，谁重要也读不出来 */}
+        {/* Legend (click to toggle a type's visibility). **Only the first LEGEND_MAX are laid
+            out**, the rest go into "+N types" -- that row grows sideways, so with many types it
+            wraps and pushes the canvas down; and with a dozen identical chips lined up you
+            cannot read which one matters */}
         <div className="pointer-events-auto flex flex-wrap gap-1.5 pt-0.5">
           {legendShown.map(([key, t]) => (
             <button
@@ -1505,10 +1614,12 @@ export function Graph() {
             </button>
           ))}
 
-          {/* chip 上的数是**全部类**，不是被收起来的那几个——
-              点开看到的就是全部（搜得到任何一个），写「+3」等于承诺了另一件事 */}
-          {/* 复位。**只要存在隐藏就给一步到位的出口**——「只看」很容易把
-              画面收得很窄，没有这个就得挨个点回来 */}
+          {/* The number on the chip is **all types**, not just the collapsed few --
+              what you see on opening it is all of them (any one is searchable), and writing
+              "+3" would be promising something else */}
+          {/* Reset. **Whenever anything is hidden, offer a one-step way out** -- "only this"
+              very easily narrows the picture right down, and without this you would have to
+              click each one back by hand */}
           {hiddenTypes.size > 0 && (
             <button
               onClick={() => setHiddenTypes(new Set())}
@@ -1532,8 +1643,9 @@ export function Graph() {
                 } hover:text-neutral-100`}
               >
                 {S.graph.legendMore(types.length)}
-                {/* 收起来的类里有正被隐藏的就点一下。**不点就是无声过滤**：
-                    在面板里关掉一个类、把面板一收，界面上再没有任何东西说它被关了 */}
+                {/* A dot when one of the collapsed types is hidden. **Without the dot it is
+                    silent filtering**: turn a type off inside the panel, collapse the panel, and
+                    nothing in the UI says any longer that it is off */}
                 {hiddenInRest > 0 && (
                   <span className="h-1.5 w-1.5 rounded-full bg-neutral-300" />
                 )}
@@ -1543,9 +1655,10 @@ export function Graph() {
                   ref={legendPop.panelRef}
                   className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-xl p-2 shadow-2xl"
                 >
-                  {/* 面板盖在 chip 原位，所以**第一行就长成那个 chip 的样子**，
-                      点它收回去——「哪儿展开的就从哪儿收回去」，
-                      与通知/用户卡片的关闭键跟触发键原位重合是同一个道理 */}
+                  {/* The panel covers the chip's original position, so **the first row is
+                      shaped exactly like that chip** and clicking it collapses again -- "it
+                      folds back to wherever it unfolded from", the same reasoning that puts the
+                      notification/user cards' close key exactly where the trigger was */}
                   <button
                     onClick={() => legendPop.close()}
                     className="mb-1.5 flex w-full items-center gap-1.5 rounded-full px-1.5 py-0.5 text-[11px] text-neutral-300 transition-colors hover:text-neutral-100"
@@ -1560,19 +1673,21 @@ export function Graph() {
                     placeholder={S.graph.legendSearch}
                     className="input-dark mb-1.5 w-full px-2 py-1 text-[12px]"
                   />
-                  {/* **列的是全部类，不只是收起来的那些**：想找一个类的时候，
-                      没人记得它是不是恰好排进了前几个 */}
+                  {/* **This lists all the types, not just the collapsed ones**: when you are
+                      looking for a type, nobody remembers whether it happened to make the first
+                      few */}
                   <div className="flex max-h-64 flex-col overflow-y-auto">
                     {types
                       .filter(([, t]) =>
                         t.label.toLowerCase().includes(legendQ.toLowerCase()),
                       )
                       .map(([key, t]) => (
-                        /* **一行两个按钮，不是一个按钮循环三态。**
-                           单键循环的代价是：不看当前状态就不知道下一次点击
-                           会发生什么，而且从「只看」回到正常必须路过「排除」
-                           ——想清空却得先让画面变成另一个错的样子。
-                           拆开之后每个手势含义固定 */
+                        /* **Two buttons per row, not one button cycling three states.**
+                           The price of a single cycling button is that you cannot know what the
+                           next click will do without reading the current state, and getting from
+                           "only this" back to normal has to pass through "excluded"
+                           -- you want to clear the filter and first have to make the picture
+                           wrong in another way. Split apart, each gesture has one fixed meaning */
                         <div
                           key={key}
                           className="group flex items-center gap-2 rounded px-1.5 py-1 hover:bg-white/5"
@@ -1605,8 +1720,9 @@ export function Graph() {
                               {t.label}
                             </span>
                           </button>
-                          {/* 「只看这个」：类一多时最想要的动作。**给显式按钮而不是
-                              修饰键**——alt+点击没人猜得到，这里横向有地方 */}
+                          {/* "Only this": the action you want most once there are many types.
+                              **An explicit button rather than a modifier key** -- nobody guesses
+                              alt+click, and there is room here horizontally */}
                           <button
                             onClick={() =>
                               setHiddenTypes(
@@ -1639,9 +1755,10 @@ export function Graph() {
           )}
         </div>
 
-        {/* 右上：能调「画多少个」+ 统计。**统计说的正是这个数**
-            （「画了 150 个，共 548 个」），把调节放在它旁边，改的是谁一目了然。
-            外壳保持中性——这一片是 chrome，彩色只属于数据 */}
+        {/* Top right: the "how many to draw" control + the stats. **The stats are about exactly
+            this number** ("150 drawn, 548 in total"), so putting the control next to them makes
+            it obvious at a glance what is being changed.
+            The shell stays neutral -- this area is chrome, and colour belongs to the data only */}
         <div className="ml-auto flex flex-col items-end gap-1">
           <div className="flex items-start gap-2">
             <div className="pointer-events-auto flex items-center overflow-hidden rounded-md border border-white/10">
@@ -1657,8 +1774,9 @@ export function Graph() {
             >
               −
             </button>
-            {/* **画满了就别再给「多画」**：库里一共就这么多，再调高什么也不会变，
-                而一个点了没反应的按钮比没有这个按钮更糟 */}
+            {/* **Once everything is drawn, stop offering "draw more"**: that is all the KB has,
+                turning it up higher changes nothing, and a button that does nothing when clicked
+                is worse than no button at all */}
             <button
               title={S.graph.nodeBudgetMore}
               disabled={
@@ -1678,14 +1796,17 @@ export function Graph() {
             </button>
           </div>
           <div className="pointer-events-none pt-0.5 u-num text-[11px] text-neutral-500">
-          {/* 画满上限时说清「画了多少 / 共多少」。**这个数从前是上限冒充规模**——
-              一个上万实体的库右上角永远写着 150 */}
+          {/* When the cap is hit, spell out "how many drawn / how many in total". **This number
+              used to be the cap masquerading as the size** -- a KB with tens of thousands of
+              entities forever read 150 in the top right corner */}
           {capped ? (
             <span title={S.graph.cappedHint(nodeCount, totalNodes)}>
-              {/* **事实也用「已画 / 共」的口径**：从前这里给的是库里的总数，
-                  而实体给的是「画了多少 / 共多少」——同一句话里两套口径，
-                  于是调档位时实体数在变、事实数纹丝不动，看着像坏了。
-                  没有时间筛选时 active 恒等于已画条数，那就不说 */}
+              {/* **Facts use the "drawn / total" framing too**: this used to give the KB's
+                  total while the entities gave "how many drawn / how many in total" -- two
+                  framings in one sentence, so changing the step moved the entity count while the
+                  fact count did not budge, and it looked broken.
+                  With no time filter active is always equal to the drawn count, so it is left
+                  unsaid */}
               {S.graph.statsCapped(
                 nodeCount,
                 totalNodes,
@@ -1703,10 +1824,10 @@ export function Graph() {
           )}
             </div>
           </div>
-          {/* **单独一行，不做统计文字的前缀。**
-              当前缀时它一出现就把整块撑宽，而这一块是靠右的——
-              于是每次重新布局，左边的档位按钮都会被挤着跳一下。
-              自己占一行，第一行的宽度就不再随它变 */}
+          {/* **A row of its own, not a prefix to the stats text.**
+              As a prefix, the moment it appears it widens the whole block, and this block is
+              right-aligned -- so on every relayout the step buttons on the left get shoved and
+              jump. On a row of its own, the first row's width no longer varies with it */}
           {stabilizing && (
             <div className="flex items-center gap-1.5 text-[11px] text-neutral-400">
               <Loader2 size={11} className="animate-spin" />
@@ -1716,33 +1837,41 @@ export function Graph() {
         </div>
       </div>
 
-      {/* 画布：世界坐标网格层（随相机动）垫在 sigma WebGL 层下（全出血，时间岛悬浮其上） */}
+      {/* Canvas: the world-coordinate grid layer (moving with the camera) is laid under sigma's
+          WebGL layer (full bleed, with the time island floating above it) */}
       <div className="absolute inset-0">
         <canvas ref={gridRef} className="absolute inset-0 h-full w-full" />
         <div ref={containerRef} className="absolute inset-0" />
       </div>
 
-      {/* 左下控件塔：推出来的边 + 布局切换 + 相机（右下归实体侧栏，底部中央归时间岛） */}
-      {/* **items-start**：列内项目默认 stretch，一组展开就会把其余几组
-          一起拉到同宽——那几组的字还收着，于是看着是几个莫名其妙的空白长条。
-          各自按内容收放，才是「一组一组展开，不牵连别人」 */}
+      {/* Bottom-left control tower: derived edges + layout switching + camera (bottom right
+          belongs to the entity sidebar, bottom centre to the time island) */}
+      {/* **items-start**: items in a column stretch by default, so one group expanding drags all
+          the others out to the same width -- and their text is still collapsed, so they read as
+          a few inexplicable blank bars. Each sizing to its own content is what makes it "one
+          group expands at a time, without dragging the others along" */}
       <div className="absolute bottom-4 left-3 z-10 flex flex-col items-start gap-2">
-        {/* 推出来的边：**自成一组，也不进类型图例。**
-            图例回答「显示哪些类」，一排全是本体里的类；这个回答的是
-            「显不显示推出来的边」——不是同一个问题。为零时整组不出现。
+        {/* Derived edges: **a group of their own, and not part of the type legend either.**
+            The legend answers "which types are shown", a row made entirely of ontology types;
+            this answers "are derived edges shown" -- not the same question. At zero the whole
+            group does not appear.
 
-            **摆到这座塔上，是绕开一对矛盾走的**：放在顶栏图例旁边，它长得
-            像第 10 个类；想靠颜色把它区分开，又撞上这文件开头那条既定原则
-            ——「chrome 零色偏、彩色只属于数据」（见调色板那段注释）。
-            往框架里塞一块高饱和金底，是整个界面唯一的彩色色块，扎眼且不成体系。
+            **Putting it on this tower is a way around a pair of conflicting constraints**: next
+            to the legend in the top bar it looks like a 10th type; distinguishing it by colour
+            runs straight into the principle established at the top of this file
+            -- "zero colour cast in the chrome, colour belongs to the data only" (see the palette
+            comment). Wedging a block of highly saturated gold into the frame would be the only
+            patch of colour in the entire UI: glaring, and part of no system at all.
 
-            这座塔本来就是「视图怎么看」的地盘（布局、缩放），
-            「显不显示推出来的边」正是同一族问题。外壳保持中性，
-            金色只出现在图标本身——与色点用在类胶囊上是同一个做法。 */}
+            This tower was always the territory of "how to look at the view" (layout, zoom), and
+            "are derived edges shown" is precisely the same family of question. The shell stays
+            neutral and the gold appears only on the icon itself -- the same approach as the
+            colour dots on the type chips. */}
         {derivedCount > 0 && (
-          /* **两层**：外层只负责定位，内层才有 overflow-hidden。
-             那个类是给按钮堆裁圆角的，可面板是同一个盒子的子元素——
-             合成一层的话面板会被一起裁掉，实测只剩塔本身那 32px 宽 */
+          /* **Two layers**: the outer one only handles positioning, and only the inner one has
+             overflow-hidden. That class is there to clip the button stack's rounded corners, but
+             the panel is a child of the same box -- collapsed into one layer the panel gets
+             clipped along with it, measured down to just the tower's own 32px of width */
           <div className="relative" ref={derivedPop.rootRef}>
             <div className="u-tower group glass-strong rounded-xl shadow-xl flex flex-col overflow-hidden">
             <button
@@ -1763,9 +1892,11 @@ export function Graph() {
               <span className="u-tower-label">{S.graph.viewDerived}</span>
             </button>
             <div className="h-px bg-white/10 mx-1.5" />
-            {/* 展开成一个小窗：这批边是什么时候推的、现在还推不推、手动再跑一次。
-                **与开关分成两个按钮**——「藏起来」是每天要点的，「什么时候推的」
-                是偶尔才问的，合成一个会让常用动作多一步 */}
+            {/* Expands into a small window: when this batch of edges was derived, whether it is
+                still being derived, and one more manual run.
+                **Split off from the switch into two buttons** -- "hide them" is clicked every
+                day, "when were they derived" is only asked occasionally, and merging the two
+                would add a step to the common action */}
             <button
               ref={derivedPop.anchorRef}
               onClick={() =>
@@ -1863,15 +1994,16 @@ export function Graph() {
 
       {empty && (
         <div className="absolute inset-0 grid place-items-center pointer-events-none">
-          {/* 不放标题方块：页面本身就是图谱页，tab 条上也写着，
-              第三遍写"图谱"两个字不带任何信息。空状态该说的是下一步做什么 */}
+          {/* No title block: the page itself is the graph page and the tab bar says so too, so
+              writing "Graph" a third time carries no information at all. What an empty state
+              should say is what to do next */}
           <div className="text-center text-sm text-neutral-500 max-w-xs">
             {S.graph.emptyBody}
           </div>
         </div>
       )}
 
-      {/* 底部居中悬浮时间岛 */}
+      {/* Bottom-centre floating time island */}
       {edgeCount > 0 && (
         <TimeScrubber
           edges={data.data!.edges}
@@ -1882,7 +2014,8 @@ export function Graph() {
         />
       )}
 
-      {/* 实体侧栏。**取消选中之后还要多留 170ms**：那段时间它在演退场 */}
+      {/* Entity sidebar. **It stays for another 170ms after selection is cleared**: that is the
+          exit animation playing */}
       {(selected || exiting) && kb && (
         <EntityPanel
           kbId={kb.id}
@@ -1891,7 +2024,8 @@ export function Graph() {
           intent={panelIntentRef}
           onClose={deselect}
           onNavigate={(id) => {
-            // 跳转目标可能不在当前画布：同时把图 refocus 到它的邻域（与搜索选择一致）
+            // The navigation target may not be on the current canvas: refocus the graph on its
+            // neighbourhood at the same time (consistent with picking a search result)
             setFocusEntity(id);
             setSelected(id);
           }}
@@ -1901,9 +2035,10 @@ export function Graph() {
   );
 }
 
-/* ============ 时间轴（底部居中悬浮岛：播放 + 密度带 + 拖动） ============ */
+/* ====== Timeline (bottom-centre floating island: play + density band + drag) ====== */
 
-/** 轨道 clientX → 对齐天步进的时间值（数据精度即 day，拖动求精细；播放仍按月推进求节奏）。 */
+/** Track clientX → a time value snapped to day steps (the data's precision is day and dragging
+ *  wants fineness; playback still advances by month, for the rhythm). */
 function scrubValueAt(
   clientX: number,
   track: HTMLDivElement | null,
@@ -1912,23 +2047,26 @@ function scrubValueAt(
 ): number {
   if (!track) return maxTs;
   const rect = track.getBoundingClientRect();
-  // 布局未成形（宽度 0）时避免除零产出 NaN
+  // Before the layout has taken shape (width 0), avoid dividing by zero and producing NaN
   if (rect.width < 1) return maxTs;
   const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
   const raw = minTs + frac * (maxTs - minTs);
   return Math.min(maxTs, minTs + Math.round((raw - minTs) / DAY_MS) * DAY_MS);
 }
 
-/** 播放/柱子的步长。**这两件事本来就该是同一个单位**——从前柱子按年、
- *  播放按天，界面上没有任何地方说得出「一格是多久」。 */
+/** The step for playback/the bars. **These two were always meant to be the same unit** -- the
+ *  bars used to go by year and playback by day, and nowhere in the UI could you tell "how long
+ *  is one cell". */
 type ScrubUnit = "year" | "month" | "day";
 
-/** 一根柱子最多画多少根。超过就把相邻的桶并起来画——**只影响画，不影响
- *  播放步长**：日单位下 15 年有五千多个桶，一根一像素也画不下，
- *  但播放仍然是一天一步。并了几个会在提示里说出来，不闷着 */
+/** How many bars are drawn at most. Beyond that, adjacent buckets are merged into one bar --
+ *  **this affects the drawing only, not the playback step**: at day granularity 15 years is over
+ *  five thousand buckets, which will not fit even at one pixel each, yet playback still advances
+ *  one day at a time. How many were merged is stated in the tooltip, not swallowed */
 const SCRUB_MAX_BARS = 220;
-/** 整条轨走完的目标时长。**与单位无关**——单位换的是颗粒度与密度，
- *  不该顺带把「等多久」也换掉：日单位若按「一天一拍」走，15 年要放二十分钟 */
+/** The target duration for traversing the whole track. **Independent of the unit** -- the unit
+ *  changes granularity and density, and it should not change "how long you wait" along with
+ *  them: at day granularity, "one beat per day" would take twenty minutes to play 15 years */
 const SCRUB_PLAY_MS = 18000;
 
 function bucketStart(ts: number, unit: ScrubUnit): number {
@@ -1956,25 +2094,30 @@ function TimeScrubber({
   edges: GraphEdge[];
   value: number | null;
   onChange: (v: number | null) => void;
-  /* 播放态由 Graph 持有：渲染层要区分播放推进与手动拖动 */
+  /* The playback state is owned by Graph: the render layer has to distinguish playback
+     advancing from manual dragging */
   playing: boolean;
   onPlayingChange: (v: boolean) => void;
 }) {
   const setPlaying = onPlayingChange;
-  /* 默认年：**大多数库跨度都以年计**，一进来先给能一眼看全的那一档 */
+  /* Year by default: **most KBs span years**, so what you get on arrival is the granularity
+     you can take in at a glance */
   const [unit, setUnit] = useState<ScrubUnit>("year");
-  /* 走完整条的次数。**拿它当 key**——同一个元素上重复触发同一个动画不会重播，
-     换 key 让它重新挂载才会 */
+  /* How many times the track has been traversed. **Used as a key** -- retriggering the same
+     animation on the same element does not replay it; changing the key so it remounts does */
   const [sweep, setSweep] = useState(0);
-  /* 指针在轨道上时，已走过的那段提亮。**它回答的是"我走到哪了"**——
-     不播的时候整条都是同一档灰，看不出进度停在哪；而这正是人把指针
-     移上来想知道的事 */
+  /* While the pointer is over the track, the stretch already traversed is brightened. **It
+     answers "how far have I got"** -- when it is not playing the whole track is one shade of
+     grey and you cannot see where progress stopped; and that is exactly what somebody who moves
+     the pointer onto it wants to know */
   const [trackHover, setTrackHover] = useState(false);
   const trackRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
-  /* 拖动落点。**播放循环有自己的浮点累加器**，不读 value——否则每帧的取整
-     误差会积起来。所以光改 value 是没用的，下一帧就被原样覆盖回去。
-     拖动把落点放进这里，循环下一帧接手，从新位置继续走 */
+  /* The drag's landing point. **The playback loop has its own floating-point accumulator** and
+     does not read value -- otherwise each frame's rounding error would pile up. So changing
+     value alone achieves nothing; the next frame overwrites it right back.
+     Dragging puts the landing point in here, the loop picks it up on its next frame and carries
+     on from the new position */
   const seekRef = useRef<number | null>(null);
   const seek = (v: number) => {
     seekRef.current = v;
@@ -1989,7 +2132,8 @@ function TimeScrubber({
     const min = froms.length
       ? Math.min(...froms)
       : now - 5 * 365 * 24 * 3600 * 1000;
-    // 起点对齐到单位边界：否则第一根柱子是半格，读起来像数据缺了一块
+    // The start is aligned to a unit boundary: otherwise the first bar is half a cell, which
+    // reads as a chunk of missing data
     const start = bucketStart(min, unit);
 
     const counts = new Map<number, number>();
@@ -2001,7 +2145,7 @@ function TimeScrubber({
     for (let t = start; t <= now; t = bucketNext(t, unit))
       raw.push({ ts: t, n: counts.get(t) ?? 0 });
 
-    // 画不下就并桶。**并的是画，不是步长**
+    // Merge buckets when they will not fit. **The merge is about the drawing, not the step**
     const group = Math.max(1, Math.ceil(raw.length / SCRUB_MAX_BARS));
     const cells: { ts: number; n: number }[] = [];
     for (let i = 0; i < raw.length; i += group) {
@@ -2013,13 +2157,15 @@ function TimeScrubber({
     }
     const peak = Math.max(1, ...cells.map((c) => c.n));
 
-    // 单位越大 → 桶越少 → 岛越短；越小 → 越长。**但下限要抬得够高**：
-    // 岛里那排固定控件（播放键 + 单位选择器 + 两个年份 + 日期 + All time/Now）
-    // 本身就要四百多像素，岛只有 320 时 flex-1 的轨道被压成 0——
-    // 实测柱子一根都看不见，整条是空的。
+    // Bigger unit → fewer buckets → shorter island; smaller → longer. **But the lower bound has
+    // to be raised high enough**: the row of fixed controls in the island (play button + unit
+    // selector + two years + date + All time/Now) needs four hundred-odd pixels on its own, and
+    // at an island of only 320 the flex-1 track gets squeezed to 0 --
+    // measured: not a single bar visible, the whole thing empty.
     //
-    // 抬高之后单位主要改变的是**每根柱子的粗细**：同一条轨道，
-    // 年是十几根粗块，日是两百多根细线。这比整条伸缩更说明问题
+    // Once raised, what the unit mainly changes is **the thickness of each bar**: on the same
+    // track, year is a dozen-odd thick blocks and day is two hundred-odd thin lines. That says
+    // more than stretching the whole island
     const w = Math.min(780, Math.max(660, 380 + cells.length * 2));
 
     return {
@@ -2031,18 +2177,21 @@ function TimeScrubber({
     };
   }, [edges, unit]);
 
-  // 播放按日推进（数据即 day 精度），日子快速翻过；整体节奏仍 ≈ 一个月/260ms。
-  // rAF 时间驱动：帧率无关，内部浮点累加避免取整漂移，值只在跨天时才下发
+  // Playback advances by day (the data is day-precision) and the days flip past quickly; the
+  // overall rhythm is still ≈ one month per 260ms.
+  // Driven by rAF time: frame-rate independent, accumulating internally in floating point to
+  // avoid rounding drift, and the value is only pushed out when a day boundary is crossed
   useEffect(() => {
     if (!playing) return;
-    // 整条走完约 SCRUB_PLAY_MS，与单位无关；单位只决定落点取整到哪一格
+    // The whole track takes about SCRUB_PLAY_MS regardless of the unit; the unit only decides
+    // which cell the landing point rounds to
     const SPEED = (maxTs - minTs) / SCRUB_PLAY_MS;
     let raf = 0;
     let last = performance.now();
     let acc = value ?? minTs;
     let lastPushed = 0;
     const step = (now: number) => {
-      // 有人拖过了：从落点接着走，而不是沿原来的轨迹
+      // Somebody has dragged: carry on from the landing point, not along the old trajectory
       if (seekRef.current !== null) {
         acc = seekRef.current;
         seekRef.current = null;
@@ -2052,17 +2201,20 @@ function TimeScrubber({
       if (acc >= maxTs) {
         setPlaying(false);
         onChange(null);
-        // 走到头了扫一道光。**这是个收尾**——播放停下、时间跳回全时段，
-        // 没有交代的话看着像中途断了；一道光扫过说明"这条走完了"
+        // A sweep of light on reaching the end. **This is a closing gesture** -- playback stops
+        // and time jumps back to all-time, which with nothing to explain it looks like it broke
+        // off midway; a sweep of light says "this one ran all the way through"
         setSweep((n) => n + 1);
         return;
       }
-      // **连续推进，不按桶跳。** 从前按 `bucketStart` 取整下发，年单位下
-      // 一次就是一年——播放头一格一格蹦，看着像卡顿而不是在走。
-      // 单位现在只管**显示**（标签精度、柱子跨度），不再管推进的步长。
+      // **Continuous advance, no hopping from bucket to bucket.** It used to round through
+      // `bucketStart` before pushing, which at year granularity meant a whole year at a time --
+      // the playhead hopped cell by cell and looked like stutter rather than motion.
+      // The unit now governs **display** only (label precision, bar span), no longer the step.
       //
-      // 代价是下发变密（每帧一次），而每次下发都要重算全图的现行边，
-      // 所以限到 ~30fps：肉眼看不出与 60fps 的差别，重算量减半
+      // The price is denser pushes (one per frame), and every push has to recompute the current
+      // edges for the whole graph, so it is limited to ~30fps: the eye cannot tell it from
+      // 60fps, and it halves the recomputation
       if (now - lastPushed >= 33) {
         lastPushed = now;
         onChange(Math.round(acc));
@@ -2071,17 +2223,18 @@ function TimeScrubber({
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-    // 只随播放开关重启：acc 在循环内自持，value 帧帧变不应重建循环
+    // Only restarts with the play switch: acc is self-sustaining inside the loop, and value
+    // changing every frame should not rebuild the loop
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, minTs, maxTs, unit]);
 
-  // 展示到日：与数据的 day 级 valid_precision 对齐
+  // Displayed down to the day: matching the data's day-level valid_precision
   const label = (() => {
     if (value === null) return S.graph.allTime;
     const d = new Date(value);
     const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
     const dd = String(d.getUTCDate()).padStart(2, "0");
-    // 精度跟着单位：年单位下写出「2019-01-01」是假精确
+    // Precision follows the unit: writing out "2019-01-01" at year granularity is false precision
     if (unit === "year") return `${d.getUTCFullYear()}`;
     if (unit === "month") return `${d.getUTCFullYear()}-${mm}`;
     return `${d.getUTCFullYear()}-${mm}-${dd}`;
@@ -2095,17 +2248,21 @@ function TimeScrubber({
     : undefined;
 
   return (
-    /* 宽度随单位变：单位大 → 桶少 → 短；单位小 → 桶多 → 长而密。
-       仍夹在视口内（calc 那一项），窄屏不会顶出去。
-       实测宽度：年 320 / 月 648 / 日 760。 */
+    /* The width varies with the unit: big unit → few buckets → short; small unit → many buckets
+       → long and dense.
+       Still clamped inside the viewport (that calc term), so it will not overflow a narrow
+       screen.
+       Measured widths: year 320 / month 648 / day 760. */
     <div
       className={`glass-strong absolute bottom-4 left-1/2 -translate-x-1/2 z-10 rounded-2xl px-3 py-2 flex items-center gap-2.5 shadow-[0_12px_40px_rgba(0,0,0,0.5)] u-scrub-island${playing ? " u-solid" : ""}`}
       style={{ width: `min(${trackW}px, calc(100vw - 4rem))` }}
     >
       <button
         onClick={() => {
-          // 已经在末端（`Now`）时按播放要从头来。**否则第一下等于没反应**：
-          // acc 起点就是终点，循环第一帧就判定播完，只把位置清成 All time
+          // Pressing play while already at the end (`Now`) has to start over. **Otherwise the
+          // first press amounts to nothing happening**: acc starts where it ends, the loop
+          // declares playback finished on its very first frame and only clears the position to
+          // All time
           if (
             !playing &&
             (value === null || value >= maxTs - (maxTs - minTs) * 0.02)
@@ -2119,13 +2276,13 @@ function TimeScrubber({
         {playing ? <Pause size={13} /> : <Play size={13} />}
       </button>
 
-      {/* 步长。**播放与柱子共用它**——从前柱子按年、播放按天，
-          界面上没有一处说得出「一格是多久」 */}
+      {/* The step. **Playback and the bars share it** -- the bars used to go by year and
+          playback by day, and nowhere in the UI could you tell "how long is one cell" */}
       <div
         title={S.graph.scrubUnitHint}
-        /* **与播放键同高同圆角**：那个键是 h-8 / rounded-lg，
-           而这里从前是 py-[3px] 撑出来的 20px 高、rounded-md——
-           并排放着两个尺寸和圆角都不一样的东西，看着不像一套 */
+        /* **Same height and corner radius as the play button**: that button is h-8 / rounded-lg,
+           while this used to be 20px tall, padded out by py-[3px], and rounded-md -- two things
+           side by side with different sizes and different radii do not look like one set */
         className="flex h-8 shrink-0 items-center overflow-hidden rounded-lg border border-white/10"
       >
         {(["year", "month", "day"] as const).map((u) => (
@@ -2151,19 +2308,20 @@ function TimeScrubber({
         {minYear}
       </span>
 
-      {/* 密度带轨道：内嵌浅色井 + 每年事实量柱 */}
+      {/* Density-band track: an inset light well + one bar per year of fact volume */}
       <div
         ref={trackRef}
         onMouseEnter={() => setTrackHover(true)}
         onMouseLeave={() => setTrackHover(false)}
         className="relative h-9 min-w-[150px] flex-1 overflow-hidden rounded-lg bg-white/[0.04]"
       >
-        {/* 演完由 **React** 卸载，**别自己 `remove()`**。
-            从前是 `onAnimationEnd={(e) => e.currentTarget.remove()}`——
-            把 React 管着的节点从 DOM 里抠走，它自己并不知道。下一次扫光时
-            key 变了，React 去移除"旧节点"，而那个节点已经不在父节点里，
-            removeChild 抛 NotFoundError，未捕获的错误让整棵树卸载重挂：
-            现象就是**连播两轮之后界面像刷新了一次** */}
+        {/* When the animation ends **React** unmounts it, **do not call `remove()` yourself**.
+            This used to be `onAnimationEnd={(e) => e.currentTarget.remove()}` --
+            ripping a node React manages out of the DOM, without React knowing. On the next
+            sweep the key changed, React went to remove the "old node", and that node was no
+            longer inside its parent; removeChild threw NotFoundError, and the uncaught error
+            unmounted and remounted the whole tree: the symptom being **the UI looks like it
+            refreshed after two rounds of playback** */}
         {sweep > 0 && (
           <span
             key={sweep}
@@ -2171,15 +2329,18 @@ function TimeScrubber({
             onAnimationEnd={() => setSweep(0)}
           />
         )}
-        {/* **间隙必须随密度收**：写死 2px 时，日单位下 216 根柱子有 215 个间隙
-            ≈ 430px，而轨道内宽才 ~455px——柱子被挤成 0.1px，整条看起来是空的。
-            实测就是这么丢的。柱子稀疏时留 2px 好数，密了就贴在一起当密度带看 */}
+        {/* **The gap has to shrink with the density**: hard-coded at 2px, day granularity's 216
+            bars have 215 gaps ≈ 430px while the track's inner width is only ~455px -- the bars
+            get squeezed to 0.1px and the whole track looks empty. That is exactly how it got
+            lost. When the bars are sparse, 2px makes them easy to count; when dense they sit
+            flush together and read as a density band */}
         <div
           className="absolute inset-x-1.5 top-1.5 bottom-1.5 flex items-end"
           style={{ gap: bars.length > 120 ? 0 : bars.length > 40 ? 1 : 2 }}
         >
           {bars.map((b) => {
-            // 进入即亮（桶起点为判据）：播放头脚下的柱子即已覆盖——进度条通用语义
+            // Lit as soon as it is entered (judged on the bucket's start): the bar under the
+            // playhead already counts as covered -- the usual progress-bar semantics
             const past = value !== null && b.ts <= value;
             const d = new Date(b.ts);
             const stamp =
@@ -2198,11 +2359,13 @@ function TimeScrubber({
                   className="w-full rounded-[1px] transition-colors"
                   style={{
                     height: `${Math.max(10, b.h * 100)}%`,
-                    // 播放中已扫过的提亮，停止后回到常规亮度。
-                    // **还没走到的压到近乎不可见**：它们本来是 0.09，
-                    // 在这个底色上仍看得清，于是播放头右边跟左边一样"亮着"，
-                    // 走到哪儿就看不出来了。留一点点而不是归零——
-                    // 归零等于假装那段没有数据，而它只是还没到
+                    // Bars already swept past brighten during playback and return to normal
+                    // brightness once it stops.
+                    // **The not-yet-reached ones are dimmed to nearly invisible**: they used to
+                    // be 0.09, which is still clearly visible against this backing, so the
+                    // right of the playhead was "lit" just like the left and you could not see
+                    // how far it had got. A trace is left rather than zero -- zero would pretend
+                    // that stretch has no data, when it simply has not been reached yet
                     background:
                       value !== null && past && (playing || trackHover)
                         ? "rgba(255,255,255,0.62)"
@@ -2222,18 +2385,21 @@ function TimeScrubber({
           max={maxTs}
           step={DAY_MS}
           value={value ?? maxTs}
-          /* **拖动不停播**：拖是"我要看那一段"，不是"我要停下"——
-             松手之后应该从新位置继续走到底。
-             （`All time` / `Now` 那两个按钮仍然停：那是明确的跳转，不是擦洗） */
+          /* **Dragging does not stop playback**: dragging is "I want to see that stretch", not
+             "I want to stop" -- after release it should carry on from the new position to the
+             end.
+             (The `All time` / `Now` buttons do still stop: those are explicit jumps, not
+             scrubbing) */
           onChange={(e) => seek(Number(e.target.value))}
-          // 原生 range 的拖拽手势会被页面级鼠标监听（如图上拖节点）干扰——
-          // 自己用 pointer capture 驱动拖动，点击与拖拽都走同一条计算路径
+          // The native range's drag gesture gets disturbed by page-level mouse listeners (such as
+          // dragging nodes on the graph) -- so the drag is driven by our own pointer capture,
+          // and clicks and drags both go down the same computation path
           onPointerDown={(e) => {
             draggingRef.current = true;
             try {
               e.currentTarget.setPointerCapture(e.pointerId);
             } catch {
-              /* 合成事件的 pointerId 可能无效，忽略 */
+              /* A synthetic event's pointerId may be invalid; ignore it */
             }
             seek(scrubValueAt(e.clientX, trackRef.current, minTs, maxTs));
           }}
@@ -2260,7 +2426,8 @@ function TimeScrubber({
 
       <div className="h-5 w-px shrink-0 bg-white/10" />
 
-      {/* 双锚点分段：所处锚点高亮、点击即跳；拖在中间某天时两者皆不亮 */}
+      {/* Two-anchor segmented control: whichever anchor you are on is highlighted and a click
+          jumps there; dragged to some day in between, neither is lit */}
       <div className="flex shrink-0 rounded-lg overflow-hidden border border-white/10">
         {(
           [
@@ -2298,15 +2465,17 @@ function TimeScrubber({
   );
 }
 
-/* ============ 实体侧栏 ============ */
+/* ============ Entity sidebar ============ */
 
-/** 世界时间（这件事何时成立）→ 文本。**一律按 UTC 读，不转本地。**
+/** World time (when this thing held) → text. **Always read as UTC, never converted to local.**
  *
- *  `valid_from` / `valid_to` 来自文档里的陈述（"2019 年 5 月 2 日就任"），
- *  是**日历日期不是时刻**，本来就没有时区；存的是那一天的 UTC 午夜。
- *  按本地渲染会让 UTC-5 的读者看到 2019-05-01——凭空差一天，而且差的方向
- *  还随读者所在地变。记录时间（我们何时这么认为）是另一回事，那个该按本地，
- *  见 EntityHistory 里 ymd 的注释。 */
+ *  `valid_from` / `valid_to` come from statements in documents ("took office on 2 May 2019"),
+ *  which are **calendar dates, not instants**, and have no time zone to begin with; what is
+ *  stored is UTC midnight of that day.
+ *  Rendering in local time would show a reader at UTC-5 2019-05-01 -- a day off out of nowhere,
+ *  and the direction of the error varies with where the reader is. Record time (when we came to
+ *  believe it) is a different matter and should be local; see the comment on ymd in
+ *  EntityHistory. */
 function fmtTime(iso: string | null, precision: string | null): string | null {
   if (!iso) return null;
   const d = new Date(iso);
@@ -2322,25 +2491,30 @@ function fmtInterval(f: EntityFact): string {
   if (f.temporal === "eternal") return "";
   const from = fmtTime(f.valid_from, f.valid_from_precision);
   const to = fmtTime(f.valid_to, f.valid_to_precision);
-  // **「结束了但不知哪天」绝不能显示成「至今」。** 那是这条改动要修的正脸：
-  // 原文明说 "former CEO of Weta Digital"，界面却告诉读者他还在任
+  // **"Ended, but which day is unknown" must never be displayed as "to date".** That is the
+  // full face of what this change fixes: the source says plainly "former CEO of Weta Digital"
+  // while the UI told the reader he was still in post
   const endedUnknown = !f.valid_to && f.valid_to_precision === "unknown";
   if (!from && !to && !endedUnknown) return "";
   const end = to ?? (endedUnknown ? S.graph.endedUnknown : S.graph.ongoing);
   return from ? `${from} ~ ${end}` : `~ ${end}`;
 }
 
-/** 一条推出来的事实，**证明摊开在下面**。
+/** One derived fact, **with the proof laid out underneath**.
  *
- * 不做折叠：这一档存在的全部理由就是「这条边不是谁说的，是这么来的」，
- * 把前提藏在一次点击后面等于把理由藏起来。链最长十二条，摊开也不长。 */
-/** 派生开关旁边那个小窗：**这批边是什么时候、按什么推出来的，以及现在还准不准**。
+ * No collapsing: the entire reason this tab exists is "nobody stated this edge, this is how it
+ * came about", and hiding the premises behind a click hides the reason. The longest chain is
+ * twelve steps, so laid out it is not long either. */
+/** The small window beside the derived switch: **when and by what this batch of edges was
+ *  derived, and whether it is still accurate**.
  *
- * 存在的理由是「新鲜度看不见」。派生每小时重推一次，而事实每篇文档进来都在变——
- * 一条派生边看上去和它刚推出来的时候一模一样，可它依据的前提可能三分钟前刚被撤掉。
- * 光有开关答不了「我现在看到的是什么时候的结论」。
+ * The reason it exists is that "freshness is invisible". Derivation re-runs every hour, while
+ * the facts shift with every document that arrives -- a derived edge looks exactly as it did the
+ * moment it was derived, yet the premise it rests on may have been retracted three minutes ago.
+ * The switch on its own cannot answer "as of when is what I am looking at".
  *
- * 手动按钮留在这里而不是别处：想重推的人正是刚看完这三行、觉得数字太旧的那个人。
+ * The manual button stays here rather than somewhere else: the person who wants to re-run is
+ * precisely the one who has just read these three lines and found the numbers too old.
  */
 function DerivedPanel({
   panelRef,
@@ -2358,14 +2532,16 @@ function DerivedPanel({
     queryKey: ["kbOne", kbId],
     queryFn: () => api.kbDetail(kbId),
   });
-  /* 重跑要确认，但**确认的第二下必须落在另一个按钮上**。
-     这产品的手势约定是「同一个控件连点两下 = 收回去」——开关、⋯、图例胶囊
-     都是这么用的。把「再点一次就执行」压在同一个按钮上，等于让同一个手势
-     在这里意外地变成了「执行」，而别处它一直是「取消」。
-     所以点一下只是**问一句**，问句下面给 取消 / 跑 两个目标。
+  /* Re-running needs confirming, but **the second press has to land on a different button**.
+     This product's gesture convention is "two clicks on the same control = collapse it" -- the
+     switch, the ⋯, the legend chips are all used that way. Putting "click again to execute" on
+     the same button would mean the same gesture unexpectedly turns into "execute" here, while
+     everywhere else it has always been "cancel".
+     So one click only **asks a question**, and beneath the question sit two targets: cancel / run.
 
-     也没有用全站的 DangerConfirm：那是红标题、可要求逐字输入的危险级，
-     留给删库那类不可逆操作。重跑推理重但可重复，够不上那一档 */
+     The site-wide DangerConfirm is not used either: that is the danger tier, with a red title
+     and the option to demand the name typed out, reserved for irreversible things like deleting
+     a KB. Re-running inference is heavy but repeatable, which does not reach that tier */
   const [armed, setArmed] = useState(false);
   const run = useMutation({
     mutationFn: () => api.runInference(kbId),
@@ -2378,29 +2554,32 @@ function DerivedPanel({
 
   const on = kb.data?.materialize_inferences ?? false;
   const last = kb.data?.last_inference_at;
-  // 「多久以前」比一个时间戳好读——问题是「新不新」，不是「几点」
+  // "How long ago" reads better than a timestamp -- the question is "is it fresh", not "what
+  // time was it"
   const age = last
     ? Math.round((Date.now() - new Date(last).getTime()) / 60000)
     : null;
 
-  // **盖在触发器原位往右上长开**（bottom-0 left-0），而不是在旁边挂一扇窗。
-  // 面与圆角跟通知/用户卡片对齐：u-menu-glass + rounded-xl
+  // **It covers the trigger's own position and grows up and to the right** (bottom-0 left-0),
+  // rather than hanging a window off to one side.
+  // Surface and corner radius line up with the notification/user cards: u-menu-glass + rounded-xl
   return (
     <div
       ref={panelRef}
       className="u-menu-glass pointer-events-auto absolute bottom-0 left-0 z-50 w-72 overflow-hidden rounded-xl px-3 pb-3 pt-2.5 shadow-2xl"
     >
-      {/* items-center 而不是 baseline：标题旁边站着一个按钮和一个关闭键，
-          按基线对齐会让那两个看着往上飘 */}
+      {/* items-center rather than baseline: a button and a close key stand beside the title, and
+          aligning on the baseline makes those two look like they drift upward */}
       <div className="flex items-center gap-2">
         <span className="text-[13px] text-neutral-100">
           {S.graph.derivedPanel}
         </span>
         {!armed && (
           <button
-            /* **要长得像个按钮**：从前是一段灰色幽灵文字夹在标题与 × 之间，
-               读起来像第三个标题而不是一个动作。加边框 + 内距，
-               与右上角那个档位加减器同一档次要控件的样子 */
+            /* **It has to look like a button**: it used to be a stretch of grey ghost text
+               wedged between the title and the ×, which read as a third title rather than as an
+               action. A border + padding puts it in the same tier of secondary control as the
+               step stepper in the top right corner */
             className="ml-auto rounded-md border border-white/10 px-2 py-0.5 text-[11px] text-neutral-400 transition-colors hover:border-white/20 hover:text-neutral-100"
             disabled={!on || run.isPending}
             title={on ? undefined : S.err.inference_off}
@@ -2409,8 +2588,9 @@ function DerivedPanel({
             {run.isPending ? S.graph.derivedRunning : S.graph.derivedRun}
           </button>
         )}
-        {/* 固定 18px 方格：**别让关闭键撑起标题行的高**——一撑高，
-            行里最矮的标题就被居中挤出上下空当，看着像上边距过大 */}
+        {/* A fixed 18px square: **do not let the close key set the height of the title row** --
+            once it does, the shortest thing in the row, the title, gets centred with gaps above
+            and below, which looks like too much top padding */}
         <button
           className={`${armed ? "ml-auto " : ""}grid h-[18px] w-[18px] place-items-center rounded text-neutral-500 transition-colors hover:bg-white/[0.06] hover:text-neutral-200`}
           onClick={onClose}
@@ -2420,8 +2600,9 @@ function DerivedPanel({
         </button>
       </div>
 
-      {/* 问句 + 两个目标。**取消排在前面**：从「跑」那一下移过来最先碰到的
-          是取消，误触的代价小的那个该更近 */}
+      {/* The question + two targets. **Cancel comes first**: moving over from that "run" press,
+          the first thing you meet is cancel, and whichever has the smaller cost when hit by
+          mistake should be the nearer one */}
       {armed && (
         <div className="mt-2 rounded-lg bg-white/[0.04] p-2">
           <p className="text-[11px] leading-relaxed text-neutral-300">
@@ -2469,8 +2650,9 @@ function DerivedPanel({
         </div>
       </dl>
 
-      {/* 上一次手动跑的结果留在这儿。**推出多少、作废多少要分开说**——
-          「什么都没变」和「换掉了三十条」是两件很不一样的事 */}
+      {/* The result of the last manual run stays here. **How many were derived and how many
+          were invalidated have to be said separately** -- "nothing changed" and "thirty got
+          replaced" are two very different things */}
       {run.data && (
         <p className="mt-2 text-[11px] text-neutral-400">
           {run.data.inserted === 0 && run.data.invalidated === 0
@@ -2485,12 +2667,13 @@ function DerivedPanel({
   );
 }
 
-/** 推出来的一条边。**行式样与 FactRow 对齐**：同样的圆角行、同样的
- *  chevron 展开、同样的 role="link" 跳转（避免按钮套按钮）。
+/** One derived edge. **The row styling lines up with FactRow**: the same rounded row, the same
+ *  chevron expansion, the same role="link" navigation (avoiding a button inside a button).
  *
- *  从前这里是一张 `glass rounded-xl p-3` 卡片、证明常驻展开——在一列
- *  Relations/Timeline/History 的紧凑行里显得是另一个产品的东西，而且十几条
- *  推导堆起来是一面墙。证明是「问了才看」的东西，收进展开区正合适。 */
+ *  This used to be a `glass rounded-xl p-3` card with the proof permanently expanded -- among a
+ *  column of compact Relations/Timeline/History rows it looked like something out of a different
+ *  product, and a dozen derivations stacked up were a wall. A proof is something you look at
+ *  only once you ask for it, so tucking it into an expansion area fits exactly. */
 function DerivedRow({
   kbId,
   d,
@@ -2541,18 +2724,23 @@ function DerivedRow({
           {d.premises.length}
         </span>
       </button>
-      {/* 证明：前提按推导顺序，每条展开到原句（0002 R2）。**边框与 EvidenceList
-          同一档**——两者是同一件事的两种形态：一个给出处，一个给推理链 */}
+      {/* Proof: the premises in derivation order, each expanded down to the original sentence
+          (0002 R2). **The border is of the same tier as EvidenceList** -- the two are two forms
+          of the same thing: one gives the source, the other gives the chain of reasoning */}
       {open && <ProofChain kbId={kbId} d={d} />}
     </div>
   );
 }
 
-/** 一条派生的证明链。展开时才取——证明是「问了才看」的东西。
+/** One derivation's proof chain. Fetched only on expansion -- a proof is something you look at
+ *  only once you ask for it.
  *
- *  每一步是一条断言前提：三元组在上，它的原句在下，原句可点进文档。
- *  前提被撤过的打标记但不藏：派生随之失效，而「当时靠的是什么」正是记录轴要答的。
- *  取不到（派生已失效）就退回列表里带来的那几行文本，不空着。 */
+ *  Each step is one asserted premise: the triple on top, its original sentence below, and the
+ *  sentence clicks through into the document.
+ *  Premises that have been retracted are marked but not hidden: the derivation lapses with them,
+ *  and "what it rested on at the time" is exactly what the record-time axis has to answer.
+ *  If it cannot be fetched (the derivation has already lapsed), fall back to the few lines of
+ *  text the list brought along, rather than leaving it blank. */
 function ProofChain({ kbId, d }: { kbId: string; d: DerivedFact }) {
   const proof = useQuery({
     queryKey: ["proof", d.id],
@@ -2565,7 +2753,8 @@ function ProofChain({ kbId, d }: { kbId: string; d: DerivedFact }) {
         <p className="text-[11px] text-neutral-600">{S.graph.proofLoading}</p>
       )}
       {steps && <ProofSteps kbId={kbId} steps={steps} />}
-      {/* 派生已失效、证明取不到：退回列表里带来的那几行文本 */}
+      {/* The derivation has lapsed and the proof cannot be fetched: fall back to the few lines
+          of text the list brought along */}
       {!proof.isPending && !steps && (
         <ol className="space-y-0.5">
           {d.premises.map((p, i) => (
@@ -2582,7 +2771,8 @@ function ProofChain({ kbId, d }: { kbId: string; d: DerivedFact }) {
   );
 }
 
-/** 证明的步，落了地的与没落地的派生共用：前提是同一种东西 */
+/** Proof steps, shared by derivations that landed and those that did not: a premise is the same
+ *  kind of thing either way */
 function ProofSteps({ kbId, steps }: { kbId: string; steps: ProofStep[] }) {
   return (
     <ol className="space-y-2">
@@ -2636,8 +2826,9 @@ function ProofSteps({ kbId, steps }: { kbId: string; steps: ProofStep[] }) {
   );
 }
 
-/** 没落地的派生（0017 §3）：像 DerivedRow 一样的一行，多一句「挡住它的是谁」，
- *  展开是它的证明链——人在这里看到「引擎本可以画这条边，是什么拦住了它」 */
+/** A derivation that did not land (0017 §3): a row like DerivedRow plus one line of "who is
+ *  blocking it", expanding into its proof chain -- this is where a person sees "the engine could
+ *  have drawn this edge; here is what stopped it" */
 function BlockedRow({
   kbId,
   b,
@@ -2730,8 +2921,9 @@ function BlockedRow({
   );
 }
 
-/** 争议 chip（0017 §3）：有一条 open 的违规或冲突指着这条断言。行不压暗——
- *  它仍然活着。点它去 Review 对应那一档，并把那张卡点亮 */
+/** Contested chip (0017 §3): an open violation or conflict is pointing at this assertion. The
+ *  row is not dimmed -- it is still alive. Clicking it goes to the matching Review tab and
+ *  lights that card up */
 function ContestedChip({
   kbId,
   c,
@@ -2781,9 +2973,9 @@ function EntityPanel({
 }: {
   kbId: string;
   entityId: string;
-  /** 正在演退场：还挂在 DOM 上，但已经不接受点击 */
+  /** Playing the exit animation: still attached to the DOM, but no longer accepting clicks */
   exiting: boolean;
-  /** 打开时停在哪一档、展开哪一行；读一次就清掉 */
+  /** Which tab to land on and which row to expand when opening; cleared once it has been read */
   intent?: MutableRefObject<{ view: "derived"; open: string } | null>;
   onClose: () => void;
   onNavigate: (entityId: string) => void;
@@ -2793,14 +2985,15 @@ function EntityPanel({
     queryFn: () => api.entityDetail(kbId, entityId),
   });
   const [openFact, setOpenFact] = useState<string | null>(null);
-  // 推出来的那些。**单独一个键，不掺进 facts**——混在一个列表里，用户看不出
-  // 「文档里写的」和「引擎推的」的区别
+  // The derived ones. **A key of their own, not mixed into facts** -- in one single list the
+  // user cannot see the difference between "written in a document" and "derived by the engine"
   const derived = detail.data?.derived ?? [];
-  // 没落地的（0017 §3）：推出来了，撞上一条断言
+  // The ones that did not land (0017 §3): derived, and then ran into an assertion
   const blocked = detail.data?.blocked ?? [];
-  /* 按「方向 + 谓词 + 规则」分组，骨架与 Relations 的 groups 一致。
-     规则挂在组上而不是每一行：它对整组都成立，逐行重复既冗余，
-     那个琥珀色小字还会跟派生边抢色相 */
+  /* Grouped by "direction + predicate + rule", with the same skeleton as Relations' groups.
+     The rule hangs on the group rather than on every row: it holds for the whole group, so
+     repeating it row by row is redundant, and that little amber label would also compete for
+     hue with the derived edges */
   const derivedGroups = useMemo(() => {
     const map = new Map<
       string,
@@ -2814,8 +3007,9 @@ function EntityPanel({
     >();
     for (const d of derived) {
       const direction = d.subject_id === entityId ? "out" : "in";
-      // 四条规则各有名字。**查不到就退回原始 kind 串**——那对读的人没有
-      // 意义，但比显示成另一条规则的名字诚实
+      // Each of the four rules has a name. **If the lookup misses, fall back to the raw kind
+      // string** -- that means nothing to the reader, but it is more honest than showing another
+      // rule's name
       const rule = S.graph.ruleNames[d.rule] ?? d.rule;
       const key = `${direction}|${d.predicate}|${d.rule}`;
       const cur = map.get(key);
@@ -2824,8 +3018,9 @@ function EntityPanel({
     }
     return [...map.values()];
   }, [derived, entityId]);
-  // Relations = 按关系分组（查关系）；Timeline = 有效时间轴（事情何时成立）；
-  // History = 记录时间轴（我们何时这么认为、又何时改了主意）
+  // Relations = grouped by relation (looking relations up); Timeline = the valid-time axis
+  // (when things held); History = the record-time axis (when we came to believe it, and when we
+  // changed our mind)
   const [view, setView] = useState<
     "relations" | "timeline" | "history" | "derived"
   >("relations");
@@ -2839,23 +3034,26 @@ function EntityPanel({
 
   const e: GraphNode | undefined = detail.data?.entity;
 
-  // 实体修正：抽取给的是初判，判错此前只能整库重抽
+  // Entity correction: extraction gives a first verdict, and until now a wrong verdict could
+  // only be fixed by re-extracting the whole KB
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState("");
   const [draftType, setDraftType] = useState("");
-  // 同名的其他实体：详情接口打开就给。改名之后再用响应里的那份覆盖——
-  // 改完名可能撞上一批新的同名，那时候的答案比打开时的新
+  // Other entities with the same name: the detail endpoint hands them over as soon as it opens.
+  // After a rename, overwrite with the copy from the response -- renaming may run into a fresh
+  // batch of same-name entities, and that answer is newer than the one from when it opened
   const [renamedPeers, setRenamedPeers] = useState<GraphNode[] | null>(null);
   const sameName = renamedPeers ?? detail.data?.same_name ?? [];
   const setSameName = setRenamedPeers;
-  // 手动合并：把同名的那个并进**当前这个**。方向写死是有意的——
-  // 用户正在看的就是他判断为「主」的那一个
+  // Manual merge: fold the same-named one into **this one here**. The direction is hard-coded
+  // on purpose -- the one the user is looking at is the one they have judged to be the primary
   const merge = useMutation({
     mutationFn: (source: string) => api.mergeEntities(kbId, source, entityId),
     onSuccess: () => {
       toast.success(S.toast.saved);
-      // 本地把并掉的那个摘掉，别等重取——它已经不存在了，留着会让人再点一次
+      // Drop the merged-away one locally instead of waiting for a refetch -- it no longer
+      // exists, and leaving it there invites another click
       setSameName((prev) =>
         (prev ?? sameName).filter((p) => p.id !== merge.variables),
       );
@@ -2865,7 +3063,8 @@ function EntityPanel({
     },
     onError: (err: Error) => toast.error(err.message),
   });
-  // 类型下拉要的是全量本体，不是当前视图里出现过的那几个
+  // The type dropdown wants the full ontology, not just the few that happen to appear in the
+  // current view
   const ontology = useQuery({
     queryKey: ["ontology", kbId],
     queryFn: () => api.ontology(kbId),
@@ -2880,7 +3079,8 @@ function EntityPanel({
     setSameName([]);
     setEditing(true);
   };
-  // 本体是异步来的：它到齐时把类型下拉对到当前类型上
+  // The ontology arrives asynchronously: when it is all in, point the type dropdown at the
+  // current type
   useEffect(() => {
     if (editing && !draftType && e)
       setDraftType(types.find((t) => t.key === e.type_key)?.id ?? "");
@@ -2899,7 +3099,7 @@ function EntityPanel({
       setEditing(false);
       setSameName(r.same_name);
       toast.success(S.graph.editSaved);
-      // 改了类型/名字，图谱节点与本体计数都要跟着动
+      // The type/name changed, so the graph nodes and the ontology counts have to move with it
       qc.invalidateQueries({ queryKey: ["entity", kbId, entityId] });
       qc.invalidateQueries({ queryKey: ["graph", kbId] });
       qc.invalidateQueries({ queryKey: ["ontology", kbId] });
@@ -2912,8 +3112,10 @@ function EntityPanel({
     (draftName.trim() !== e.name ||
       draftType !== (types.find((t) => t.key === e.type_key)?.id ?? ""));
 
-  // Relations = 当下有效的快照（as-of now）；已闭合的历史只出现在 Timeline。
-  // 按「方向 + 谓词」分组：实体自身名不再逐行重复，谓词只出现在小节标题里
+  // Relations = the snapshot valid right now (as-of now); closed history only appears in
+  // Timeline.
+  // Grouped by "direction + predicate": the entity's own name is no longer repeated on every
+  // row, and the predicate appears only in the section heading
   const { groups, historicalCount } = useMemo(() => {
     const all = detail.data?.facts ?? [];
     const nowIso = new Date().toISOString();
@@ -2933,7 +3135,8 @@ function EntityPanel({
       }
     >();
     for (const f of current) {
-      // 谓词为空的事实归到同一组：它们的共同点就是「说不出是什么关系」
+      // Facts with an empty predicate go into one group: what they have in common is exactly
+      // "we cannot say what the relation is"
       const k = `${f.direction}:${f.predicate_key ?? ""}`;
       if (!map.has(k))
         map.set(k, {
@@ -2981,7 +3184,8 @@ function EntityPanel({
                   {e.name}
                 </span>
               </div>
-              {/* 消歧后缀找不到关联事实时兜底成类型标签，那就与后面的类型重复了 */}
+              {/* When the disambiguator finds no related fact it falls back to the type label,
+                  which then duplicates the type shown after it */}
               <div className="mt-1 text-xs text-neutral-500">
                 {e.disambiguator && e.disambiguator !== e.type_label
                   ? `${e.disambiguator} · `
@@ -3068,7 +3272,8 @@ function EntityPanel({
         </div>
       )}
 
-      {/* 同名不是错误——两个张伟可以并存。只提示，判定是不是同一个是人的事 */}
+      {/* A shared name is not an error -- two people can both be called Zhang Wei. This only
+          points it out; judging whether they are the same one is a person's job */}
       {sameName.length > 0 && !editing && (
         <div className="mx-4 mt-2.5 rounded border border-white/10 bg-white/[0.03] px-2.5 py-2">
           <div className="flex items-start justify-between gap-2">
@@ -3083,9 +3288,10 @@ function EntityPanel({
               <X size={11} />
             </button>
           </div>
-          {/* 每个同名的给两个动作：去看它，或者把它并进来。
-              **方向写死成「并进当前这个」**——合并有方向（源消失、事实搬到目标上），
-              而当前打开的这个就是用户正在看、正在判断的那一个 */}
+          {/* Each same-named entity gets two actions: go and look at it, or fold it in here.
+              **The direction is hard-coded to "fold into the current one"** -- a merge has a
+              direction (the source disappears, its facts move onto the target), and the one
+              currently open is the one the user is looking at and judging */}
           <div className="mt-1.5 space-y-1">
             {sameName.map((p) => (
               <div key={p.id} className="flex items-center gap-1">
@@ -3115,12 +3321,13 @@ function EntityPanel({
         </div>
       )}
 
-      {/* 视图切换：Relations（分组）| Timeline（年表） */}
+      {/* View switching: Relations (grouped) | Timeline (chronology) */}
       <div className="px-4 pt-2.5">
         <div className="flex rounded-lg overflow-hidden border border-white/10 w-fit">
           {(["relations", "timeline", "history", "derived"] as const)
-            // 推出来的那一档：**没有派生就不出现**。一个没开推理的库不该看到
-            // 一个永远是空的标签页。没落地的也算——那正是这一档要说的事
+            // The derived tab: **it does not appear when there are no derivations**. A KB with
+            // inference off should not be shown a tab that is forever empty. The ones that did
+            // not land count too -- that is precisely what this tab is there to say
             .filter(
               (v) => v !== "derived" || derived.length > 0 || blocked.length > 0,
             )
@@ -3213,10 +3420,11 @@ function EntityPanel({
             <p className="px-2 pb-1.5 pt-0.5 text-[11px] leading-relaxed text-neutral-500">
               {S.graph.derivedHint}
             </p>
-            {/* **与 Relations 同一个骨架**：方向箭头 + 谓词 + 条数的小标题，
-                底下是紧凑行。规则（传递/对称）并进标题——它对整组都成立，
-                挂在每一行上是重复，而且那个 `--u-warn` 琥珀色又是一处
-                与派生边抢色相的地方 */}
+            {/* **The same skeleton as Relations**: a small heading of direction arrow +
+                predicate + count, with compact rows underneath. The rule (transitive/symmetric)
+                is folded into the heading -- it holds for the whole group, so hanging it on
+                every row is repetition, and that `--u-warn` amber is one more place competing
+                for hue with the derived edges */}
             {derivedGroups.map((gr) => (
               <div key={gr.key} className="mb-3 last:mb-1">
                 <div className="flex items-center gap-1.5 px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-[0.08em] text-neutral-500">
@@ -3294,7 +3502,8 @@ function EntityPanel({
   );
 }
 
-/** 年表视图：带区间的事实按起点摊开成竖直时间线；无时间的沉到底部 undated。 */
+/** Chronology view: facts with an interval are laid out along a vertical timeline by their
+ *  start point; the timeless ones sink to the bottom under undated. */
 function TimelineView({
   kbId,
   facts,
@@ -3359,7 +3568,8 @@ function TimelineView({
   );
 }
 
-/** 年表条目：区间 + 闭合方式标记 + 开放事实的最后确认时间；点击展开证据。 */
+/** Chronology entry: the interval + a mark for how it closed + the last confirmation time for
+ *  open facts; click to expand the evidence. */
 function TimelineRow({
   kbId,
   fact,
@@ -3453,7 +3663,8 @@ function TimelineRow({
   );
 }
 
-/** 字面值宾语的显示：属性 {value,unit} / 问数映射 {summary} / 其他 JSON 兜底。 */
+/** Display of literal-valued objects: attribute {value,unit} / data-Q&A mapping {summary} /
+ *  other JSON as a fallback. */
 function fmtObjectValue(v: Record<string, unknown> | null): string | null {
   if (!v) return null;
   if (v.value !== undefined) {
@@ -3479,7 +3690,8 @@ function FactRow({
   onNavigate: (entityId: string) => void;
 }) {
   const interval = fmtInterval(fact);
-  // 与 Review 的低置信口径一致：只有低到需要怀疑才挂 chip，常规置信保持沉默
+  // Consistent with Review's low-confidence framing: a chip is attached only when it is low
+  // enough to warrant doubt, while ordinary confidence stays silent
   const lowConfidence = fact.confidence < 0.75;
 
   return (
@@ -3542,7 +3754,8 @@ function FactRow({
   );
 }
 
-/** 证据展开区（FactRow 与 TimelineRow 共用）：quote + 跳原文 + 版本角标 + 置信。 */
+/** The evidence expansion area (shared by FactRow and TimelineRow): quote + link to the source
+ *  text + version badge + confidence. */
 function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
   const evidence = useQuery({
     queryKey: ["evidence", fact.id],
@@ -3558,9 +3771,10 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
           search={{ chunk: ev.chunk_id }}
           className="block text-xs text-neutral-500 hover:text-neutral-300"
         >
-          {/* 原文说的谓词，只在它与事实行上显示的不同时才写出来。本体外的谓词
-              事实行上已经显示原文说法（0052），相同的话再写一遍是噪声；
-              一条事实有多种说法时（占 3%）这里才有话说 */}
+          {/* The predicate as the source text put it, written out only when it differs from what
+              the fact row shows. For predicates outside the ontology the fact row already shows
+              the source's wording (0052), so writing an identical one out again is noise; this
+              only has something to say when one fact has several wordings (3% of them) */}
           {ev.proposed_predicate &&
             ev.proposed_predicate !== fact.predicate_key && (
               <div className="mb-0.5 text-[11px] text-neutral-400">
@@ -3586,7 +3800,8 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
       {evidence.data?.evidence.length === 0 && (
         <p className="text-xs text-neutral-500">{S.graph.noEvidence}</p>
       )}
-      {/* 置信度只在低到值得怀疑时说话（与 Review 低置信口径一致），常规不标 */}
+      {/* Confidence speaks only when it is low enough to be worth doubting (consistent with
+          Review's low-confidence framing); ordinarily it is not labelled */}
       {fact.confidence < 0.75 && (
         <p className="text-[10px] text-[var(--u-warn)]">
           {Math.round(fact.confidence * 100)}% {S.graph.confidence}

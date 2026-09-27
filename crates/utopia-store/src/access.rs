@@ -1,14 +1,15 @@
-//! KB 级访问判定 —— 全部 KB 作用域路由的唯一鉴权入口。
-//! 判定链：系统管理员 → 全通；kb_members 矩阵有记录 → 按矩阵角色；
-//! open 库 → 按部署角色（隐形 workspace 的 membership）；
-//! restricted 库无记录 → NotFound（不泄露库的存在）。
+//! KB-level access decisions -- the single authorization entry point for every KB-scoped
+//! route.
+//! The decision chain: system admin → everything allowed; a row in the kb_members matrix
+//! → the matrix role; an open KB → the deployment role (membership of the invisible
+//! workspace); a restricted KB with no row → NotFound (does not leak that the KB exists).
 
 use sqlx::PgPool;
 use utopia_core::models::{KbMemberView, KnowledgeBase, MyKbInfo, Role, User};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// 用户在某 KB 的有效角色（None = 不可见）。
+/// A user's effective role in a given KB (None = not visible).
 pub async fn kb_role(pool: &PgPool, user: &User, kb: &KnowledgeBase) -> AppResult<Option<Role>> {
     if user.is_admin {
         return Ok(Some(Role::Owner));
@@ -23,8 +24,9 @@ pub async fn kb_role(pool: &PgPool, user: &User, kb: &KnowledgeBase) -> AppResul
         return Ok(Role::parse(&r));
     }
     if kb.visibility == "open" {
-        // open 库 = 部署内人人可读；写权限一律来自本库矩阵
-        //（系统管理员在链首已 Owner；部署角色不再向库内映射写权）
+        // An open KB = everyone in the deployment can read; write access always comes
+        // from this KB's matrix (system admins are already Owner at the head of the
+        // chain; deployment roles no longer map write access into a KB)
         let ws: Option<(String,)> =
             sqlx::query_as("SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2")
                 .bind(kb.workspace_id)
@@ -36,17 +38,19 @@ pub async fn kb_role(pool: &PgPool, user: &User, kb: &KnowledgeBase) -> AppResul
     Ok(None)
 }
 
-/// `kb_role` 的集合版：这个人**在所有工作区里**能看见的每个 KB → 有效角色。
+/// The set version of `kb_role`: every KB this person can see **across all workspaces**
+/// → effective role.
 ///
-/// **改上面那个函数就必须改这个**。之所以不用循环调 `kb_role` 拼出来：
-/// 告警列表是跨库的，逐条一次查询就是 N+1，而告警数会随部署规模长。
-/// 三条分支与 `kb_role` 一一对应，顺序也一致：
-///   1. is_admin → 全部 KB，Owner
-///   2. kb_members 有记录 → 矩阵角色
-///   3. open 库 + 该工作区的 membership → Viewer
+/// **Change the function above and you have to change this one**. Why it is not assembled
+/// by calling `kb_role` in a loop: the alert list is cross-KB, one query per row is an
+/// N+1, and the number of alerts grows with the size of the deployment.
+/// The three branches match `kb_role` one for one, in the same order:
+///   1. is_admin → every KB, Owner
+///   2. a row in kb_members → the matrix role
+///   3. an open KB + a membership in that workspace → Viewer
 ///
-/// 第 3 条这里显式查了 `memberships`，而 `kbs::list_visible` 没查——
-/// 那个函数已被工作区路由限定过范围，这个没有。
+/// Branch 3 queries `memberships` explicitly here, while `kbs::list_visible` does not --
+/// that function has already been scoped by the workspace route, and this one has not.
 pub async fn visible_kb_roles(pool: &PgPool, user: &User) -> AppResult<Vec<(Uuid, Role)>> {
     if user.is_admin {
         let ids: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM knowledge_bases")
@@ -69,7 +73,8 @@ pub async fn visible_kb_roles(pool: &PgPool, user: &User) -> AppResult<Vec<(Uuid
     Ok(rows
         .into_iter()
         .filter_map(|(id, matrix, open_member)| {
-            // 矩阵优先于 open——跟 kb_role 一样，矩阵有记录就不再看 visibility
+            // The matrix beats open -- as in kb_role, once there is a matrix row
+            // visibility is no longer consulted
             match matrix {
                 Some(r) => Role::parse(&r).map(|r| (id, r)),
                 None if open_member => Some((id, Role::Viewer)),
@@ -79,7 +84,7 @@ pub async fn visible_kb_roles(pool: &PgPool, user: &User) -> AppResult<Vec<(Uuid
         .collect())
 }
 
-/// 要求对 KB 至少具备 `min` 角色，返回 KB。
+/// Require at least the `min` role on the KB, and return the KB.
 pub async fn require_kb(
     pool: &PgPool,
     user: &User,
@@ -95,14 +100,14 @@ pub async fn require_kb(
 }
 
 // ---------------------------------------------------------------------------
-// KB 成员矩阵
+// The KB member matrix
 // ---------------------------------------------------------------------------
 
 pub async fn kb_members(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<KbMemberView>> {
     let rows: Vec<KbMemberView> = sqlx::query_as(
         "SELECT m.user_id, u.email, u.display_name, m.role
          FROM kb_members m JOIN users u ON u.id = m.user_id
-         -- 停用的人不出现在成员列表里（见 `users.deactivated_at`）；成员关系那一行留着
+         -- Deactivated people do not appear in the member list (see `users.deactivated_at`); the membership row itself stays
          WHERE m.kb_id = $1 AND u.deactivated_at IS NULL ORDER BY u.display_name",
     )
     .bind(kb_id)
@@ -123,7 +128,8 @@ pub async fn set_kb_member(
             "role must be viewer, editor or admin".into(),
         ));
     }
-    // 改角色不改写最初邀请人（加入信息记录的是"谁引进来的"）
+    // Changing the role does not rewrite the original inviter (the join info records
+    // "who brought them in")
     sqlx::query(
         "INSERT INTO kb_members (kb_id, user_id, role, added_by) VALUES ($1, $2, $3, $4)
          ON CONFLICT (kb_id, user_id)
@@ -138,7 +144,8 @@ pub async fn set_kb_member(
     Ok(())
 }
 
-/// 我在各可见库的成员信息 + 概览统计（账户层 Knowledge bases 页）。
+/// My membership info for each visible KB + summary stats (the account-level Knowledge
+/// bases page).
 pub async fn my_kb_infos(
     pool: &PgPool,
     kb_ids: &[Uuid],
@@ -176,7 +183,7 @@ pub async fn remove_kb_member(pool: &PgPool, kb_id: Uuid, user_id: Uuid) -> AppR
 }
 
 // ---------------------------------------------------------------------------
-// 部署配置
+// Deployment configuration
 // ---------------------------------------------------------------------------
 
 pub async fn open_registration(pool: &PgPool) -> AppResult<bool> {
@@ -195,10 +202,12 @@ pub async fn set_open_registration(pool: &PgPool, value: bool) -> AppResult<()> 
     Ok(())
 }
 
-/// 新建知识库时 `ontology_lang` 的默认值。
+/// The default value of `ontology_lang` when a knowledge base is created.
 ///
-/// **刻意不叫"系统语言"**：叫那个名字的话，迟早有人试图把界面语言挂上来，
-/// 然后发现挂不上（界面语言在客户端）。名字本身就该把误用挡住。见 docs/decisions/0004。
+/// **Deliberately not called "system language"**: under that name, sooner or later
+/// someone tries to hang the interface language off it and then finds out they cannot
+/// (the interface language lives in the client). The name itself ought to block the
+/// misuse. See docs/decisions/0004.
 pub async fn default_ontology_lang(pool: &PgPool) -> AppResult<String> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT default_ontology_lang FROM deployment_settings LIMIT 1")
@@ -218,15 +227,17 @@ pub async fn set_default_ontology_lang(pool: &PgPool, value: &str) -> AppResult<
     Ok(())
 }
 
-/// 任务 worker 并发数（系统设置可改，改动即时生效——见 jobs::run_worker）。
+/// The job worker concurrency (changeable in the system settings, and a change takes
+/// effect immediately -- see jobs::run_worker).
 pub async fn worker_concurrency(pool: &PgPool) -> AppResult<i32> {
     let row: Option<(i32,)> =
         sqlx::query_as("SELECT worker_concurrency FROM deployment_settings LIMIT 1")
             .fetch_optional(pool)
             .await?;
-    // 与 `deployment_settings.worker_concurrency` 的列缺省保持一致（迁移 0011）。
-    // 两处分开写是因为一处在 SQL、一处在 Rust，改一处不会带上另一处——
-    // `the_backstop_can_be_raised` 那条测试盯着这件事
+    // Kept in step with the column default of `deployment_settings.worker_concurrency`
+    // (migration 0011). It is written in two places because one is in SQL and the other
+    // in Rust, and changing one does not carry the other along -- the
+    // `the_backstop_can_be_raised` test keeps an eye on exactly this
     Ok(row.map(|(v,)| v).unwrap_or(64))
 }
 
@@ -244,12 +255,14 @@ pub async fn set_worker_concurrency(pool: &PgPool, value: i32) -> AppResult<()> 
     Ok(())
 }
 
-/// 落库自动生成的 JWT 密钥，返回最终生效的那一个。
+/// Persist the auto-generated JWT secret, and return the one that ends up in effect.
 ///
-/// `COALESCE` 让并发启动的多个实例收敛到同一个值：谁先写谁赢，后来者拿回的是
-/// 库里已有的那条而不是自己刚生成的。分成「先读、没有再写」两步做不到这一点——
-/// 两个实例会同时读到 NULL，各写各的，先写的那个从此在用一个已经不在库里的密钥，
-/// 它签发的 token 到另一个实例上全部失效。
+/// `COALESCE` makes several instances starting concurrently converge on the same value:
+/// whoever writes first wins, and the latecomers get back the row already in the database
+/// rather than the one they just generated. Splitting it into the two steps "read first,
+/// write if absent" cannot achieve that -- two instances would both read NULL, each write
+/// their own, and the one that wrote first would from then on be using a secret that is
+/// no longer in the database, so every token it signs is invalid on the other instance.
 pub async fn ensure_jwt_secret(pool: &PgPool, generated: &str) -> AppResult<String> {
     let (secret,): (Option<String>,) = sqlx::query_as(
         "UPDATE deployment_settings SET jwt_secret = COALESCE(jwt_secret, $1)
@@ -260,16 +273,18 @@ pub async fn ensure_jwt_secret(pool: &PgPool, generated: &str) -> AppResult<Stri
     .await?;
     secret.ok_or_else(|| {
         AppError::Other(anyhow::anyhow!(
-            "deployment_settings 没有单例行，JWT 密钥无处落库"
+            "deployment_settings has no singleton row, so the JWT secret has nowhere to go"
         ))
     })
 }
 
-/// 本体铺进抽取提示词的字符预算。超了改成按分块检索候选。
+/// The character budget for laying the ontology into the extraction prompt. Over budget,
+/// it switches to retrieving candidates per chunk.
 ///
-/// **放设置而不是常量**，是因为定死它需要一条曲线：每个本体规模下，全量内联
-/// 与按块检索各测一次，看它们在哪里交叉。要重启一次服务才测得了一档的话，
-/// 那条曲线不会有人跑第二遍。
+/// **A setting rather than a constant**, because pinning it down takes a curve: at every
+/// ontology size, measure full inlining once and per-chunk retrieval once, and see where
+/// the two cross. If measuring a single point takes a service restart, nobody will ever
+/// run that curve a second time.
 pub async fn ontology_prompt_budget(pool: &PgPool) -> AppResult<usize> {
     let row: Option<(i32,)> =
         sqlx::query_as("SELECT ontology_prompt_budget FROM deployment_settings LIMIT 1")

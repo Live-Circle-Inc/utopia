@@ -40,7 +40,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route("/auth/register", post(auth_routes::register))
         .route("/auth/login", post(auth_routes::login))
         .route("/auth/logout", post(auth_routes::logout))
-        // 告警中心：跨库，不挂在 /kbs/{id} 下面
+        // Alert centre: cross-KB, so it does not hang under /kbs/{id}
         .route("/alerts", get(alerts_routes::list))
         .route("/alerts/unread", get(alerts_routes::unread))
         .route("/alerts/read-all", post(alerts_routes::mark_all_read))
@@ -62,7 +62,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
                 .delete(workspaces::delete),
         )
         .route("/workspaces/{id}/kbs", get(kbs::list).post(kbs::create))
-        // 建库界面用的静态清单，与具体工作区无关
+        // Static list for the create-KB screen; nothing to do with any particular workspace
         .route("/ontology-packs", get(kbs::list_packs))
         .route("/workspaces/{id}/my-kbs", get(kbs::my_kbs))
         .route(
@@ -79,7 +79,8 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             axum::routing::put(members_routes::set_role).delete(members_routes::remove),
         )
         .route("/users", get(members_routes::org_users))
-        // 已停用的账号：没有这一条，恢复就够不着（那个人从所有列表里消失）
+        // Deactivated accounts: without this route reactivation is out of reach (the person
+        // has vanished from every list)
         .route("/users/deactivated", get(members_routes::deactivated_users))
         .route(
             "/kbs/{id}",
@@ -87,7 +88,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         )
         .route("/kbs/{id}/members", get(kbs::members))
         .route("/kbs/{id}/audit", get(kbs::audit_log))
-        // 失败任务回队列（#216）：库内给 Editor，全局给管理员
+        // Requeue failed jobs (#216): within a KB for Editor, globally for admins
         .route("/kbs/{id}/jobs/failed", get(jobs_routes::failed_in_kb))
         .route("/kbs/{id}/jobs/requeue", post(jobs_routes::requeue_in_kb))
         .route("/jobs/requeue", post(jobs_routes::requeue_all))
@@ -100,8 +101,8 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             get(admin_routes::get_deployment).put(admin_routes::put_deployment),
         )
         .route("/admin/users", post(admin_routes::create_user))
-        // 停用 / 恢复账号（见 `users.deactivated_at`）。DELETE 的语义是「这个人不再有访问权」,
-        // 而不是「这一行没了」——归因照旧查得到
+        // Deactivate / reactivate an account (see `users.deactivated_at`). DELETE means "this
+        // person no longer has access", not "this row is gone" -- attribution stays queryable
         .route(
             "/admin/users/{id}",
             axum::routing::delete(admin_routes::deactivate_user)
@@ -168,7 +169,8 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
                 .post(documents_routes::upload)
                 .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
         )
-        // 一键重试：抽取失败往往是成批的（模型端点断了一阵，那段时间进来的全挂）
+        // One-click retry: extraction failures usually come in batches (the model endpoint was
+        // down for a while and everything that arrived in that window failed)
         .route(
             "/kbs/{id}/documents/retry-failed",
             post(documents_routes::retry_failed),
@@ -224,14 +226,16 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             post(ontology_routes::restore_miss),
         )
         .route("/kbs/{id}/ontology/suggest", post(ontology_routes::suggest))
-        // 上次算出来、还没人表态的那些（见 `ontology_proposals`）。刷新页面靠它，不必重跑模型
+        // The ones computed last time that nobody has ruled on yet (see `ontology_proposals`).
+        // A page refresh leans on this instead of re-running the model
         .route(
             "/kbs/{id}/ontology/proposals",
             get(ontology_routes::stored_proposals).post(ontology_routes::decide_proposal),
         )
-        // OWL 导入：预览与落库分开两个端点，绝不让上传即改本体。
-        // 两者跑同一个 plan——分开的代码路径会分叉，而分叉意味着确认之后
-        // 发生的事与刚看过的不一样
+        // OWL import: preview and commit are two separate endpoints -- an upload must never
+        // change the ontology by itself.
+        // Both run the same plan -- separate code paths drift apart, and drift means what
+        // happens after you confirm is not what you just looked at
         .route(
             "/kbs/{id}/ontology/imports",
             get(ontology_routes::list_imports)
@@ -260,7 +264,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         )
         .route("/kbs/{id}/search", post(search_routes::search))
         .route("/kbs/{id}/chat", post(chat::chat))
-        // 刷新页面后重新接上正在生成的那个回答（见 `live`）
+        // Reattach to the answer still being generated after a page refresh (see `live`)
         .route(
             "/kbs/{id}/conversations/{conversation_id}/stream",
             get(chat::reattach),
@@ -295,12 +299,12 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/kbs/{id}/facts/{fact_id}/evidence",
             get(graph_routes::fact_evidence),
         )
-        // 派生事实的证明（0002 R2）：前提按顺序展开到原句
+        // Proof of a derived fact (0002 R2): premises expanded in order down to the sentence
         .route(
             "/kbs/{id}/derived/{derived_id}/proof",
             get(graph_routes::derived_proof),
         )
-        // 没落地的派生的证明（0017 §3）：前提在违规的 path 里
+        // Proof of a derivation that never landed (0017 §3): premises live in the violation's path
         .route(
             "/kbs/{id}/violations/{violation_id}/proof",
             get(graph_routes::blocked_proof),
@@ -336,7 +340,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             get(documents_routes::extractions),
         )
         .route("/kbs/{id}/ingest", post(sources_routes::ingest))
-        // api 来源推送：来源专属密钥认证（Bearer），无会话
+        // Push from an api source: authenticated by a source-specific key (Bearer), no session
         .route("/sources/{source_id}/ingest", post(sources_routes::push))
         .route(
             "/kbs/{id}/sources/{source_id}/token",
@@ -348,7 +352,8 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         )
         .route("/kbs/{id}/review", get(review_routes::list))
         .route("/kbs/{id}/review/history", get(review_routes::history))
-        // 记忆抽出、等人点头的事实（0015）：按句取、逐条裁
+        // Facts extracted from a memory, waiting for a nod (0015): fetched per sentence, ruled
+        // on one at a time
         .route(
             "/kbs/{id}/review/pending",
             get(review_routes::pending_for_chunk),
@@ -358,13 +363,14 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             post(review_routes::decide_pending),
         )
         .route("/kbs/{id}/review/{review_id}", post(review_routes::decide))
-        // 语义层映射的表态（0011）。跟消解审核并排——都是「引擎提议、人裁决」
+        // Ruling on a semantic-layer mapping (0011). Sits alongside resolution review -- both
+        // are "the engine proposes, a human decides"
         .route(
             "/kbs/{id}/review/mappings/{mapping_id}",
             post(review_routes::decide_mapping),
         )
-        // 一致性检查（0002 R0）：跑一遍，与裁决一处违规。
-        // 检查本身是纯计算,同步跑
+        // Consistency check (0002 R0): run a pass, and rule on one violation.
+        // The check itself is pure computation, so it runs synchronously
         .route(
             "/kbs/{id}/consistency/check",
             post(review_routes::run_consistency_check),
@@ -377,7 +383,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/kbs/{id}/review/defects/{defect_id}",
             post(review_routes::decide_defect),
         )
-        // R1 物化推导。受 KB 上的 materialize_inferences 开关约束
+        // R1 materialised inference. Bounded by the materialize_inferences switch on the KB
         .route(
             "/kbs/{id}/inference/run",
             post(review_routes::run_inference),
@@ -413,7 +419,7 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route("/jobs/noop", post(jobs_noop))
         .with_state(state);
 
-    // 开发环境 CORS：Vite dev server 携带 cookie 跨端口访问
+    // CORS for development: the Vite dev server sends cookies across ports
     let cors = CorsLayer::new()
         .allow_origin("http://localhost:5173".parse::<HeaderValue>().unwrap())
         .allow_methods([
@@ -428,15 +434,16 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
 
     let mut app = Router::new().nest("/api/v1", api).layer(cors);
 
-    // SPA 托管：产物存在则挂载，history fallback 到 index.html
+    // Serving the SPA: mount it if the build output exists, with a history fallback to index.html
     let index = std::path::Path::new(&cfg.web_dist).join("index.html");
     if index.exists() {
         let serve = ServeDir::new(&cfg.web_dist).fallback(ServeFile::new(index));
         app = app.fallback_service(serve);
-        tracing::info!("已托管前端产物: {}", cfg.web_dist);
+        tracing::info!("serving the frontend build: {}", cfg.web_dist);
     }
 
-    // 最外层：先把请求来源放进 task-local，之后任何一层写审计都读得到
+    // Outermost layer: put the request's origin into a task-local first, so that any layer
+    // writing an audit record afterwards can read it
     app.layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(crate::client_ctx::capture))
 }
@@ -445,7 +452,7 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "name": "utopia", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-/// P0 队列验证端点：入队一个 noop 任务（后续里程碑移除）。
+/// P0 queue smoke-test endpoint: enqueues a noop job (removed in a later milestone).
 async fn jobs_noop(
     axum::extract::State(state): axum::extract::State<AppState>,
     _user: crate::auth::AuthUser,

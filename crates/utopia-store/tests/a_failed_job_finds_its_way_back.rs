@@ -1,16 +1,23 @@
-//! #216：失败的任务能回到队列。
+//! #216: a failed job can find its way back to the queue.
 //!
-//! 此前 `failed` 就是终点——余额耗尽一批文档全失败，充值之后只能逐个点，或整源重抽
-//! （已成功的也重跑一遍模型）。`jobs::requeue_failed` 按范围重排：库、种类、失败时间
-//! 三个条件都可空。这里守三件事：
+//! `failed` used to be the end of the road -- run out of credit and a whole batch of documents
+//! fails, and after topping up the only options were clicking them one at a time or
+//! re-extracting the entire source (running the model again over the ones that already
+//! succeeded). `jobs::requeue_failed` requeues by scope: base, kind and failure time, all three
+//! conditions optional. Three things are guarded here:
 //!
-//! 1. **按库圈得准。** 任务的 payload 只带 `document_id` / `source_id` / `kb_id` 三种
-//!    之一，按库重排要解到库——别的库的一条都不碰，没有库的（系统任务）只有不限库时才动。
-//! 2. **只动 failed 的**，`done` 与 `queued` 不动；重排后 `attempts` 归零、立即到期。
-//! 3. **种类与时间窗**：`kind` 只排那一种；`failed_since` 只排那之后失败的——
-//!    告警上的「再跑一遍」圈的正是那次故障窗口里的任务。
+//! 1. **The base scope is drawn precisely.** A job's payload carries only one of
+//!    `document_id` / `source_id` / `kb_id`, so requeueing by base has to resolve down to the
+//!    base -- not a single row from another base is touched, and the ones with no base (system
+//!    jobs) only move when the scope is not restricted to a base.
+//! 2. **Only the `failed` ones move**, `done` and `queued` stay put; after requeueing
+//!    `attempts` goes back to zero and the job is due immediately.
+//! 3. **Kind and time window**: `kind` requeues only that one kind; `failed_since` only the
+//!    ones that failed after that point -- a "run it again" off an alert is drawn around
+//!    exactly the jobs inside that outage window.
 //!
-//! 没有 `UTOPIA_DATABASE_URL` 时跳过而不是失败。自建自拆，绝不碰已有的库。
+//! Skipped rather than failed when there is no `UTOPIA_DATABASE_URL`. It builds its own fixture
+//! and tears it down, and never touches an existing database.
 
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -119,7 +126,8 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
 
     let run = async {
         let m = Duration::minutes(1);
-        // kb1：文档任务、库级任务、一条很早就失败的、一条已经成功的
+        // kb1: a document job, a base-level job, one that failed long ago, one that already
+        // succeeded
         let d1 = job(
             &pool,
             "process_document",
@@ -152,7 +160,7 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
             m,
         )
         .await?;
-        // kb2：来源任务
+        // kb2: a source job
         let s2 = job(
             &pool,
             "sync_source",
@@ -161,14 +169,14 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
             m,
         )
         .await?;
-        // 没有库的系统任务
+        // a system job with no base
         let sys = job(&pool, "noop", serde_json::json!({}), "failed", m).await?;
         ids.extend([d1, b1, old1, done1, s2, sys]);
 
         assert_eq!(jobs::failed_count(&pool, Some(f.kb1)).await?, 3);
         assert_eq!(jobs::failed_count(&pool, Some(f.kb2)).await?, 1);
 
-        // 3. 时间窗：只排最近一小时里失败的 kb1 任务
+        // 3. Time window: requeue only the kb1 jobs that failed within the last hour
         let n = jobs::requeue_failed(
             &pool,
             RequeueScope {
@@ -197,7 +205,7 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
             "a system job has no base"
         );
 
-        // 3. 种类：kb1 里只排 process_document，老的那条这次回来
+        // 3. Kind: inside kb1 requeue only process_document; the old one comes back this time
         let n = jobs::requeue_failed(
             &pool,
             RequeueScope {
@@ -211,7 +219,7 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
         assert_eq!(state(&pool, old1).await?, ("queued".into(), 0));
         assert_eq!(jobs::failed_count(&pool, Some(f.kb1)).await?, 0);
 
-        // 1. 按库：kb2 的来源任务
+        // 1. By base: kb2's source job
         let n = jobs::requeue_failed(
             &pool,
             RequeueScope {
@@ -224,7 +232,7 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
         assert_eq!(n, 1);
         assert_eq!(state(&pool, s2).await?, ("queued".into(), 0));
 
-        // 不限库才动系统任务
+        // Only a scope that is not restricted to a base moves the system job
         let before = jobs::failed_count(&pool, None).await?;
         let n = jobs::requeue_failed(
             &pool,
@@ -242,7 +250,7 @@ async fn a_failed_job_finds_its_way_back() -> anyhow::Result<()> {
     }
     .await;
 
-    // 自拆：任务表不随组织级联，手动清
+    // Tear-down: the jobs table does not cascade with the organization, so clean it by hand
     let _ = sqlx::query("DELETE FROM jobs WHERE id = ANY($1)")
         .bind(&ids)
         .execute(&pool)

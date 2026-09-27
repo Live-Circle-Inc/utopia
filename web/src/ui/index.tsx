@@ -1,4 +1,5 @@
-/* Utopia UI 组件库 — 页面只用这里的组件与 styles.css 语义类，不写颜色字面量。 */
+/* Utopia UI component library -- pages use only the components in here and the semantic
+   classes from styles.css, never colour literals. */
 import { useEffect, useRef, useState } from "react";
 import type {
   ButtonHTMLAttributes,
@@ -15,12 +16,15 @@ import {
 } from "lucide-react";
 import { S } from "../i18n";
 
-/** 应用内左栏统一底座：宽度 + 玻璃面（各页在此之上加 flex/padding）。
-    以最宽的 Ontology（w-64）为基准——rail 装的是名字，宽一档少截断。 */
+/** The shared base for the in-app left rail: width + glass surface (each page adds its
+    own flex/padding on top of it). Sized against the widest one, Ontology (w-64) -- the
+    rail holds names, and one notch wider means less truncation. */
 export const RAIL_CLS = "w-64 shrink-0 glass-strong border-y-0 border-l-0";
 
-/** 品牌字标：Marcellus 衬线，逐字母从左到右淡入；hover 浮出 ↗，点击去官网。
-    箭头/偏移全部用 em，跟随使用处的字号缩放（登录大标题与顶栏共用）。 */
+/** The brand wordmark: Marcellus serif, letters fading in left to right; on hover the ↗
+    floats out, and clicking goes to the site. The arrow and its offsets are all in em, so
+    they scale with the font size where it is used (shared by the login headline and the
+    top bar). */
 export function Wordmark({ className }: { className?: string }) {
   return (
     <a
@@ -87,7 +91,7 @@ export function Input({
   );
 }
 
-/* ---------- Dropdown（自制下拉，替代原生 select：原生弹层无法主题化） ---------- */
+/* ---------- Dropdown (hand-rolled, replacing the native select: its popup cannot be themed) ---------- */
 export interface DropdownOption {
   value: string;
   label: ReactNode;
@@ -110,11 +114,11 @@ export function Dropdown({
   placeholder?: string;
   className?: string;
   size?: "sm" | "md";
-  /** 触发器左侧的语义图标（说明"这一级是什么"） */
+  /** The semantic icon on the left of the trigger (it says "what this level is") */
   icon?: ReactNode;
-  /** 弹层顶部的小标题（同时作为触发器 title 提示） */
+  /** The small heading at the top of the popup (also used as the trigger's title hint) */
   menuLabel?: string;
-  /** 弹层底部固定操作区（点击后弹层关闭） */
+  /** A fixed action area at the bottom of the popup (clicking it closes the popup) */
   footer?: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -171,7 +175,7 @@ export function Dropdown({
               {menuLabel}
             </div>
           )}
-          {/* 选项行顶满面板边缘（无内衬）：单选项时整个菜单被这一项填满 */}
+          {/* Option rows run flush to the panel edges (no inset): with a single option that one row fills the whole menu */}
           <div className="u-scroll max-h-60 overflow-y-auto">
             {options.map((o) => (
               <button
@@ -210,16 +214,21 @@ export function Dropdown({
   );
 }
 
-/* ---------- SearchSelect（可搜索选择器：无界对象列表专用——成员、父类、数据源…）
-   触发器本身是输入框：聚焦即开、键入即过滤；渲染上限 maxVisible，超出提示继续
-   输入收窄。小而有界的枚举（角色/数据类型…）仍用 Dropdown，两击即达不必打字。 ---------- */
+/* ---------- SearchSelect (a searchable picker, for unbounded object lists -- members,
+   parent classes, data sources...)
+   The trigger is itself an input: focus opens it, typing filters it; maxVisible caps how
+   many get rendered, and past that it prompts you to keep typing to narrow down. Small
+   bounded enums (roles / data types...) still use Dropdown -- two clicks and you are
+   there, no typing needed. ---------- */
 export interface SearchSelectOption {
   value: string;
-  /** 主文案：过滤与选中回显的依据（纯字符串，不能是节点） */
+  /** The primary text: the basis for filtering and for echoing the selection
+      (a plain string, it cannot be a node) */
   label: string;
-  /** 次要文案（邮箱、连接摘要…），一并参与过滤，弱化显示 */
+  /** Secondary text (email, connection summary...); it takes part in filtering too
+      and is displayed de-emphasised */
   hint?: string;
-  /** 层级缩进（浏览态展示树形；键入过滤后拉平对齐） */
+  /** Hierarchy indent (a tree while browsing; flattened and aligned once you type a filter) */
   indent?: number;
 }
 
@@ -276,14 +285,14 @@ export function SearchSelect({
         ref={inputRef}
         className={cn("input-dark w-full", pad)}
         value={open ? query : (current?.label ?? "")}
-        /* 打开后把当前选中项挪进 placeholder：边打字边能看到现值 */
+        /* Once open, the current selection moves into the placeholder: you can see the current value while typing */
         placeholder={open ? current?.label || placeholder : placeholder}
         onFocus={() => {
           setOpen(true);
           setQuery("");
           setActive(0);
         }}
-        /* 选项行 mousedown 已 preventDefault（不夺焦点），走到这里的失焦都是真离开 */
+        /* Option rows already preventDefault on mousedown (so focus is not stolen); any blur that reaches here is a real departure */
         onBlur={() => setOpen(false)}
         onChange={(e) => {
           setQuery(e.target.value);
@@ -355,18 +364,22 @@ export function SearchSelect({
   );
 }
 
-/* ---------- MultiSearchSelect（多选版 SearchSelect） ---------- */
+/* ---------- MultiSearchSelect (the multi-select version of SearchSelect) ---------- */
 
 /**
- * 多选 + 搜索。与 [`SearchSelect`] 同一套语汇与键盘操作，三处不同：
+ * Multi-select + search. The same vocabulary and keyboard handling as [`SearchSelect`],
+ * with three differences:
  *
- * - **已选的显示在输入框上方**，各带一个移除按钮。不显示在下拉里的原因是
- *   下拉一关就看不见了，而"我到底选了哪些"是随时要看的
- * - **选完不关**：多选多半要连点几个，每次都重新聚焦是折磨
- * - 已选项在列表里带勾，再点一次是取消
+ * - **The selected items are shown above the input**, each with its own remove button.
+ *   They are not shown inside the dropdown because one close and they are invisible,
+ *   while "which ones did I actually pick" is something you need to see at any time
+ * - **Picking does not close it**: multi-select usually means clicking several in a row,
+ *   and having to refocus every time is torture
+ * - Already-selected options carry a tick in the list; clicking one again deselects it
  *
- * 选项多到几百个时（大本体就是这个量级）它仍然可用——这正是它取代芯片墙的理由：
- * 芯片墙的高度随类数线性增长，搜索框不随。
+ * It stays usable when the options run into the hundreds (a large ontology is exactly
+ * that order of magnitude) -- which is precisely why it replaced the wall of chips: the
+ * height of a chip wall grows linearly with the number of classes, a search box does not.
  */
 export function MultiSearchSelect({
   values,
@@ -381,7 +394,8 @@ export function MultiSearchSelect({
   options: SearchSelectOption[];
   onToggle: (v: string) => void;
   placeholder?: string;
-  /** 一个都没选时显示的话。多选留空往往是有意义的（"不限"），不是没填 */
+  /** What to show when nothing is selected at all. An empty multi-select is often
+      meaningful ("no limit") rather than simply unfilled */
   emptyHint?: string;
   className?: string;
   maxVisible?: number;
@@ -466,7 +480,8 @@ export function MultiSearchSelect({
             e.preventDefault();
             toggle(visible[active].value);
           } else if (e.key === "Backspace" && !query && picked.length) {
-            // 空输入时退格删掉最后一个 —— 与各家 token 输入框一致
+            // Backspace on an empty input deletes the last one -- the same as every
+            // other token input out there
             onToggle(picked[picked.length - 1].value);
           }
         }}
@@ -517,9 +532,12 @@ export function MultiSearchSelect({
   );
 }
 
-/* ---------- ColorPicker（精选色板 + hex 兜底；实体色刻意不开放全色域） ----------
-   **改这里就得改 `crates/utopia-store/src/palette.rs`**：手动挑的色与自动按 key
-   取的色必须来自同一组，否则一张图里会出现两套配色。那边有测试盯着，改漏了会红。 */
+/* ---------- ColorPicker (a curated palette + a hex fallback; the full colour space is
+   deliberately not opened up for entity colours) ----------
+   **Change this and you have to change `crates/utopia-store/src/palette.rs`**: the
+   colours picked by hand and the colours picked automatically by key must come from the
+   same set, otherwise a single graph ends up with two colour schemes. There is a test
+   watching over there, so missing one turns it red. */
 export const ENTITY_PALETTE = [
   "#7fd0ff",
   "#5fa8ff",
@@ -540,14 +558,15 @@ export const ENTITY_PALETTE = [
 ];
 
 /**
- * 类的 key → 颜色。**必须与 `crates/utopia-store/src/palette.rs` 的
- * `color_for_key` 逐位一致**：新建类时前端先按 key 挑一个显示出来，
- * 用户不改就这么存下去；而导入/消解那条路是后端算的。两边算得不一样，
- * 同一个 key 就会因为「谁建的」而拿到不同颜色。
+ * A class key → a colour. **This must agree bit for bit with `color_for_key` in
+ * `crates/utopia-store/src/palette.rs`**: when a class is created the frontend picks one
+ * by key and displays it, and if the user does not change it that is what gets stored;
+ * whereas the import/resolution path is computed by the backend. If the two compute
+ * different things, the same key gets a different colour depending on "who created it".
  *
- * FNV-1a + 雪崩混合。用 BigInt 是因为 JS 的位运算是 32 位的，
- * 而这里要的是 64 位乘法——用 Number 做会静默丢高位，
- * 算出来跟 Rust 对不上，且不会有任何报错。
+ * FNV-1a plus an avalanche mix. BigInt is used because JS bitwise operations are 32-bit
+ * while what is wanted here is 64-bit multiplication -- doing it with Number silently
+ * drops the high bits, so the result does not match Rust, and nothing reports an error.
  */
 export function colorForKey(key: string): string {
   let h = 0xcbf29ce484222325n;
@@ -569,7 +588,8 @@ export function ColorPicker({
 }: {
   value: string;
   onChange: (v: string) => void;
-  /** 给定时，色井渲染"形状 + 颜色"而不是整块填充（方形是直角，与图谱节点一致） */
+  /** When given, the colour well renders "shape + colour" rather than a solid fill
+      (the square has sharp corners, matching the graph nodes) */
   shape?: "circle" | "square";
 }) {
   const [open, setOpen] = useState(false);
@@ -594,7 +614,7 @@ export function ColorPicker({
 
   return (
     <div ref={rootRef} className="relative inline-block">
-      {/* 触发器：当前颜色色块（Figma 式 color well）；带 shape 时渲染形状 + 颜色 */}
+      {/* The trigger: a swatch of the current colour (a Figma-style colour well); with shape it renders shape + colour */}
       {shape ? (
         <button
           type="button"
@@ -617,7 +637,8 @@ export function ColorPicker({
         />
       )}
       {open && (
-        // 显式宽度：绝对定位的收缩宽度会被 inline-block 触发器的 56px 容器块钳死
+        // An explicit width: the shrink-to-fit width of an absolutely positioned element
+        // gets clamped by the 56px containing block of the inline-block trigger
         <div className="u-pop u-pop-in u-pop-in-tl absolute z-50 left-0 top-full mt-2 w-56 rounded-xl p-3 shadow-xl">
           <div className="grid grid-cols-8 gap-1.5 mb-2.5">
             {ENTITY_PALETTE.map((c) => (
@@ -653,14 +674,14 @@ export function ColorPicker({
   );
 }
 
-/* ---------- Pager（列表分页条：不足一页时自动隐藏） ---------- */
+/* ---------- Pager (the list pagination bar: hidden automatically below one page) ---------- */
 export function Pager({
   total,
   pageSize,
   page,
   onPage,
-  /** 覆盖默认的上边距。默认 `mt-3` 适合跟在列表后面；
-      放进一个已经有内边距的底栏时传 `""` 去掉它 */
+  /** Overrides the default top margin. The default `mt-3` suits following a list;
+      pass `""` to drop it when putting this in a footer that already has padding */
   className = "mt-3",
 }: {
   total: number;
@@ -699,7 +720,7 @@ export function Pager({
   );
 }
 
-/** 分页切片辅助：返回当前页数据与安全页号。 */
+/** Pagination slice helper: returns the current page's rows and the safe page number. */
 export function pageSlice<T>(
   items: T[],
   page: number,
@@ -710,7 +731,7 @@ export function pageSlice<T>(
   return { rows: items.slice(safe * pageSize, (safe + 1) * pageSize), safe };
 }
 
-/* ---------- DangerConfirm（危险操作确认弹窗：可要求输入指定文本解锁） ---------- */
+/* ---------- DangerConfirm (confirm dialog for dangerous actions: can require typed text to unlock) ---------- */
 export function DangerConfirm({
   title,
   hint,
@@ -723,7 +744,8 @@ export function DangerConfirm({
 }: {
   title: string;
   hint: string;
-  /** 要求逐字输入的解锁文本（如资源名称）；缺省则直接可确认 */
+  /** The unlock text that has to be typed out verbatim (the resource name, say);
+      when absent, confirming is available straight away */
   requireText?: string;
   confirmLabel: string;
   cancelLabel: string;
@@ -784,7 +806,7 @@ export function DangerConfirm({
   );
 }
 
-/* ---------- Panel（玻璃面板） ---------- */
+/* ---------- Panel (glass panel) ---------- */
 export function Panel({
   strong = false,
   className,
@@ -803,7 +825,7 @@ export function Panel({
   );
 }
 
-/* ---------- Chip（状态胶囊） ---------- */
+/* ---------- Chip (status pill) ---------- */
 export type ChipTone =
   "neutral" | "info" | "success" | "warn" | "danger" | "violet";
 
@@ -865,7 +887,7 @@ export function ErrorText({ children }: { children: ReactNode }) {
   return <p className="text-sm text-rose-400">{children}</p>;
 }
 
-/* ---------- GithubMark（lucide 无品牌图标，官方 mark 内联） ---------- */
+/* ---------- GithubMark (lucide has no brand icons, so the official mark is inlined) ---------- */
 export function GithubMark({ size = 16 }: { size?: number }) {
   return (
     <svg
@@ -880,7 +902,8 @@ export function GithubMark({ size = 16 }: { size?: number }) {
   );
 }
 
-/* ---------- SectionMark（分区字标：Docs/账户层等，逐字母入场，点击回应用） ---------- */
+/* ---------- SectionMark (section wordmark: Docs, the account layer and so on; letters
+   enter one by one, clicking returns to the app) ---------- */
 import { Link as RouterLink } from "@tanstack/react-router";
 export function SectionMark({ text, title }: { text: string; title: string }) {
   return (
@@ -896,7 +919,7 @@ export function SectionMark({ text, title }: { text: string; title: string }) {
           className="u-letter"
           style={{ animationDelay: `${80 + i * 45}ms` }}
         >
-          {/* inline-flex 会折叠纯空格 span——换不折叠空格 */}
+          {/* inline-flex collapses a pure-space span -- swap in a non-collapsing space */}
           {ch === " " ? " " : ch}
         </span>
       ))}

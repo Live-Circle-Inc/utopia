@@ -1,22 +1,32 @@
-//! 自动扩本体：抽取遇到本体外的说法时，把它补进本体并改写等它的那些事实。
+//! Automatic ontology extension: when extraction runs into a phrasing outside the ontology, add
+//! it to the ontology and remap the facts that were waiting on it.
 //!
-//! 新建的库不种任何关系，起点是用户挑的本体包（0008）或者空着。包再大也装不下
-//! 一份语料的全部说法：落不上本体的事实谓词留空、原词记在证据上（0010），
-//! 图上这些边只有原文措辞、没有词表语义，直到有人坐下来点 Suggest、看提案、逐条 Add。
-//! 这个模块把那件事自动化：说法够普遍就建成关系，并把等着它的事实改写过去。
+//! A freshly created KB seeds no relations at all; the starting point is whichever ontology pack
+//! the user picked (0008), or nothing. No pack, however big, can hold every phrasing in a
+//! corpus: facts that don't land on the ontology leave the predicate empty and record the
+//! original wording on the evidence (0010), so on the graph those edges carry only the source
+//! wording and no vocabulary semantics -- until somebody sits down, clicks Suggest, reads the
+//! proposals and Adds them one at a time. This module automates that: if a phrasing is common
+//! enough, turn it into a relation and remap the facts waiting on it.
 //!
-//! 敢这么做的前提是采纳可撤销（见 graph::unadopt）：错了点一下就回去，
-//! 旧事实从来没被销毁过。所以判断轴不是"有多确信"而是"错了有多贵"。
+//! What makes it acceptable to be this bold is that adoption is reversible (see graph::unadopt):
+//! if it's wrong, one click takes it back, and the old facts were never destroyed. So the axis of
+//! judgement is not "how confident are we" but "how expensive is it to be wrong".
 //!
-//! **要不要替人做，由人在知识库设置里声明**（`auto_extend_ontology`，缺省开）。
-//! 曾试过从行为推断——"本体有没有被碰过"——那是猜，而且猜错的后果荒唐：在提案上
-//! 点一次 Add 就会永久关掉建议功能。开关一来，猜测没有了，冻结也没有了。
+//! **Whether we do this on the human's behalf is declared by the human in the KB settings**
+//! (`auto_extend_ontology`, on by default). We once tried to infer it from behaviour -- "has the
+//! ontology been touched" -- which is guessing, and the consequence of guessing wrong was absurd:
+//! a single Add click on a proposal would permanently switch the suggestion feature off. With the
+//! switch, the guessing is gone, and so is the freeze.
 //!
-//! 关掉它不影响"留意"：未匹配统计照常累积、照常在 Unmatched 面板可见，
-//! 只是变成你点一下的提案，信息一条不少。
+//! Turning it off does not affect "noticing": unmatched counts keep accumulating and stay visible
+//! in the Unmatched panel, they just become proposals you click, with not one piece of
+//! information lost.
 //!
-//! 唯独 `functional` 永不自动，开关开着也不行：它驱动时态引擎自动闭合事实、
-//! 生成冲突，等发现时那些闭合本身已是一串 supersede 链——不属于"错了很便宜"那类。
+//! The sole exception is `functional`, which is never automatic, not even with the switch on: it
+//! drives the temporal engine to auto-close facts and generate conflicts, and by the time you
+//! notice, those closures are themselves a chain of supersedes -- not the "cheap to be wrong"
+//! kind.
 
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -25,51 +35,61 @@ use crate::api::ontology_routes;
 use crate::predicate_match::{merge_key, PredicateIndex};
 use crate::state::AppState;
 
-/// 少于这么多个够格的信号（谓词 + 类型）就不折腾——凑不出像样的提案，
-/// 白烧一次 LLM 调用。
+/// Below this many qualifying signals (predicates + types) don't bother -- there is not enough
+/// for a decent proposal, and it burns an LLM call for nothing.
 const MIN_SIGNALS: usize = 3;
-/// 只采纳出现在这么多篇文档里的说法。**只在一篇里出现过的是那篇文档的用词，
-/// 不是这个组织的词汇**——而本体会反馈进抽取提示词，一次偶然会变成长期指令。
-/// 副作用正好：只有一篇文档时什么都够不着门槛，于是什么也不做，下一篇再试。
+/// Only adopt phrasings that appear in at least this many documents. **Something that appeared in
+/// only one document is that document's wording, not this organisation's vocabulary** -- and the
+/// ontology feeds back into the extraction prompt, so one accident becomes a standing
+/// instruction. The side effect is exactly right: with only one document nothing reaches the
+/// threshold, so nothing happens, and we try again with the next one.
 const MIN_DOCS: i64 = 2;
 
-/// 一组按屈折基归并的说法——采纳后它们是同一个关系。
+/// A set of phrasings merged by inflectional stem -- once adopted they are the same relation.
 struct RelationGroup {
-    /// 规范 key：组里事实最多的那个说法。**不问模型取名**——组里每个说法都是
-    /// 原文真实出现过的措辞，挑最常见的那个比编一个新词更贴语料
+    /// Canonical key: the phrasing in the group with the most facts. **We do not ask the model to
+    /// name it** -- every phrasing in the group is wording that really occurred in the source, and
+    /// picking the most common one fits the corpus better than inventing a new word
     key: String,
-    /// 组里全部说法，采纳时一并改写
+    /// Every phrasing in the group; they are all remapped on adoption
     forms: Vec<String>,
     facts: i64,
     docs: usize,
-    /// 本体里已经有等价关系时的落点：`(关系 id, 主宾要不要对调)`。
-    /// `None` = 本体里确实没有，按票数新建
+    /// Where to land when the ontology already has an equivalent relation:
+    /// `(relation id, whether subject and object must be swapped)`.
+    /// `None` = the ontology really doesn't have it, so create it by vote count
     existing: Option<(Uuid, bool)>,
 }
 
-/// 按票数决定采纳哪些关系。**不调模型。**
+/// Decide which relations to adopt by vote count. **No model call.**
 ///
-/// 三步：把说法按屈折基归并（`sued` 与 `sues` 是同一个关系）、算文档并集、过门槛。
+/// Three steps: merge phrasings by inflectional stem (`sued` and `sues` are the same relation),
+/// take the union of documents, apply the threshold.
 ///
-/// 并集不能用相加：同一篇文档完全可能两种写法都用过，相加会让一篇文档把一个说法
-/// 顶过「≥2 篇」。所以要 `proposed_predicate_documents` 拿到真正的文档 id。
+/// The union cannot be a sum: one and the same document may well have used both spellings, and
+/// summing would let a single document push a phrasing past ">= 2 documents". That is why we need
+/// `proposed_predicate_documents` to get the real document ids.
 ///
-/// 输出**排过序**——这条路的价值有一半在于确定性，而 HashMap 的遍历顺序不是。
+/// The output is **sorted** -- half the value of this path is determinism, and HashMap iteration
+/// order is not that.
 async fn counted_relation_groups(
     state: &AppState,
     kb_id: Uuid,
 ) -> anyhow::Result<Vec<RelationGroup>> {
     let forms = utopia_store::graph::proposed_predicates(&state.pool, kb_id).await?;
     let pairs = utopia_store::graph::proposed_predicate_documents(&state.pool, kb_id).await?;
-    // **建之前先问本体。**
+    // **Ask the ontology before creating anything.**
     //
-    // 少了这一步，采纳只按票数建，从不检查「是不是已经有等价的了」。实测后果：
-    // demo-b3 那个库里 `produced_by` 与 `produces`、`developed_by` 与 `develops`
-    // 各成一个关系，同一件事的两个方向永久分家。
+    // Without this step, adoption only creates by vote count and never checks "is there already an
+    // equivalent". Measured consequence: in the demo-b3 KB, `produced_by` and `produces`, and
+    // `developed_by` and `develops`, each became a relation of its own -- the two directions of
+    // the same thing permanently split apart.
     //
-    // 而 `produces` 有 265 条、`produced_by` 只有 15 条——票多的先进本体，
-    // 票少的那个本该被 `predicate_match` 的 `_by` 规则接住，却因为**采纳路径压根
-    // 没走匹配器**而长成了独立关系。匹配器只在抽取时用过，这里是它缺席的第二处。
+    // And `produces` had 265 facts while `produced_by` had only 15 -- the one with more votes got
+    // into the ontology first, and the one with fewer should have been caught by the `_by` rule in
+    // `predicate_match`, but grew into an independent relation because **the adoption path never
+    // went through the matcher at all**. The matcher was only ever used during extraction; this is
+    // the second place it was absent.
     let rtypes = utopia_store::graph::relation_types(&state.pool, kb_id).await?;
     let index = PredicateIndex::build(&rtypes);
 
@@ -86,7 +106,8 @@ async fn counted_relation_groups(
 
     let mut out = Vec::new();
     for (_, mut members) in grouped {
-        // 事实多的在前，同数按字典序——规范 key 的选取不能依赖 HashMap 顺序
+        // More facts first, ties by lexicographic order -- the choice of canonical key must not
+        // depend on HashMap ordering
         members.sort_by(|a, b| b.fact_count.cmp(&a.fact_count).then(a.form.cmp(&b.form)));
         let mut docs: HashSet<Uuid> = HashSet::new();
         for m in &members {
@@ -97,9 +118,11 @@ async fn counted_relation_groups(
         if (docs.len() as i64) < MIN_DOCS {
             continue;
         }
-        // 组里任一说法能落到本体已有关系上，整组就落过去。同组说法共享屈折基，
-        // 结尾有没有 `by` 也必然一致（`produced_by` 与 `produces` 不同组），
-        // 所以「要不要对调」是**整组一致**的，不必逐条判
+        // If any phrasing in the group lands on a relation the ontology already has, the whole
+        // group lands there. Phrasings in a group share an inflectional stem, so whether they end
+        // in `by` is necessarily consistent too (`produced_by` and `produces` are in different
+        // groups), which makes "swap or not" **uniform across the group** -- no need to decide it
+        // phrasing by phrasing
         let existing = members.iter().find_map(|m| index.lookup(&m.form));
         out.push(RelationGroup {
             key: members[0].form.clone(),
@@ -114,15 +137,17 @@ async fn counted_relation_groups(
 }
 
 pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
-    // 并发的两个抽取任务可能都看到"空闲"而各入队一次；开关也可能刚被关掉
+    // Two concurrent extraction jobs may both see "idle" and each enqueue once; and the switch
+    // may have just been turned off
     let kb = utopia_store::kbs::get(&state.pool, kb_id).await?;
     if !kb.auto_extend_ontology {
-        tracing::debug!(%kb_id, "自动扩本体已关闭，跳过");
+        tracing::debug!(%kb_id, "auto ontology extension is off, skipping");
         return Ok(());
     }
-    // 门槛看的是"够不够一次 LLM 调用的量"，**谓词与类型合起来算**。
-    // 此前只数谓词，于是一个只缺实体类型、不缺关系的语料会被整个跳过——
-    // proposed_type 里明明堆着 platform ×2、inference_engine ×2 在等。
+    // The threshold asks "is there enough here to be worth an LLM call", and **predicates and
+    // types are counted together**. It used to count predicates only, so a corpus that was short
+    // on entity types but not on relations got skipped entirely -- even with platform x2 and
+    // inference_engine x2 piled up in proposed_type, waiting.
     let forms: Vec<_> = utopia_store::graph::proposed_predicates(&state.pool, kb_id)
         .await?
         .into_iter()
@@ -132,23 +157,29 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
     if forms.len() + types.len() < MIN_SIGNALS {
         tracing::debug!(
             %kb_id, predicates = forms.len(), types = types.len(),
-            "够格的信号太少，跳过自动扩本体"
+            "too few qualifying signals, skipping auto ontology extension"
         );
         return Ok(());
     }
 
-    // **关系不问模型，按票数采纳。**
+    // **Relations are not put to the model; they are adopted by vote count.**
     //
-    // 从前这一步把候选交给 LLM，让它回答"哪些值得建成关系"。那个问题数据已经
-    // 答了——`runs_on` 出现在 8 篇文档、13 条事实里，不是判断题。而模型实测答错：
-    // 它漏掉了 `runs_on`，却采纳了只在一篇里出现过的 `pledged_capital`。
+    // This step used to hand the candidates to the LLM and have it answer "which of these are
+    // worth making into relations". The data had already answered that question -- `runs_on`
+    // appears in 8 documents and 13 facts, it is not a judgement call. And in practice the model
+    // answered wrong: it missed `runs_on` and adopted `pledged_capital`, which had appeared in
+    // exactly one document.
     //
-    // 换成计数还有一个副作用是关键的：**这一段变成确定性的**。同一份语料重跑得到
-    // 同一个本体，测量台第一次能对它做对照。之前 B 与 B3 两组差 3 个百分点，
-    // 到底是修复起了作用还是跑次方差，答不上来，就因为中间夹着一次 LLM 调用。
+    // Switching to counting has one further side effect that is crucial: **this stretch becomes
+    // deterministic**. Re-running the same corpus yields the same ontology, and for the first time
+    // the measurement bench can run a controlled comparison on it. Previously groups B and B3
+    // differed by 3 percentage points and we could not say whether the fix had worked or it was
+    // run-to-run variance -- purely because there was an LLM call sitting in the middle.
     //
-    // 模型没有被撤走，只是换了个问题：见下方的同义归并——"这批新关系里哪些跟
-    // 已有的是同一个意思"。那个才需要理解意义，且答错了 unadopt 一键回退。
+    // The model has not been taken away, it has only been given a different question: see the
+    // synonym merge below -- "which of these new relations mean the same thing as an existing
+    // one". That one really does require understanding meaning, and if it answers wrong, unadopt
+    // rolls it back with one click.
     let counted = counted_relation_groups(state, kb_id).await?;
     let proposals = ontology_routes::build_proposals(state, kb_id, "en", MIN_DOCS).await?;
     let classes = proposals
@@ -174,9 +205,11 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
             label,
             utopia_store::palette::color_for_key(key),
             "circle",
-            // 冷启动建的类不挂父：提案里没有层级信息，猜一个父类比不挂更糟
+            // Classes created on cold start get no parent: the proposal carries no hierarchy
+            // information, and guessing a parent is worse than attaching none
             &[],
-            // 描述进抽取提示词，reason 只是给人看的理由——喂错了这个类就成新的倾倒场
+            // The description goes into the extraction prompt; reason is only the rationale for
+            // humans to read -- feed it the wrong one and this class becomes the new dumping ground
             str_of(p, "description")
                 .or_else(|| str_of(p, "reason"))
                 .unwrap_or(""),
@@ -185,8 +218,9 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         {
             Ok(type_id) => {
                 added_classes.push(key.to_string());
-                // 建类之后要把等它的实体搬过去——只建类型不动实体，
-                // 本体长大了图没变好，那些提议过 model 的实体继续挂在 concept 下
+                // Once the class exists, move the entities waiting on it across -- create the
+                // type but leave the entities alone and the ontology grows while the graph gets no
+                // better: the entities that proposed model stay hanging under concept
                 let forms: Vec<String> = p
                     .get("forms")
                     .and_then(|v| v.as_array())
@@ -195,14 +229,16 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                             .filter_map(|s| s.as_str().map(String::from))
                             .collect()
                     })
-                    // 提案没给 forms 时，至少认领与 key 同名的那些提议
+                    // When the proposal gives no forms, at least claim the proposals that share
+                    // the key's name
                     .unwrap_or_else(|| vec![key.to_string()]);
                 match utopia_store::resolution::adopt_proposed_types(
                     &state.pool,
                     kb_id,
                     type_id,
                     &forms,
-                    // 系统的动作,不是谁的决定——与本文件下方审计写 NULL 同一条
+                    // A system action, not anybody's decision -- the same reasoning as writing
+                    // NULL in the audit record further down this file
                     None,
                 )
                 .await
@@ -213,7 +249,7 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                             batches.push(batch);
                         }
                     }
-                    Err(e) => tracing::warn!(%kb_id, key, error = %e, "实体改类失败"),
+                    Err(e) => tracing::warn!(%kb_id, key, error = %e, "failed to retype entities"),
                 }
                 for form in &forms {
                     let _ =
@@ -221,22 +257,25 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                             .await;
                 }
             }
-            // key 撞车之类的：跳过这一条，别带垮整批
-            Err(e) => tracing::warn!(%kb_id, key, error = %e, "冷启动建类失败"),
+            // Key collisions and the like: skip this one, don't take the whole batch down
+            Err(e) => tracing::warn!(%kb_id, key, error = %e, "cold-start class creation failed"),
         }
     }
 
-    // 关系：按票数采纳，一组一个关系。
+    // Relations: adopted by vote count, one relation per group.
     //
-    // key 与 label 都来自语料自己的措辞，description 留空——它进抽取提示词当语义
-    // 指引，而这里没有可信的来源可写。编一句反而是往提示词里塞一个没人负责的断言，
-    // 而 key 本身（`runs_on`、`available_on`）已经说清楚了。
+    // Both key and label come from the corpus's own wording; description is left empty -- it goes
+    // into the extraction prompt as a semantic hint, and there is no trustworthy source to write
+    // here. Making one up would instead stuff an assertion nobody is accountable for into the
+    // prompt, and the key itself (`runs_on`, `available_on`) already says it clearly enough.
     //
-    // temporal 一律 state：它只在 functional / inverse_functional 为真时驱动时态
-    // 引擎，而这条路**永不**自动设那两位（见文件头），所以此处它没有行为后果。
+    // temporal is always state: it only drives the temporal engine when functional /
+    // inverse_functional are true, and this path **never** sets those two bits automatically (see
+    // the file header), so here it has no behavioural consequence.
     for g in &counted {
-        // 本体里已经有等价关系就不新建，直接把事实改写过去。
-        // 被动形（`produced_by` 对上 `produces`）改写时主宾对调
+        // If the ontology already has an equivalent relation, don't create a new one, just remap
+        // the facts onto it. Passive forms (`produced_by` matching `produces`) swap subject and
+        // object when remapped
         let (predicate_id, swap) = match g.existing {
             Some(hit) => hit,
             None => {
@@ -247,7 +286,8 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                     &g.key,
                     &label,
                     "state",
-                    // 冷启动不替人声明任何公理：推理机的判据必须是人写下来的
+                    // Cold start declares no axiom on anyone's behalf: the reasoner's criteria
+                    // have to be something a human wrote down
                     Default::default(),
                     "",
                     "relation",
@@ -263,7 +303,7 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                         (id, false)
                     }
                     Err(e) => {
-                        tracing::warn!(%kb_id, key = %g.key, error = %e, "冷启动建关系失败");
+                        tracing::warn!(%kb_id, key = %g.key, error = %e, "cold-start relation creation failed");
                         continue;
                     }
                 }
@@ -285,7 +325,7 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         tracing::info!(
             %kb_id, key = %g.key, forms = ?g.forms, docs = g.docs, facts = g.facts, moved, left_off,
             corrected, reused = g.existing.is_some(), swap,
-            "按票数采纳关系"
+            "adopted relation by vote count"
         );
         moved_total += moved;
         left_off_total += left_off;
@@ -298,10 +338,11 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         }
     }
 
-    // 属性那一档：宾语是字面值的说法。
+    // The attribute tier: phrasings whose object is a literal value.
     //
-    // domain 不从提案里读——它从这些事实的主语类型里取，见 adopt_attribute。
-    // 值换不动的那些不改写，继续没有谓词，等下一次
+    // domain is not read from the proposal -- it is taken from the subject types of these facts,
+    // see adopt_attribute. Facts whose value cannot be converted are not remapped; they stay
+    // without a predicate and wait for next time
     let attrs = proposals
         .get("attribute_types")
         .and_then(|v| v.as_array())
@@ -344,16 +385,21 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                     batches.push(batch);
                 }
             }
-            Err(e) => tracing::warn!(%kb_id, key, error = %e, "冷启动建属性失败"),
+            Err(e) => {
+                tracing::warn!(%kb_id, key, error = %e, "cold-start attribute creation failed")
+            }
         }
     }
 
-    // **映射到已有类型**：本体里已经有这个意思了，只改写事实、不动本体。
+    // **Map to an existing type**: the ontology already holds this meaning, so only remap the
+    // facts and leave the ontology untouched.
     //
-    // 自动执行是安全的一档：它不让本体长大，只把一批 related_to 挂到一个
-    // 早就存在的谓词上，而且跟新建那条路走同一个批次机制，同样可撤销。
-    // 反过来说，漏掉这一档才是危险的——检索告诉模型"已经有 founding_date 了"，
-    // 模型答"这些说法就是它"，我们却什么都不做，那批事实继续是"有关联"。
+    // Doing this automatically is the safe tier: it does not let the ontology grow, it only hangs
+    // a batch of related_to edges onto a predicate that existed all along, and it goes through the
+    // same batch mechanism as the create path, so it is just as reversible. Conversely, leaving
+    // this tier out is the dangerous thing -- retrieval tells the model "we already have
+    // founding_date", the model answers "these phrasings are it", and we do nothing at all, so
+    // that batch of facts stays as "is related to".
     let mapped = proposals
         .get("map_to")
         .and_then(|v| v.as_array())
@@ -375,8 +421,9 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         if forms.is_empty() {
             continue;
         }
-        // 目标是属性时改写走另一条路：值要按它的 datatype 换算。
-        // kind 由服务端在解析提案时标上（模型只答得出一个 key）
+        // When the target is an attribute, remapping takes another path: the values have to be
+        // converted according to its datatype. kind is stamped on by the server while parsing the
+        // proposal (the model can only answer with a key)
         if str_of(m, "kind") == Some("attribute") {
             match ontology_routes::adopt_attribute_existing(state, kb_id, key, &forms).await {
                 Ok((batch, moved)) => {
@@ -385,20 +432,24 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                         batches.push(batch);
                     }
                 }
-                Err(e) => tracing::warn!(%kb_id, key, error = %e, "映射到已有属性失败"),
+                Err(e) => {
+                    tracing::warn!(%kb_id, key, error = %e, "mapping to an existing attribute failed")
+                }
             }
             continue;
         }
-        // 模型偶尔会把候选清单之外的 key 抄进来（或者干脆编一个）。
-        // 找不到就跳过——**不新建**：这条路的前提就是"它已经存在"
+        // Every so often the model copies in a key that was not on the candidate list (or simply
+        // invents one). If it isn't found, skip it -- **do not create it**: the premise of this
+        // path is that "it already exists"
         let Some(predicate_id) =
             utopia_store::ontology::relation_type_id_by_key(&state.pool, kb_id, key).await?
         else {
-            tracing::warn!(%kb_id, key, "映射目标不在本体里，跳过");
+            tracing::warn!(%kb_id, key, "map target is not in the ontology, skipping");
             continue;
         };
-        // LLM 的 map_to 提案同样可能混着主动与被动，一个 swap 标志伺候不了
-        //（同人工路径，见 ontology_routes 里那段注释）
+        // The LLM's map_to proposals can just as easily mix active and passive, which a single
+        // swap flag cannot serve
+        // (same as the manual path, see that comment over in ontology_routes)
         let utopia_store::graph::Adopted {
             batch_id: batch,
             moved,
@@ -414,7 +465,7 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         .await?;
         tracing::info!(
             %kb_id, key, forms = ?forms, moved, left_off, corrected,
-            "按映射提案采纳关系"
+            "adopted relation from a map proposal"
         );
         left_off_total += left_off;
         moved_total += moved;
@@ -427,7 +478,8 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         }
     }
 
-    // 类先建好、实体后抽出来是常态：把等着已存在类型的那些也收走
+    // Classes created first and entities extracted afterwards is the normal case: sweep up the
+    // ones waiting on types that already exist too
     match utopia_store::resolution::sweep_proposed_types(&state.pool, kb_id, None).await {
         Ok(swept) => {
             for (batch, n) in swept {
@@ -435,14 +487,16 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
                 batches.push(batch);
             }
         }
-        Err(e) => tracing::warn!(%kb_id, error = %e, "已有类型的实体收尾失败"),
+        Err(e) => {
+            tracing::warn!(%kb_id, error = %e, "sweeping up entities for existing types failed")
+        }
     }
 
     if added_relations.is_empty() && added_classes.is_empty() && moved_total == 0 {
         return Ok(());
     }
-    // actor 为 NULL：这是系统的动作，不是谁的决定。台账里查得到做了什么、
-    // 改了多少条、以及撤销要用的批次号
+    // actor is NULL: this is a system action, not anybody's decision. The ledger still shows what
+    // was done, how many rows were changed, and the batch ids needed to undo it
     let _ = utopia_store::audit::record_opt(
         &state.pool,
         Some(kb_id),
@@ -454,7 +508,9 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
             "relations": added_relations,
             "classes": added_classes,
             "facts_remapped": moved_total,
-            // 签名两边都对不上、没挂上谓词的（#190）。不报这个数，「改写了 N 条」就是报喜不报忧
+            // The ones where neither side of the signature matched and no predicate got attached
+            // (#190). Without reporting this number, "remapped N facts" is reporting only the
+            // good news
             "facts_left_off": left_off_total,
             "batches": batches,
         }),
@@ -466,7 +522,7 @@ pub async fn bootstrap_ontology(state: &AppState, kb_id: Uuid) -> anyhow::Result
         relations = added_relations.len(),
         classes = added_classes.len(),
         facts = moved_total,
-        "冷启动自动扩本体完成"
+        "cold-start auto ontology extension complete"
     );
     Ok(())
 }

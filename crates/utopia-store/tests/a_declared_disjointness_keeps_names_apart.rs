@@ -1,15 +1,22 @@
-//! 0016 B3：`owl:disjointWith` 进消解——本体声明了互斥的两个类，同名也不进审阅队列。
+//! 0016 B3: `owl:disjointWith` reaches resolution -- when the ontology declares two classes
+//! disjoint, even the same name does not enter the review queue.
 //!
-//! 消解判「两个类能不能指同一个东西」有三层：硬表 `CONFUSABLE_TYPE_KEYS`、类层级
-//! （同一支系当易混，#226）、本体声明的互斥。这里守的是**声明优先于前两层**：
+//! Resolution decides "can these two classes point at the same thing" in three layers: the
+//! hard-coded `CONFUSABLE_TYPE_KEYS` table, the class hierarchy (the same lineage counts as
+//! confusable, #226), and disjointness declared in the ontology. What is guarded here is that
+//! **a declaration takes precedence over the first two layers**:
 //!
-//! 1. 没声明时行为不变：organization vs project 照硬表进队列，corporation vs
-//!    federal_agency 照类层级（共有非根祖先 organization）进队列。
-//! 2. 声明 organization ⟂ project 之后，同名的 organization / project 分开，不进队列。
-//! 3. 声明 corporation ⟂ agency 之后，federal_agency（agency 的子类）跟 corporation
-//!    也分开——**互斥是继承的**，声明在父类上就够。
+//! 1. With nothing declared the behaviour is unchanged: organization vs project goes to the
+//!    queue by the hard-coded table, corporation vs federal_agency goes to the queue by the
+//!    class hierarchy (they share the non-root ancestor organization).
+//! 2. After declaring organization ⟂ project, a same-named organization / project are kept
+//!    apart and do not enter the queue.
+//! 3. After declaring corporation ⟂ agency, federal_agency (a subclass of agency) is kept
+//!    apart from corporation too -- **disjointness is inherited**, declaring it on the parent
+//!    is enough.
 //!
-//! 没有 `UTOPIA_DATABASE_URL` 时跳过而不是失败。自建自拆，绝不碰已有的库。
+//! Skipped rather than failed when there is no `UTOPIA_DATABASE_URL`. It builds its own fixture
+//! and tears it down, and never touches an existing database.
 
 use sqlx::PgPool;
 use utopia_store::{ontology, resolution};
@@ -27,8 +34,9 @@ struct Fx {
 
 async fn seed(pool: &PgPool) -> anyhow::Result<Fx> {
     let (org, ws, kb) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
-    // 顶上要有一个根：类层级那条规则里「共有的祖先」不算根（schema.org 里万物皆
-    // Thing，算上它 Person 与 Organization 也成了一家），所以 organization 得有父类
+    // There has to be a root on top: in the class-hierarchy rule a "shared ancestor" does not
+    // count the root (in schema.org everything is a Thing, and counting it would make Person
+    // and Organization kin), so organization needs a parent
     let (thing, organization, project, corporation, agency, federal_agency) = (
         Uuid::now_v7(),
         Uuid::now_v7(),
@@ -106,7 +114,7 @@ async fn entity(pool: &PgPool, f: &Fx, name: &str, type_id: Uuid) -> anyhow::Res
     Ok(id)
 }
 
-/// 消解一条 mention，回它挂上的「类型漂移」审核对指向谁
+/// Resolve one mention and return who the "type drift" review pairs it attached point at
 async fn drift_reviews(
     pool: &PgPool,
     f: &Fx,
@@ -134,7 +142,7 @@ async fn a_declared_disjointness_keeps_names_apart() -> anyhow::Result<()> {
     let f = seed(&pool).await?;
 
     let run = async {
-        // 1. 没声明：硬表与类层级照旧
+        // 1. Nothing declared: the hard-coded table and the class hierarchy work as before
         let orion = entity(&pool, &f, "Orion", f.organization).await?;
         assert_eq!(
             drift_reviews(&pool, &f, "Orion", f.project).await?,
@@ -148,7 +156,8 @@ async fn a_declared_disjointness_keeps_names_apart() -> anyhow::Result<()> {
             "corporation vs federal_agency share the ancestor organization: kin, so Review"
         );
 
-        // 2. 声明 organization ⟂ project：硬表说易混，本体说互斥——本体赢
+        // 2. Declare organization ⟂ project: the hard-coded table says confusable, the
+        //    ontology says disjoint -- the ontology wins
         ontology::set_disjoint_for(&pool, f.kb, f.organization, &[f.project]).await?;
         let _vega = entity(&pool, &f, "Vega", f.organization).await?;
         assert!(
@@ -158,8 +167,9 @@ async fn a_declared_disjointness_keeps_names_apart() -> anyhow::Result<()> {
             "a declared disjointness wins over the hard-coded list"
         );
 
-        // 3. 声明 corporation ⟂ agency：federal_agency 是 agency 的子类，互斥继承下来，
-        //    类层级说一家也不算
+        // 3. Declare corporation ⟂ agency: federal_agency is a subclass of agency, so the
+        //    disjointness is inherited and the class hierarchy calling them kin no longer
+        //    counts
         ontology::set_disjoint_for(&pool, f.kb, f.corporation, &[f.agency]).await?;
         let _beta = entity(&pool, &f, "Beta", f.corporation).await?;
         assert!(
@@ -168,7 +178,8 @@ async fn a_declared_disjointness_keeps_names_apart() -> anyhow::Result<()> {
                 .is_empty(),
             "a disjointness declared on the parent reaches the child and wins over kinship"
         );
-        // 反过来问也一样：表里两个方向各一行，继承沿另一头的祖先链走
+        // Asking it the other way round is the same: the table holds a row per direction, and
+        // the inheritance walks the ancestor chain from the other end
         let _gamma = entity(&pool, &f, "Gamma", f.federal_agency).await?;
         assert!(
             drift_reviews(&pool, &f, "Gamma", f.corporation)
@@ -177,7 +188,8 @@ async fn a_declared_disjointness_keeps_names_apart() -> anyhow::Result<()> {
             "the declaration holds from either side"
         );
 
-        // 4. 取消声明，回到没声明时的行为——编辑必须能撤
+        // 4. Drop the declaration and the undeclared behaviour comes back -- an edit has to be
+        //    undoable
         ontology::set_disjoint_for(&pool, f.kb, f.corporation, &[]).await?;
         let delta = entity(&pool, &f, "Delta", f.corporation).await?;
         assert_eq!(

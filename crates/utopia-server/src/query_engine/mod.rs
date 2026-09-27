@@ -1,18 +1,25 @@
-//! 问数查询引擎：trait 接缝（BlobStore 同手法）+ 引擎无关的安全闸。
+//! The query-the-data query engine: the trait seam (same technique as BlobStore) plus the
+//! engine-agnostic safety gate.
 //!
-//! 引擎按协议族扩，不按产品名扩：postgres 线协议（`postgres.rs`）→ HTTP 族——
-//! `trino.rs` 一个顶起 Iceberg / Delta / Hive 整个湖仓生态，`databricks.rs`、
-//! `snowflake.rs` 各走自家的 SQL REST API。挂载模型与注册表引擎无关，加引擎只放宽
-//! 一条 CHECK。连接串是唯一的输入：引擎由 scheme 决定（[`engine_from_conn`]），
-//! 剩下的部分各引擎自己拆（`conn.rs`），凭据只在服务端流转。
+//! Engines are extended by protocol family, not by product name: the postgres wire protocol
+//! (`postgres.rs`) -> the HTTP family -- `trino.rs` alone holds up the whole Iceberg / Delta /
+//! Hive lakehouse ecosystem, while `databricks.rs` and `snowflake.rs` each go via their own SQL
+//! REST API. The mount model and the registry are engine-agnostic, and adding an engine only
+//! loosens one CHECK. The connection string is the only input: the engine is decided by the
+//! scheme ([`engine_from_conn`]), each engine takes the rest of it apart itself (`conn.rs`), and
+//! credentials only ever move around on the server side.
 //!
-//! 安全闸（纵深防御，不信任模型）：
-//! 1. sqlparser 解析：仅放行单条 SELECT/WITH（含 CTE），拒绝 DML/DDL/多语句/SELECT INTO。
-//!    按引擎选方言；sqlparser 没有 Trino 方言，Generic 是它的超集
-//! 2. 强制外包一层 LIMIT（cap+1 探测截断）
-//! 3. 会话级只读 + 语句超时（引擎各自的机制，parser 万一漏网也写不进去）。
-//!    HTTP 族没有会话，只有语句超时——只读靠第 1 层，这是它们比线协议少的那一层
-//! 4. 结果统一为 JSON Lines：PG 让库自己转；HTTP 族拿到列名与值后在这里拼，列序保留
+//! The safety gates (defence in depth; the model is not trusted):
+//! 1. sqlparser parses it: only a single SELECT/WITH gets through (CTEs included), and
+//!    DML/DDL/multi-statement/SELECT INTO are rejected. The dialect is picked per engine;
+//!    sqlparser has no Trino dialect, and Generic is a superset of it
+//! 2. A LIMIT is forcibly wrapped around it (cap+1, to detect truncation)
+//! 3. Session-level read-only + a statement timeout (each engine's own mechanism, so that even
+//!    if the parser lets something slip it still cannot write). The HTTP family has no sessions,
+//!    only statement timeouts -- read-only there rests on layer 1, and that is the one layer they
+//!    have less of than the wire protocol
+//! 4. Results are unified into JSON Lines: PG lets the database convert them itself; for the HTTP
+//!    family the column names and values are assembled here, preserving column order
 
 mod conn;
 mod databricks;
@@ -25,19 +32,22 @@ use sqlparser::dialect::{DatabricksDialect, GenericDialect, PostgreSqlDialect, S
 use sqlparser::parser::Parser;
 use std::time::Duration;
 
-/// 行数上限（外包 LIMIT cap+1，第 201 行只用来判断截断）。
+/// The row cap (a LIMIT of cap+1 is wrapped around it; row 201 is only used to decide whether
+/// the result was truncated).
 pub const ROW_CAP: usize = 200;
 pub(crate) const STATEMENT_TIMEOUT_SECS: u32 = 10;
-/// HTTP 族：单次请求的超时，与整条语句从提交到拿完结果的轮询预算
+/// The HTTP family: the timeout on a single request, and the polling budget for one whole
+/// statement from submission to having all the results
 pub(crate) const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const HTTP_POLL_BUDGET: Duration = Duration::from_secs(30);
 
-/// 注册表里 `engine` 列的取值。迁移里的 CHECK 与这张表要一致
+/// The values the `engine` column in the registry can take. The CHECK in the migration has to
+/// agree with this table
 pub const ENGINES: &[&str] = &["postgres", "trino", "databricks", "snowflake"];
 
 #[derive(Debug)]
 pub struct QueryResult {
-    /// 每行一个 JSON 对象文本（键序 = 查询列序）
+    /// One JSON object text per row (key order = the query's column order)
     pub rows: Vec<String>,
     pub truncated: bool,
 }
@@ -55,11 +65,13 @@ pub struct SchemaColumn {
 pub trait QueryEngine: Send + Sync {
     async fn test(&self) -> anyhow::Result<()>;
     async fn fetch_schema(&self) -> anyhow::Result<Vec<SchemaColumn>>;
-    /// 执行已过闸的 SELECT。实现自身仍需强制只读会话与超时（纵深防御）。
+    /// Execute a SELECT that has been through the gate. The implementation itself still has to
+    /// force a read-only session and a timeout (defence in depth).
     async fn execute(&self, sql: &str) -> anyhow::Result<QueryResult>;
 }
 
-/// scheme → 引擎名。界面只有一个连接串输入框，这里是它唯一的分派点。
+/// scheme -> engine name. The UI has only one connection-string input box, and this is its only
+/// dispatch point.
 pub fn engine_from_conn(conn: &str) -> Option<&'static str> {
     let scheme = conn.trim().split("://").next()?.to_ascii_lowercase();
     match scheme.as_str() {
@@ -71,7 +83,7 @@ pub fn engine_from_conn(conn: &str) -> Option<&'static str> {
     }
 }
 
-/// 引擎工厂。conn 凭据只在服务端流转。
+/// The engine factory. The credentials in conn only ever move around on the server side.
 pub fn engine_for(engine: &str, conn: &str) -> anyhow::Result<Box<dyn QueryEngine>> {
     match engine {
         "postgres" => Ok(Box::new(postgres::PostgresEngine::new(conn))),
@@ -88,7 +100,8 @@ pub fn engine_for(engine: &str, conn: &str) -> anyhow::Result<Box<dyn QueryEngin
     }
 }
 
-/// 安全闸第 1 层：按引擎方言解析并校验，返回规整后的语句文本。
+/// Safety gate, layer 1: parse and validate against the engine's dialect, and return the tidied
+/// statement text.
 pub fn guard_sql_for(engine: &str, sql: &str) -> anyhow::Result<String> {
     let cleaned = sql.trim().trim_end_matches(';').trim();
     if cleaned.is_empty() {
@@ -126,20 +139,23 @@ fn statement_kind(s: &Statement) -> &'static str {
     }
 }
 
-/// 第 2 层：外包一层 LIMIT。三个 HTTP 引擎都认这个写法；PG 有自己的 row_to_json 版本
+/// Layer 2: wrap a LIMIT around it. All three HTTP engines accept this form; PG has its own
+/// row_to_json version
 pub(crate) fn wrap_limit(sql: &str) -> String {
     format!("SELECT * FROM ( {sql} ) AS _q LIMIT {}", ROW_CAP + 1)
 }
 
-/// 第 201 行只用来判断截断，不交给模型
+/// Row 201 is only used to decide whether the result was truncated; it is not handed to the model
 pub(crate) fn truncate_rows<T>(mut rows: Vec<T>) -> (Vec<T>, bool) {
     let truncated = rows.len() > ROW_CAP;
     rows.truncate(ROW_CAP);
     (rows, truncated)
 }
 
-/// HTTP 族共用：「列名 + 行值」拼成 JSON Lines。手拼而不是 `serde_json::Map`，
-/// 后者不开 `preserve_order` 就按键排序，而列序是查询写下的顺序，模型读表靠它
+/// Shared by the HTTP family: assembling "column names + row values" into JSON Lines. Done by
+/// hand rather than with `serde_json::Map`, because without `preserve_order` that sorts by key,
+/// whereas the column order is the order the query wrote down, and that is what the model reads
+/// the table by
 pub(crate) fn rows_to_json_lines(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
@@ -162,8 +178,9 @@ pub(crate) fn rows_to_json_lines(
         .collect()
 }
 
-/// Databricks 的 JSON_ARRAY 与 Snowflake 的 data 把每个值都给成字符串（或 null）。
-/// 按列类型把数与布尔还原，其余留字符串——模型对 `"42"` 和 `42` 的算术不一样
+/// Databricks's JSON_ARRAY and Snowflake's data hand every value over as a string (or null).
+/// Restore numbers and booleans according to the column type, and leave the rest as strings --
+/// a model does different arithmetic on `"42"` than on `42`
 pub(crate) fn coerce(type_name: &str, raw: &serde_json::Value) -> serde_json::Value {
     let serde_json::Value::String(s) = raw else {
         return raw.clone();
@@ -173,7 +190,8 @@ pub(crate) fn coerce(type_name: &str, raw: &serde_json::Value) -> serde_json::Va
         "INT", "LONG", "SHORT", "BYTE", "FLOAT", "DOUBLE", "DECIMAL", "NUMBER", "FIXED", "REAL",
         "NUMERIC",
     ];
-    // INTERVAL 也含 "INT"：解析不成数就原样留下，不会误伤
+    // INTERVAL contains "INT" as well: if it does not parse as a number it is left as it was,
+    // so there is no collateral damage
     if NUMERIC.iter().any(|k| ty.contains(k)) {
         if let Ok(n) = s.parse::<i64>() {
             return n.into();
@@ -194,17 +212,20 @@ pub(crate) fn coerce(type_name: &str, raw: &serde_json::Value) -> serde_json::Va
     raw.clone()
 }
 
-/// 单引号字面量的转义：schema 名进 information_schema 的 WHERE 子句
+/// Escaping for single-quoted literals: the schema name goes into information_schema's WHERE
+/// clause
 pub(crate) fn sql_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// HTTP 族共用的客户端。
+/// The client shared by the HTTP family.
 ///
-/// **代理策略是显式的**：回环地址与 `NO_PROXY` 里的主机直连，其余按 `HTTPS_PROXY` /
-/// `HTTP_PROXY` / `ALL_PROXY` 走。不用 reqwest 的系统代理探测——Windows 上它读注册表，
-/// 而注册表里 `127.*` 这种绕过写法它认不全，本机的替身服务会被送进代理拿回 502。
-/// 服务进程该看环境变量，这条规矩与 docker-compose 里的写法一致
+/// **The proxy policy is explicit**: loopback addresses and the hosts in `NO_PROXY` connect
+/// directly, and everything else goes via `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`. reqwest's
+/// system-proxy detection is not used -- on Windows it reads the registry, and it does not
+/// recognise all the bypass forms written there such as `127.*`, so a stand-in service on the
+/// local machine gets sent through the proxy and comes back a 502. A service process should be
+/// looking at environment variables, and this rule matches how it is written in docker-compose
 pub(crate) fn http() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(HTTP_REQUEST_TIMEOUT)
@@ -235,8 +256,8 @@ fn proxy_for(url: &reqwest::Url) -> Option<reqwest::Url> {
         .and_then(|v| reqwest::Url::parse(v.trim()).ok())
 }
 
-/// `NO_PROXY=localhost,127.0.0.1,.internal,corp.example` 的常见写法：整名相等，
-/// 或者以点开头的后缀匹配
+/// The common forms of `NO_PROXY=localhost,127.0.0.1,.internal,corp.example`: whole-name
+/// equality, or a suffix match for entries starting with a dot
 fn no_proxy_matches(host: &str) -> bool {
     let raw = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
@@ -303,7 +324,8 @@ mod tests {
                 "{engine}"
             );
         }
-        // 各家的方言细节：反引号、双冒号转型，都要过得去
+        // Each vendor's dialect details -- backticks, double-colon casts -- all have to get
+        // through
         assert!(guard_sql_for("databricks", "SELECT `region` FROM main.sales.orders").is_ok());
         assert!(guard_sql_for("snowflake", "SELECT amount::number FROM db.public.orders").is_ok());
         assert!(guard_sql_for("trino", "SELECT count(*) FROM hive.default.orders").is_ok());

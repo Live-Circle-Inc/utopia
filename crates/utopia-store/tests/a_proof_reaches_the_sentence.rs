@@ -1,13 +1,19 @@
-//! R2：一条派生的证明要能一路读到原句（`docs/decisions/0002`）。
+//! R2: the proof of a derivation has to be readable all the way down to the original sentence
+//! (`docs/decisions/0002`).
 //!
-//! 前提一律是断言（`fact_derivations` 不记派生），所以证明是一条链：
-//! 派生 → 按 `seq` 排好的断言 → 每条断言的证据 → chunk。这里守三件事：
+//! Premises are always assertions (`fact_derivations` does not record derivations), so a proof is
+//! a chain: derivation → assertions ordered by `seq` → the evidence of each assertion → chunk.
+//! Three things are guarded here:
 //!
-//! 1. **顺序对**。`A part_of B`、`B part_of C` 推出 `A part_of C`，证明第一步是 A→B。
-//! 2. **叶子是原句**。每一步带着它的证据，引句就是当初抽出它的那句话。
-//! 3. **撤了的前提照样列出并打标记**。派生随之失效，`proof` 仍能回看当时靠的是什么。
+//! 1. **The order is right**. `A part_of B` and `B part_of C` derive `A part_of C`, and the first
+//!    step of the proof is A→B.
+//! 2. **The leaf is the original sentence**. Every step carries its own evidence, and the quote is
+//!    the sentence it was extracted from in the first place.
+//! 3. **A retracted premise is still listed, and marked**. The derivation is invalidated with it,
+//!    and `proof` can still show what it rested on at the time.
 //!
-//! 没有 `UTOPIA_DATABASE_URL` 时跳过而不是失败。自建自拆，绝不碰已有的库。
+//! Skips rather than fails when `UTOPIA_DATABASE_URL` is absent. Builds and tears down its own
+//! data, and never touches anything already there.
 
 use sqlx::PgPool;
 use utopia_store::reasoning;
@@ -122,7 +128,7 @@ async fn seed(pool: &PgPool) -> anyhow::Result<Fixture> {
     })
 }
 
-/// 一条断言，带一句原文当证据
+/// One assertion, with a sentence of source text as its evidence
 async fn asserted(
     pool: &PgPool,
     f: &Fixture,
@@ -192,7 +198,7 @@ async fn a_proof_reaches_the_sentence() -> anyhow::Result<()> {
             .find(|d| d.subject_id == f.a && d.object_id == f.c)
             .expect("A part_of C should be derived");
 
-        // 1. 顺序对，2. 叶子是原句
+        // 1. the order is right, 2. the leaf is the original sentence
         let proof = reasoning::proof(&pool, f.kb, ac.id)
             .await?
             .expect("live derivation has a proof");
@@ -216,12 +222,13 @@ async fn a_proof_reaches_the_sentence() -> anyhow::Result<()> {
         assert_eq!(proof.steps[1].evidence[0].chunk_id, f.chunk_bc);
         assert!(proof.steps.iter().all(|s| !s.retracted));
 
-        // 一个不存在的 id 不是错误，是「没有证明」
+        // a nonexistent id is not an error, it is "no proof"
         assert!(reasoning::proof(&pool, f.kb, Uuid::now_v7())
             .await?
             .is_none());
 
-        // 3. 撤掉一条前提：派生失效，证明还在，且那一步打上标记
+        // 3. retract one premise: the derivation is invalidated, the proof is still there, and
+        // that step is marked
         sqlx::query("UPDATE facts SET invalidated_at = now() WHERE id = $1")
             .bind(bc)
             .execute(&pool)

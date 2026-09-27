@@ -1,5 +1,5 @@
-//! 认证：argon2 密码哈希 + JWT（HttpOnly Cookie，同时接受 Bearer）。
-//! Cookie 本身是会话 cookie，过期由 JWT 的 exp 控制（7 天）。
+//! Authentication: argon2 password hashing + JWT (HttpOnly cookie, Bearer also accepted).
+//! The cookie itself is a session cookie; expiry is controlled by the JWT's exp (7 days).
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -57,24 +57,27 @@ pub fn issue_token(state: &AppState, user_id: Uuid) -> Result<String, AppError> 
     .map_err(|e| AppError::Other(anyhow::anyhow!("Token issuance failed: {e}")))
 }
 
-/// 外层是否在跑 TLS。反代都会带 `X-Forwarded-Proto`；没有这个头（本地直连、
-/// 开发环境）就当明文，Secure 不打，登录照常工作。
+/// Whether TLS is running out in front. Reverse proxies all set `X-Forwarded-Proto`; with no
+/// such header (local direct connection, dev environment) we treat it as plaintext, do not set
+/// Secure, and login keeps working.
 ///
-/// 不需要「信任的代理」名单：伪造这个头只会让攻击者自己的 cookie 变成 Secure，
-/// 更严格而不是更宽松，没有攻击价值。`UTOPIA_COOKIE_SECURE=true` 可强制打开，
-/// 给那些不发这个头的代理兜底。
+/// No "trusted proxies" list is needed: forging this header only turns the attacker's own cookie
+/// into a Secure one, which is stricter rather than looser, so there is nothing to gain from it.
+/// `UTOPIA_COOKIE_SECURE=true` can force it on, as a fallback for proxies that do not send the
+/// header.
 pub fn behind_tls(headers: &axum::http::HeaderMap, forced: bool) -> bool {
     forced
         || headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            // 经过多层代理时这个头是逗号分隔的链，最左边是最初那一跳
+            // Through multiple proxies this header is a comma-separated chain, and the
+            // leftmost entry is the original hop
             .and_then(|v| v.split(',').next())
             .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
 }
 
-/// 会话 cookie。`secure` 由 [`behind_tls`] 判定——HTTPS 下打上 Secure，
-/// 浏览器就不会再把它经明文链路发出去。
+/// The session cookie. `secure` is decided by [`behind_tls`] -- under HTTPS we set Secure, and
+/// then the browser will no longer send it out over a plaintext link.
 pub fn auth_cookie(token: String, secure: bool) -> Cookie<'static> {
     Cookie::build((COOKIE_NAME, token))
         .path("/")
@@ -84,10 +87,11 @@ pub fn auth_cookie(token: String, secure: bool) -> Cookie<'static> {
         .build()
 }
 
-/// 注销用的删除指令。**属性必须和签发时一致**：浏览器按 name + domain + path
-/// 匹配才认得出要删哪一条，只给名字的话 path 会退化成当前请求路径
-/// （`/api/v1/auth`），和签发时的 `/` 对不上——cookie 留在浏览器里，人以为
-/// 自己登出了。
+/// The deletion instruction used for logout. **The attributes must match those used when it was
+/// issued**: the browser matches on name + domain + path to work out which entry to delete, and
+/// if you give only the name then path degrades to the current request path
+/// (`/api/v1/auth`), which does not match the `/` used at issue time -- the cookie stays in the
+/// browser and the human thinks they logged themselves out.
 pub fn clear_auth_cookie(secure: bool) -> Cookie<'static> {
     Cookie::build((COOKIE_NAME, ""))
         .path("/")
@@ -107,7 +111,7 @@ pub(crate) fn decode_user_id(state: &AppState, token: &str) -> Result<Uuid, AppE
     Ok(data.claims.sub)
 }
 
-/// 已登录用户提取器：Cookie `utopia_token` 或 `Authorization: Bearer`。
+/// Extractor for a logged-in user: the `utopia_token` cookie, or `Authorization: Bearer`.
 pub struct AuthUser(pub User);
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -139,11 +143,12 @@ impl FromRequestParts<AppState> for AuthUser {
     }
 }
 
-/// 生成一条 JWT 签名密钥：32 字节 CSPRNG，hex 编码成 64 个字符。
+/// Generate one JWT signing secret: 32 bytes from a CSPRNG, hex-encoded into 64 characters.
 ///
-/// 长度取 32 字节是因为 HS256 的 HMAC 块就是 32 字节——再长会被先哈希一遍，
-/// 并不增加强度。hex 而非 base64：这个值会出现在日志、环境变量和运维的复制粘贴里，
-/// 不带 +/= 省去一整类转义问题。
+/// The length is 32 bytes because HS256's HMAC block is exactly 32 bytes -- anything longer gets
+/// hashed down first and does not add strength. hex rather than base64: this value shows up in
+/// logs, in environment variables and in operators' copy-paste, and carrying no +/= saves a whole
+/// class of escaping problems.
 pub fn generate_jwt_secret() -> String {
     use argon2::password_hash::rand_core::RngCore;
     let mut buf = [0u8; 32];
@@ -162,9 +167,11 @@ mod tests {
         }
     }
 
-    /// JWT 校验的护栏：默认配置必须认自家签发的 HS256，且拒绝换密钥与过期。
-    /// 加于 jsonwebtoken 9 → 10 升级时（CVE-2026-25537：<10.3.0 的类型混淆可绕过授权）——
-    /// 库的默认校验语义是编译器看不见的那部分，回归靠这里兜。
+    /// Guardrail for JWT validation: the default configuration must accept HS256 tokens we
+    /// issued ourselves, and reject both a swapped key and an expired token.
+    /// Added during the jsonwebtoken 9 → 10 upgrade (CVE-2026-25537: the type confusion in
+    /// <10.3.0 can bypass authorization) -- a library's default validation semantics are the part
+    /// the compiler cannot see, so this is what catches the regression.
     #[test]
     fn default_validation_accepts_own_token_and_rejects_the_rest() {
         let secret = b"test-secret-not-a-real-key";
@@ -219,24 +226,28 @@ mod tests {
         h
     }
 
-    /// Secure 的判定必须只在确认走了 TLS 时为真：判错成 true，明文部署的用户
-    /// 登录后浏览器直接丢掉 cookie，症状是「点了登录又回到登录页」，且不报错。
+    /// The Secure decision must be true only when TLS is confirmed to be in the path: get it
+    /// wrong in the true direction and users of a plaintext deployment have the browser throw the
+    /// cookie away right after login, with the symptom "clicked log in and came back to the login
+    /// page", and no error reported.
     #[test]
     fn secure_only_when_tls_is_actually_in_front() {
-        // 没有代理：本地直连、cargo run —— 不能打 Secure，否则 HTTP 下登不上
+        // No proxy: local direct connection, cargo run -- must not set Secure, or you cannot
+        // log in over HTTP
         assert!(!behind_tls(&headers_with(None), false));
         assert!(!behind_tls(&headers_with(Some("http")), false));
 
         assert!(behind_tls(&headers_with(Some("https")), false));
-        // 头的大小写由代理决定，不能假设
+        // The header casing is up to the proxy, so it cannot be assumed
         assert!(behind_tls(&headers_with(Some("HTTPS")), false));
 
-        // 多层代理时这个头是逗号分隔的链，最左边是最初那一跳——
-        // 取错一端会把「用户走 HTTPS 到边缘、边缘走 HTTP 回源」判成明文
+        // With multiple proxies this header is a comma-separated chain and the leftmost entry
+        // is the original hop -- taking the wrong end judges "user goes HTTPS to the edge, edge
+        // goes HTTP back to the origin" as plaintext
         assert!(behind_tls(&headers_with(Some("https, http")), false));
         assert!(!behind_tls(&headers_with(Some("http, https")), false));
 
-        // 配置强制打开：给不发这个头的代理兜底
+        // Forced on by configuration: a fallback for proxies that do not send the header
         assert!(behind_tls(&headers_with(None), true));
     }
 }

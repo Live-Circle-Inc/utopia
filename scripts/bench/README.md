@@ -1,52 +1,66 @@
-# 类型消解的测量台
+# The measuring bench for type resolution
 
-**每一组一个新库。** 这条规则是整个目录存在的理由。
+**A fresh database for every run.** This one rule is the entire reason this directory exists.
 
-此前连着三轮在同一个库上调检索，而那个库带着前几轮的改类结果——容易的实体早已
-精化，拒绝理由里直接写着 `already correctly typed as pharmacy`。后两轮的数字跟
-第一轮根本不可比，却被当成依据改了两次代码。复用一个库省下的几分钟，换来的是
-一整段无效的结论。
+Before it, three runs in a row tuned retrieval against the same database, and that database
+carried the retyping results of the previous runs -- the easy entities had long since been
+refined, and the rejection reasons said so outright: `already correctly typed as pharmacy`.
+The numbers from the last two runs were simply not comparable with the first, and yet they
+were taken as grounds for two code changes. The few minutes saved by reusing a database bought
+a whole stretch of worthless conclusions.
 
-## 跑一组
+## Running a set
 
 ```
 node scripts/bench/run.mjs --corpus pharma --label seeds-only
 node scripts/bench/run.mjs --corpus pharma --ontology /tmp/schemaorg.ttl --label schemaorg
 ```
 
-前置：`utopia-server` 已启动、连着一个能写的库、工作区配好了对话与嵌入模型。
-环境变量见 `run.mjs` 头部。
+Prerequisites: `utopia-server` is up, connected to a writable database, and the workspace has a
+chat and an embedding model configured. See the head of `run.mjs` for the environment variables.
 
-## 目录
+## The directory
 
-- `corpora/*.json` —— 固定语料。**实体跨文档反复出现**是刻意的：单篇语料里每个
-  实体只有一两条事实，画像基本只剩名字，量不出消解的真实水平。
-- `truth/*.json` —— 每个实体期望落到哪个类。key 是名字的一个足以认出它的片段
-  （抽取给的名字每次略有出入，全等匹配会把这种变化算成失败）；值是可接受的类，
-  任一命中算对。**空数组 = 本体里没有对得上的类，此时正确行为是不动它**。
-- `run.mjs` —— 一组：新建库 → 灌语料 → 可选导入本体 → 跑消解 → 打分。
-- `fetch-ai-timeline.mjs` —— 抓条目的**当前版**（`prop=extracts`）。
-- `fetch-wiki-history.mjs` —— 抓**历史快照**（`action=parse&oldid`）。演认知时间靠它：
-  同一条目的多张快照按 `doc_time` 灌进去，图会真的改主意。
-- `subset-corpus.mjs` —— 从一份语料里挑几个条目做成新语料。**整条目取**，
-  因为 `supersedes` 只在同一条目的相邻快照之间发生，随机抽块会把时态那根轴废掉。
-- `subset.mjs` —— 把 schema.org 的 TTL 切成前 N 个类，给退化曲线用。
+- `corpora/*.json` -- fixed corpora. **Entities recurring across documents** is deliberate: in a
+  single-document corpus each entity has only one or two facts, the profile is barely more than a
+  name, and you cannot measure what resolution can really do.
+- `truth/*.json` -- which class each entity is expected to land in. The key is a fragment of the
+  name that is enough to recognise it (the name extraction hands back varies slightly every time,
+  and exact matching would score that variation as a failure); the value is the set of acceptable
+  classes, and any one of them counts as correct. **An empty array = the ontology has no matching
+  class, and in that case the correct behaviour is to leave it alone**.
+- `run.mjs` -- one run: create a database -> load the corpus -> optionally import an ontology ->
+  run resolution -> score.
+- `fetch-ai-timeline.mjs` -- fetches the **current revision** of an article (`prop=extracts`).
+- `fetch-wiki-history.mjs` -- fetches **historical snapshots** (`action=parse&oldid`). This is what
+  demonstrating epistemic time relies on: load several snapshots of the same article ordered by
+  `doc_time` and the graph will genuinely change its mind.
+- `subset-corpus.mjs` -- picks a few articles out of one corpus to make a new one. **Whole articles
+  only**, because `supersedes` only happens between adjacent snapshots of the same article, and
+  sampling random chunks would destroy the temporal axis entirely.
+- `subset.mjs` -- cuts the schema.org TTL down to its first N classes, for the degradation curve.
 
-## 读数怎么算
+## How to read the numbers
 
-- `prompt_tokens_est` 是**本体段**的估算，不是整个提示词。实测 4.0 字符 ≈ 1 token
-  （377,735↔81,855、396,716↔99,041）。真实 token 数在 LLM 客户端里，穿出来要改
-  一路签名；这里要量的是"本体规模"，比例稳定就够用。
-- `for_review` 按**没改**算进 miss。它确实还没改——算成命中就是把人的活记在机器账上。
-- `absent` = 标准答案里有、但抽取压根没抽出这个实体。它不是消解的错，单独一栏。
+- `prompt_tokens_est` is an estimate for the **ontology section**, not the whole prompt. Measured
+  at 4.0 characters ~= 1 token (377,735<->81,855, 396,716<->99,041). The real token count lives in
+  the LLM client, and threading it out would mean changing signatures the whole way up; what we
+  want to measure here is "ontology size", and a stable ratio is good enough.
+- `for_review` counts as a miss, on the grounds that it **was not changed**. It really has not been
+  changed yet -- scoring it as a hit means putting a human's work on the machine's tab.
+- `absent` = present in the ground truth, but extraction never pulled the entity out at all. That
+  is not resolution's fault, so it gets its own column.
 
-## 标准答案会写错
+## The ground truth will be wrong sometimes
 
-第一次跑就写窄了一个：`心血管健康论坛` 只写了 `business_event|event_series`，
-而系统给的 `conference_event` 是对的。**答案错了要改答案**——但要在结果出来之后
-才改、且写清楚为什么，否则这份答案就变成了"系统这次答了什么"的记录，量不出任何东西。
+The very first run had one written too narrowly: `心血管健康论坛` only listed
+`business_event|event_series`, while the `conference_event` the system gave was correct.
+**When the answer is wrong, fix the answer** -- but only after the results are in, and write down
+why, otherwise the ground truth degrades into a record of "what the system happened to answer this
+time" and measures nothing at all.
 
-## 加一个语料
+## Adding a corpus
 
-两个文件：`corpora/x.json` 与 `truth/x.json`。语料换行业是有意的——同一套判断在
-两个领域上都成立，才谈得上不是过拟合到某一批词上。
+Two files: `corpora/x.json` and `truth/x.json`. The corpora spanning different industries is
+deliberate -- only when the same judgement holds up in two domains can you argue it is not just
+overfitted to one batch of vocabulary.

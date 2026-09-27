@@ -1,7 +1,8 @@
-//! 告警中心（0005）。**跨库**：一个顶栏面板，不挂在某个 KB 下面。
+//! Alert centre (0005). **Cross-base**: one panel in the top bar, not hung under some KB.
 //!
-//! 可见性不在这里判——它在 `utopia_store::alerts` 的那几条 SQL 里判且只判一次。
-//! 路由层只负责取当前用户。
+//! Visibility is not decided here -- it is decided in those few SQL statements in
+//! `utopia_store::alerts`, and decided exactly once. The routing layer is only responsible for
+//! getting hold of the current user.
 
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -18,15 +19,18 @@ use crate::auth::AuthUser;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// 一页几组。弹窗里放得下的量——再多就该翻页，而不是让人滚一屏。
+/// How many groups per page. As many as fit in the popover -- any more and it should be paged,
+/// rather than making someone scroll a screenful.
 const PAGE: i64 = 8;
-/// 一页最多能要多少：防的是有人把 limit 写成 100000 让服务端去数全表
+/// The most a page may ask for: this guards against someone writing limit as 100000 and making
+/// the server count the whole table
 const MAX_PAGE: i64 = 50;
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    /// 搜库名、对象详情、kind 代号。**搜不到界面上那句标题**——
-    /// 措辞在客户端，服务端没有它（见 store 里 SEARCH 的注释）
+    /// Searches base names, object details and the kind code. **It cannot find the headline you
+    /// see in the UI** -- that wording lives in the client and the server does not have it (see
+    /// the comment on SEARCH in the store)
     #[serde(default)]
     pub q: Option<String>,
     #[serde(default)]
@@ -35,7 +39,8 @@ pub struct ListQuery {
     pub offset: Option<i64>,
 }
 
-/// 一组连着的同类故障。折叠是**读**出来的，存储那边仍是一次故障一行。
+/// One group of consecutive failures of the same kind. The collapsing happens on **read**; on
+/// the storage side it is still one row per failure.
 #[derive(Serialize)]
 pub struct GroupView {
     pub kb_id: Option<Uuid>,
@@ -45,16 +50,17 @@ pub struct GroupView {
     pub count: i64,
     pub unread: i64,
     pub latest_at: DateTime<Utc>,
-    /// 跟 `latest_at` 一起圈出这一组，标已读时原样发回来
+    /// Together with `latest_at` this fences off the group; send it back unchanged when marking
+    /// as read
     pub earliest_at: DateTime<Utc>,
-    /// 明细，最多几条，新的在前
+    /// The detail lines, a few at most, newest first
     pub lines: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
 pub struct ListResponse {
     pub items: Vec<GroupView>,
-    /// 总**组**数——翻页控件数的是组，不是行
+    /// The total number of **groups** -- what the pager counts is groups, not rows
     pub total: i64,
 }
 
@@ -87,7 +93,8 @@ pub async fn list(
     }))
 }
 
-/// 角标。单独一条路由而不是从列表里数：这个每开一页都要。
+/// The badge. A route of its own rather than counting it from the list: this one is needed on
+/// every page load.
 pub async fn unread(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -100,15 +107,17 @@ pub async fn unread(
 pub struct ReadGroupBody {
     pub kb_id: Option<Uuid>,
     pub kind: String,
-    /// 组的时间区间，原样来自列表返回的 `earliest_at` / `latest_at`
+    /// The group's time range, exactly as returned by the list in `earliest_at` / `latest_at`
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
 }
 
-/// 把一整组标已读。**逐人**——读过不等于问题没了，别人的未读不受影响。
+/// Marks a whole group as read. **Per person** -- having read it does not mean the problem is
+/// gone, and other people's unread counts are unaffected.
 ///
-/// 按时间区间圈而不是发 id 列表：一组可能有几百条。可见性在 store 里照查，
-/// 所以猜一个 kind 也标不掉自己看不见的东西。
+/// The group is fenced off by time range rather than by sending a list of ids: a group may hold
+/// hundreds of rows. Visibility is still checked in the store, so guessing a kind cannot mark
+/// off anything you cannot see yourself.
 pub async fn mark_group_read(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -120,7 +129,7 @@ pub async fn mark_group_read(
     Ok(Json(json!({ "marked": n })))
 }
 
-/// 全部已读。
+/// Marks everything as read.
 pub async fn mark_all_read(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -129,12 +138,14 @@ pub async fn mark_all_read(
     Ok(Json(json!({ "marked": n })))
 }
 
-/// 全局事件流。KB 那条是 `/kbs/{id}/events`，按库过滤；角标是跨库的，
-/// 挂不上去。
+/// The global event stream. The KB one is `/kbs/{id}/events`, filtered by base; the badge is
+/// cross-base, so it cannot hang off that.
 ///
-/// **这里不做任何权限过滤**：事件不带数据，收到的人一律回头重取列表，
-/// 而列表那条查询会把不该看的挡掉。代价是没权限的人也被叫醒一次，
-/// 换来的是推送这条路上一行权限逻辑都没有——不会出现"推送判得比列表松"。
+/// **No permission filtering happens here**: the events carry no data, everyone who receives one
+/// goes back and re-fetches the list, and the query behind the list blocks whatever they should
+/// not see. The price is that people without permission get woken up once too; what it buys is
+/// not a single line of permission logic anywhere on the push path -- so "the push decides more
+/// loosely than the list" cannot happen.
 pub async fn stream(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,

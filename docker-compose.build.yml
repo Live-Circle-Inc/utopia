@@ -1,8 +1,10 @@
-# 从源码构建，叠加在 docker-compose.yml 之上——改了代码，或者想跑未发布的版本时用：
+# Build from source, layered on top of docker-compose.yml -- for when you have changed code, or
+# want to run a version that has not been released:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
 #
-# 普通部署不需要这个文件，直接 docker compose --profile app up -d 拉预构建镜像。
+# An ordinary deployment does not need this file: just docker compose --profile app up -d to pull
+# the prebuilt image.
 services:
   app:
     build:

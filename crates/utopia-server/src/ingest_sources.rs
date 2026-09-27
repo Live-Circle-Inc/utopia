@@ -1,8 +1,10 @@
-//! 来源同步任务：url（网页抓取）/ rss（订阅，pubDate → doc_time）/
-//! github_issues / jira_issues（工单，更新时刻 → doc_time，正文里带状态变更史）/
-//! s3（对象存储，LastModified → doc_time）。
-//! 全部走 sha256 去重（重复内容静默跳过），新文档进标准摄入管道（process_document）。
-//! folder 是纯容器（上传入内），api 是推送型——两者无拉取语义。
+//! Source sync jobs: url (page fetch) / rss (feeds, pubDate -> doc_time) /
+//! github_issues / jira_issues (tickets, update time -> doc_time, with the status change history
+//! in the body) / s3 (object storage, LastModified -> doc_time).
+//! All of them dedupe by sha256 (duplicate content is skipped silently), and new documents enter
+//! the standard ingest pipeline (process_document).
+//! folder is a pure container (uploads land inside it) and api is push-based -- neither has any
+//! pull semantics.
 
 use crate::state::AppState;
 use chrono::{DateTime, Utc};
@@ -11,19 +13,20 @@ use utopia_core::models::Source;
 use utopia_core::models::SourceKind;
 use uuid::Uuid;
 
-/// 单次同步的新文档上限（防超长 feed/URL 列表拖垮任务）
+/// Cap on new documents per sync (stops an overlong feed/URL list dragging the job down)
 const MAX_NEW_PER_SYNC: usize = 200;
 
-/// 抓取用的 User-Agent。reqwest 默认一个都不发，而维基百科明确拒绝匿名请求
-/// （403），Cloudflare 前置的站点也普遍如此——URL 与 RSS 两类来源因此对一大批
-/// 真实网站直接失效。自报家门也是爬虫礼节：站方能认出我们、能联系到我们。
+/// The User-Agent used for fetching. reqwest sends none at all by default, while Wikipedia
+/// explicitly refuses anonymous requests (403), as do sites fronted by Cloudflare generally --
+/// so the URL and RSS source kinds simply did not work against a large set of real websites.
+/// Announcing who we are is also crawler etiquette: the site can recognise us and contact us.
 const UA: &str = concat!(
     "Utopia/",
     env!("CARGO_PKG_VERSION"),
     " (+https://utopia.bi; self-hosted knowledge platform)"
 );
 
-/// 单次同步的产出统计（Moved/Unchanged 不计）。
+/// What a single sync produced (Moved/Unchanged are not counted).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncStats {
     pub created: usize,
@@ -49,7 +52,8 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
     let run_id = utopia_store::sources::start_run(&state.pool, source_id).await?;
     state.emit_source(source.kb_id);
 
-    // 按枚举穷举：加一种来源就得在这里决定它怎么同步，编译器不放过漏掉的那一支
+    // Exhaustive over the enum: add a source kind and you have to decide here how it syncs; the
+    // compiler will not let a missing arm through
     let outcome = match SourceKind::parse(&source.kind) {
         Some(SourceKind::Url) => sync_urls(state, &source).await,
         Some(SourceKind::Rss) => sync_rss(state, &source).await,
@@ -61,7 +65,7 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
         }
         Some(SourceKind::Webdav) => sync_webdav(state, &source).await,
         Some(SourceKind::Notion) => sync_notion(state, &source).await,
-        // 被动容器：folder / api / memory / upload 没有拉取语义
+        // Passive containers: folder / api / memory / upload have no pull semantics
         Some(SourceKind::Folder | SourceKind::Api | SourceKind::Memory | SourceKind::Upload) => {
             Ok(SyncStats::default())
         }
@@ -82,7 +86,7 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
             utopia_store::sources::finish_sync(&state.pool, source_id, None, stats.total() as i32)
                 .await?;
             state.emit_source(source.kb_id);
-            tracing::info!(%source_id, kind = %source.kind, created = stats.created, updated = stats.updated, "来源同步完成");
+            tracing::info!(%source_id, kind = %source.kind, created = stats.created, updated = stats.updated, "source sync finished");
             Ok(())
         }
         Err(e) => {
@@ -103,14 +107,15 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
     }
 }
 
-/// 三路判定的结果。
+/// The outcome of the three-way decision.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IngestAction {
     Created,
     Updated,
     Moved,
     Unchanged,
-    /// 墓碑：标记"不在来源中"（不删除文档，删不删由用户在 UI 决定）
+    /// Tombstone: marks it "not in the source" (the document is not deleted -- whether to
+    /// delete is the user's decision in the UI)
     Tombstoned,
 }
 
@@ -125,8 +130,9 @@ fn sha_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// 普通上传语义的推送（KB 级 /ingest → Uploads）：无来源、无身份键，
-/// 不做三路判定——KB 内已有同内容时视为无操作，其余一律新建。
+/// A push with plain-upload semantics (KB-level /ingest -> Uploads): no source, no identity key
+/// and no three-way decision -- if the same content is already in the KB it counts as a no-op,
+/// and everything else is created new.
 pub async fn ingest_upload(
     state: &AppState,
     kb_id: Uuid,
@@ -168,11 +174,12 @@ pub async fn ingest_upload(
     }
 }
 
-/// 身份感知摄入：按 (source, external_key) 三路判定——
-/// 新增（建文档）/ 变更（原地替换 + 版本记录 + 重跑管道）/ 未变（跳过）；
-/// 同内容换路径识别为移动（只改身份，不重跑）。external_key 为 URI 形态
-/// （file:/// 相对路径、页面 URL、rss guid、api:{id}），出处自描述，
-/// 也为 P5 SPARQL 投影的文档 IRI 提前对齐。
+/// Identity-aware ingest: a three-way decision keyed by (source, external_key) --
+/// new (create the document) / changed (replace in place + record a version + re-run the
+/// pipeline) / unchanged (skip); the same content at a different path is recognised as a move
+/// (only the identity changes, nothing is re-run). external_key is URI-shaped (file:/// relative
+/// path, page URL, rss guid, api:{id}), so provenance is self-describing, and it also lines up
+/// in advance with the document IRI of the P5 SPARQL projection.
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_item(
     state: &AppState,
@@ -189,7 +196,8 @@ pub async fn ingest_item(
     }
     let sha256 = sha_hex(bytes);
 
-    // 主判定：逻辑身份；兜底：迁移前的历史文档（无 key）按文件名认领并补键
+    // Primary decision: logical identity. Fallback: historical documents from before the
+    // migration (which have no key) are claimed by filename and given one
     let mut existing =
         utopia_store::documents::find_by_external_key(&state.pool, source_id, external_key).await?;
     if existing.is_none() {
@@ -199,7 +207,8 @@ pub async fn ingest_item(
         {
             utopia_store::documents::adopt_external_key(&state.pool, legacy.id, external_key)
                 .await?;
-            // 认领时把旧内容记为版本 1（此前没有版本记录）
+            // On claiming, record the old content as version 1 (there was no version record
+            // before)
             utopia_store::documents::record_version(
                 &state.pool,
                 legacy.id,
@@ -215,7 +224,8 @@ pub async fn ingest_item(
         if doc.sha256 == sha256 {
             return Ok(IngestAction::Unchanged);
         }
-        // 变更：原地替换，旧版本入 document_versions（blob 内容寻址不删，回放有料）
+        // Changed: replace in place, the old version goes to document_versions (blobs are
+        // content-addressed and never deleted, so replay has something to work with)
         write_blob(state, &sha256, bytes).await?;
         utopia_store::documents::replace_content(
             &state.pool,
@@ -239,7 +249,8 @@ pub async fn ingest_item(
         return Ok(IngestAction::Updated);
     }
 
-    // 同内容出现在新路径：识别为移动/改名，不重跑管道
+    // The same content appearing at a new path: recognised as a move/rename, and the pipeline
+    // is not re-run
     if let Some(doc) =
         utopia_store::documents::find_by_source_sha(&state.pool, source_id, &sha256).await?
     {
@@ -280,7 +291,8 @@ pub async fn ingest_item(
             state.emit_document(kb_id, doc.id);
             Ok(IngestAction::Created)
         }
-        // KB 内已有同内容（如手动上传过同一文件）：不重复摄入
+        // The same content is already in the KB (e.g. the same file was uploaded by hand): do
+        // not ingest it a second time
         Err(utopia_core::AppError::Conflict(_)) => Ok(IngestAction::Unchanged),
         Err(e) => Err(e.into()),
     }
@@ -311,7 +323,8 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
     for url in urls.iter().take(MAX_NEW_PER_SYNC) {
         match fetch_page(&http, url).await {
             Ok((filename, mime, bytes)) => {
-                // 逻辑身份 = URL 本身：页面内容变了就原地替换（历史进版本表）
+                // Logical identity = the URL itself: if the page content changed, replace it in
+                // place (the history goes into the versions table)
                 let action = ingest_item(
                     state,
                     source.kb_id,
@@ -326,18 +339,20 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
                 stats.absorb(action);
             }
             Err(e) => {
-                tracing::warn!(%url, error = %e, "抓取失败");
+                tracing::warn!(%url, error = %e, "fetch failed");
                 last_err = Some(format!("{url}: {e}"));
             }
         }
     }
-    // 部分失败：有产出则视为成功（错误进日志），全军覆没才报错
+    // Partial failure: if anything came through, treat it as success (the errors go to the
+    // log); only a total wipeout is reported as an error
     if stats.total() == 0 {
         if let Some(err) = last_err {
             anyhow::bail!("{err}");
         }
     }
-    // 配置列表即全集：不在列表里的文档标"不在来源中"（抓取失败不算——它仍被配置着）
+    // The configured list is the full set: documents that are not on it get marked "not in the
+    // source" (a failed fetch does not count -- it is still configured)
     utopia_store::documents::reconcile_missing(&state.pool, source.id, &urls)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -426,7 +441,8 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
             .first()
             .map(|l| l.href.clone())
             .unwrap_or_default();
-        // 逻辑身份：feed 规范的 guid（通常已是 permalink/urn），缺失时退条目链接
+        // Logical identity: the guid from the feed spec (usually already a permalink/urn),
+        // falling back to the entry link when it is missing
         let key = if !entry.id.trim().is_empty() {
             entry.id.trim().to_string()
         } else if !link.is_empty() {
@@ -440,7 +456,8 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
             .and_then(|c| c.body.clone())
             .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
             .unwrap_or_default();
-        // 条目发布时间 → 文档时间：时态抽取吃到真实时间戳（本平台的差异化正在于此）
+        // Entry publication time -> document time: temporal extraction gets a real timestamp
+        // (this is precisely where this platform differentiates itself)
         let doc_time = entry.published.or(entry.updated);
 
         let html = format!(
@@ -470,15 +487,17 @@ async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats
     Ok(stats)
 }
 
-/// GitHub 工单：一张工单一篇文档，正文里带它的状态变更史。
+/// GitHub tickets: one document per ticket, with its status change history in the body.
 ///
-/// 工单与评论走**仓库级 + `since`**（一次分页取全），事件走**逐工单**——
-/// 不是不一致，是 `issues/events` 不支持 `since` 且会被 PR 事件淹没，
-/// 拿真实仓库一跑就发现状态变更史悄悄空了。详见 [`crate::github_issues`]。
+/// Issues and comments go **repo-level + `since`** (fetched in full in one paginated pass),
+/// while events go **per issue** -- that is not an inconsistency: `issues/events` does not
+/// support `since` and gets drowned out by PR events, and one run against a real repository
+/// showed the status change history quietly coming up empty. See [`crate::github_issues`].
 ///
-/// `doc_time` 取 `updated_at` 而不是 `created_at`：每次同步捕获的是"此刻这张
-/// 工单是什么样"，认知时间该说这个状态是何时成立的。新增一条评论会改
-/// `updated_at`，于是内容变了、记一个新版本、`doc_time` 也跟着走。
+/// `doc_time` takes `updated_at` rather than `created_at`: what each sync captures is "what this
+/// ticket looks like right now", and the knowledge time should say when that state came to hold.
+/// Adding a comment changes `updated_at`, so the content changed, a new version is recorded, and
+/// `doc_time` moves along with it.
 async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let repo = source.config["repo"]
         .as_str()
@@ -494,8 +513,9 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    // PR 在 GitHub 的模型里也是 issue。默认排除——问"工单系统"要的是工单；
-    // 但有些仓库的决策记录实际写在 PR 描述里，所以留了开关
+    // In GitHub's model a PR is an issue too. Excluded by default -- what you ask a "ticket
+    // system" for is tickets; but in some repositories the decision record actually lives in the
+    // PR description, so the switch was left in
     let include_prs = source.config["include_pull_requests"]
         .as_bool()
         .unwrap_or(false);
@@ -506,7 +526,7 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         .build()?;
     let base = format!("https://api.github.com/repos/{repo}");
 
-    // 增量：GitHub 的 since 是"这之后更新过的"
+    // Incremental: GitHub's since means "updated after this"
     let mut issue_q: Vec<(&str, String)> = vec![("state", "all".into())];
     let mut comment_q: Vec<(&str, String)> = Vec::new();
     if let Some(t) = source.last_sync_at {
@@ -529,8 +549,9 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         .filter(|(i, _)| include_prs || i.pull_request.is_none())
         .take(MAX_NEW_PER_SYNC)
     {
-        // 逐工单取事件。N 只是本轮要写入的工单数——首次同步等于总数，
-        // 之后有 since 兜着通常是个位数
+        // Events are fetched per issue. The N is only the number of issues being written this
+        // round -- on the first sync that equals the total, and after that, with since backing
+        // it up, it is usually a single digit
         let events = crate::github_issues::sort_events(
             crate::github_issues::fetch_all(
                 &http,
@@ -542,7 +563,8 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         );
         let es: Vec<&crate::github_issues::Event> = events.iter().collect();
         let body = crate::github_issues::render(issue, &cs, &es);
-        // 逻辑身份带上仓库：同一个知识库里接两个仓库时，#18 不会互相覆盖
+        // The logical identity carries the repository: with two repositories connected to the
+        // same KB, the two #18s will not overwrite each other
         let key = format!("github:{repo}#{}", issue.number);
         let filename = format!("{}-{}.md", issue.number, slugify(&issue.title));
         let action = ingest_item(
@@ -561,14 +583,16 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
     Ok(stats)
 }
 
-/// Jira 工单：一张工单一篇文档，正文里带**字段级**的变更史。
+/// Jira tickets: one document per ticket, with a **field-level** change history in the body.
 ///
-/// 比 GitHub 那条路省：`search?expand=changelog` 一次调用就带回工单本体、
-/// 完整变更史与评论，**没有 N+1**。增量靠 JQL 的 `updated >= …` 表达，
-/// 因为 Jira 没有 `since` 参数。详见 [`crate::jira_issues`]。
+/// Cheaper than the GitHub path: a single `search?expand=changelog` call brings back the ticket
+/// itself, the full change history and the comments, with **no N+1**. Incrementality is
+/// expressed through JQL's `updated >= …`, because Jira has no `since` parameter. See
+/// [`crate::jira_issues`].
 ///
-/// `doc_time` 取 `updated`，与 github_issues 同一口径：每次同步捕获的是
-/// "此刻这张工单是什么样"，认知时间该说这个状态何时成立。
+/// `doc_time` takes `updated`, the same standard as github_issues: what each sync captures is
+/// "what this ticket looks like right now", and the knowledge time should say when that state
+/// came to hold.
 async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let base_url = source.config["base_url"]
         .as_str()
@@ -580,8 +604,9 @@ async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<S
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("jira_issues source is missing config.project"))?;
-    // 项目 key 直接拼进 JQL，所以不能是任意字符串。Jira 的 key 本身就限定
-    // 字母数字加下划线——挡住它顺带挡住了 JQL 注入
+    // The project key is spliced straight into the JQL, so it cannot be an arbitrary string.
+    // Jira's keys are themselves limited to alphanumerics plus underscore -- enforcing that
+    // blocks JQL injection along the way
     if !project.chars().all(|c| c.is_alphanumeric() || c == '_') {
         anyhow::bail!("config.project should be a Jira project key, got {project:?}");
     }
@@ -597,21 +622,23 @@ async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<S
 
     let jql = crate::jira_issues::jql(project, source.last_sync_at);
     let (issues, total) = crate::jira_issues::fetch_all(&http, base_url, &jql, auth).await?;
-    // **截断了就说出来。** 一个跑了多年的项目动辄上万张工单，翻页上限意味着
-    // 这一轮只覆盖了一段；不报的话界面上"同步完成"就是一句误导
+    // **If it got truncated, say so.** A project that has been running for years easily has
+    // tens of thousands of tickets, and the pagination cap means this round only covered a
+    // slice; say nothing and "sync complete" in the UI is simply misleading
     if total > issues.len() as i64 {
         tracing::warn!(
             source_id = %source.id,
             fetched = issues.len(),
             total,
-            "Jira 结果被翻页上限截断，本轮只覆盖了一部分；下一轮的 JQL 窗口会接上"
+            "Jira results truncated by the pagination cap; this round covered only part of them, the next round's JQL window picks up from there"
         );
     }
 
     let mut stats = SyncStats::default();
     for issue in issues.iter().take(MAX_NEW_PER_SYNC) {
         let body = crate::jira_issues::render(issue);
-        // 逻辑身份带上站点：一个知识库接两个 Jira 时，PROJ-1 不会互相覆盖
+        // The logical identity carries the site: with two Jiras connected to one KB, the two
+        // PROJ-1s will not overwrite each other
         let host = reqwest::Url::parse(base_url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
@@ -638,7 +665,8 @@ async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<S
     Ok(stats)
 }
 
-/// 标题 → 文件名安全的片段。与 RSS 那条路同一个口径（非字母数字换成 -，截断）。
+/// Title -> a filename-safe fragment. Same standard as the RSS path (non-alphanumerics become
+/// -, then truncated).
 fn slugify(title: &str) -> String {
     let mut s: String = title
         .chars()
@@ -648,11 +676,14 @@ fn slugify(title: &str) -> String {
     s.trim_matches('-').to_string()
 }
 
-/// 自定义拉取器 —— Utopia Ingest Interface：
-/// `GET {endpoint}?since=<上次同步 RFC3339>`（首次同步不带 since；可配 Authorization 头），
-/// 响应 `{"items":[{"id":"稳定唯一ID","title":"文档名","content":"正文(纯文本/Markdown/HTML)",
-///                  "doc_time":"RFC3339 可选","mime":"text/markdown 可选"}]}`。
-/// id → external_key（custom:{id}），三路判定生效：同 id 同内容跳过、新内容原地更新。
+/// Custom puller -- the Utopia Ingest Interface:
+/// `GET {endpoint}?since=<last sync, RFC3339>` (no since on the first sync; an Authorization
+/// header can be configured), with the response
+/// `{"items":[{"id":"stable unique id","title":"doc name",
+///             "content":"body (plain text/Markdown/HTML)",
+///             "doc_time":"RFC3339, optional","mime":"text/markdown, optional"}]}`.
+/// id -> external_key (custom:{id}), and the three-way decision applies: same id with the same
+/// content is skipped, new content is updated in place.
 async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let endpoint = source.config["endpoint"]
         .as_str()
@@ -664,7 +695,8 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         url.query_pairs_mut().append_pair("since", &t.to_rfc3339());
     }
 
-    // loopback 端点不走系统代理：代理对回环地址只会 502，本机服务必须直连
+    // A loopback endpoint does not go through the system proxy: a proxy only ever answers 502
+    // for loopback addresses, and a service on this machine has to be reached directly
     let loopback = url
         .host_str()
         .map(|h| {
@@ -698,11 +730,11 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
     let mut seen_keys: Vec<String> = Vec::new();
     for item in items.iter().take(MAX_NEW_PER_SYNC) {
         let Some(id) = item["id"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
-            tracing::warn!(source_id = %source.id, "custom item 缺少 id，跳过");
+            tracing::warn!(source_id = %source.id, "custom item is missing id, skipping");
             continue;
         };
         let Some(content) = item["content"].as_str().filter(|s| !s.trim().is_empty()) else {
-            tracing::warn!(source_id = %source.id, %id, "custom item 缺少 content，跳过");
+            tracing::warn!(source_id = %source.id, %id, "custom item is missing content, skipping");
             continue;
         };
         let title = item["title"]
@@ -731,9 +763,11 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         stats.absorb(action);
         seen_keys.push(key);
     }
-    // 增量响应（?since=）里缺席≠删除，不做全集对账；但：
-    // 1) 再次出现的条目摘掉 missing 标记（失而复得）
-    // 2) 显式墓碑 deleted[] 才标"不在来源中"——删不删文档由用户在 UI 决定
+    // Absence from an incremental response (?since=) != deletion, so no full-set reconciliation;
+    // but:
+    // 1) items that show up again have their missing mark taken off (lost and found)
+    // 2) only an explicit deleted[] tombstone marks something "not in the source" -- whether to
+    //    delete the document is the user's decision in the UI
     if !seen_keys.is_empty() {
         utopia_store::documents::clear_missing_keys(&state.pool, source.id, &seen_keys)
             .await
@@ -752,21 +786,22 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         let n = utopia_store::documents::mark_missing_keys(&state.pool, source.id, &tombstones)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        tracing::info!(source_id = %source.id, count = n, "custom 墓碑：标记不在来源中");
+        tracing::info!(source_id = %source.id, count = n, "custom tombstones: marked not in the source");
     }
     Ok(stats)
 }
 
-/// 对象存储同步：列前缀下的对象，逐个摄入。
+/// Object storage sync: list the objects under a prefix and ingest them one by one.
 ///
-/// `external_key` 用 `s3://bucket/key`，跟 `file:///` 与页面 URL 同一个约定：
-/// 出处自描述。换了前缀但内容没变时，`ingest_item` 会认成「搬家」而不是新增，
-/// 不会重跑一遍抽取。
+/// `external_key` uses `s3://bucket/key`, the same convention as `file:///` and page URLs:
+/// self-describing provenance. When the prefix changes but the content does not, `ingest_item`
+/// recognises it as a "move" rather than something new, and extraction is not run again.
 ///
-/// **`doc_time` 取 `LastModified`，而它是写入时刻不是文档自身的时间。**
-/// 一份 2019 年的合同今天传上去，时间线上会落在今天。对象存储没有更好的
-/// 来源——除非文件名或正文里带日期，而那是抽取器的活。这一条与 `url` 源
-/// 同病：`0013` 的第一条判据在这里只满足一半。
+/// **`doc_time` takes `LastModified`, and that is the moment of writing, not the document's own
+/// time.** A contract from 2019 uploaded today lands on today in the timeline. Object storage
+/// has no better source -- unless the filename or the body carries a date, and that is the
+/// extractor's job. This shares its affliction with the `url` source: the first criterion of
+/// `0013` is only half satisfied here.
 async fn sync_object_storage(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let bucket = source.config["bucket"]
         .as_str()
@@ -782,21 +817,23 @@ async fn sync_object_storage(state: &AppState, source: &Source) -> anyhow::Resul
     let (objects, truncated) =
         crate::object_storage::fetch(&source.kind, store.as_ref(), bucket, prefix).await?;
 
-    // 到顶不是错误，但必须说出来——否则「同步成功」下面藏着没进来的东西，
-    // 而那正是 0005 说的失败无声
+    // Hitting the ceiling is not an error, but it has to be said out loud -- otherwise "sync
+    // succeeded" has things hidden underneath it that never came in, and that is exactly the
+    // silent failure 0005 talks about
     if truncated {
         tracing::warn!(
             %bucket, prefix = prefix.unwrap_or(""),
-            "对象数到达单次上限，其余留给下一次同步"
+            "object count hit the per-run cap, the rest is left to the next sync"
         );
     }
 
     let mut stats = SyncStats::default();
     for obj in objects {
-        // **不猜 mime。** `utopia_ingest::parse` 先看魔数、再看扩展名，
-        // 注释写着「扩展名可能撒谎」——在这里按文件名猜一个，只是多一个
-        // 会撒谎的来源，而且要为此多一个依赖。`octet-stream` 是诚实的：
-        // 我们拿到的就是一串字节，没看过里面是什么。
+        // **Don't guess the mime.** `utopia_ingest::parse` looks at the magic number first and
+        // the extension second, and the comment there says "the extension may be lying" --
+        // guessing one from the filename here would only add one more source that can lie, and
+        // would cost an extra dependency for the privilege. `octet-stream` is honest: what we
+        // got is a string of bytes and we have not looked inside it.
         let action = ingest_item(
             state,
             source.kb_id,
@@ -813,10 +850,10 @@ async fn sync_object_storage(state: &AppState, source: &Source) -> anyhow::Resul
     Ok(stats)
 }
 
-/// WebDAV 同步：逐层走目录，把文件摄进来。
+/// WebDAV sync: walk the directories level by level and ingest the files.
 ///
-/// `external_key` 用 `webdav://host/path`——同一台网盘换了挂载点仍是同一份
-/// 文件，而不同网盘上的同名路径是两份。
+/// `external_key` uses `webdav://host/path` -- the same drive remounted somewhere else is still
+/// the same file, while identical paths on different drives are two files.
 async fn sync_webdav(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let base = source.config["base_url"]
         .as_str()
@@ -836,12 +873,17 @@ async fn sync_webdav(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         .build()?;
     let (files, truncated) = crate::webdav::fetch(&http, base, root, auth).await?;
     if truncated {
-        tracing::warn!(base, root, "文件数到达单次上限，其余留给下一次同步");
+        tracing::warn!(
+            base,
+            root,
+            "file count hit the per-run cap, the rest is left to the next sync"
+        );
     }
 
     let mut stats = SyncStats::default();
     for f in files {
-        // 不猜 mime，理由同对象存储：解析先看魔数
+        // Don't guess the mime, same reason as object storage: parsing looks at the magic
+        // number first
         let action = ingest_item(
             state,
             source.kb_id,
@@ -858,11 +900,11 @@ async fn sync_webdav(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
     Ok(stats)
 }
 
-/// Notion 同步：把 integration 能看见的页面摄进来。
+/// Notion sync: ingest the pages the integration can see.
 ///
-/// `doc_time` 取 `last_edited_time`——**这是页面自己的编辑时刻**，比对象存储
-/// 那边的写入时刻实在：一份 2019 年的合同今天传进 S3 会落在今天，而 Notion
-/// 页面的编辑时刻就是它内容变化的时刻。
+/// `doc_time` takes `last_edited_time` -- **this is the page's own edit time**, which is more
+/// solid than the write time over in object storage: a contract from 2019 uploaded to S3 today
+/// lands on today, whereas a Notion page's edit time is the moment its content changed.
 async fn sync_notion(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let token = source.config["token"]
         .as_str()
@@ -876,7 +918,7 @@ async fn sync_notion(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
 
     let (pages, truncated) = crate::notion::fetch(token, query).await?;
     if truncated {
-        tracing::warn!("页面数到达单次上限，其余留给下一次同步");
+        tracing::warn!("page count hit the per-run cap, the rest is left to the next sync");
     }
 
     let mut stats = SyncStats::default();
@@ -897,7 +939,8 @@ async fn sync_notion(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
     Ok(stats)
 }
 
-/// 标题无扩展名时按 mime 补一个，接入解析矩阵的分派。
+/// When the title has no extension, add one from the mime so it plugs into the parse matrix's
+/// dispatch.
 fn ensure_extension(title: &str, mime: &str) -> String {
     let has_ext = title
         .rsplit('.')

@@ -1,22 +1,26 @@
-//! 审核队列的**真实条数**。
+//! The **real counts** for the review queue.
 //!
-//! 从前左栏的徽标读的是接口返回的数组长度，而接口固定只回 100 条——于是一个
-//! 有 164 条低置信事实的库，界面写着 100。清完那 100 条，剩下的 64 条会再冒
-//! 出来，看起来像凭空长的。
+//! The badge in the left rail used to read the length of the array the endpoint returned, and the
+//! endpoint always returns at most 100 rows -- so a knowledge base with 164 low-confidence facts
+//! displayed 100. Clear those 100 and the remaining 64 come back up, looking like they grew out
+//! of nowhere.
 //!
-//! **数数和取数是两件事，得分开做。** 取数有上限（一页十条，翻页拿下一页），
-//! 数数没有：`count(*)` 走的是与列表同一套 WHERE，索引也是同一条。
+//! **Counting and fetching are two different things, and they have to be done separately.**
+//! Fetching has a ceiling (ten per page, page forward for the next ten); counting does not:
+//! `count(*)` goes through the same WHERE as the list, over the same index.
 //!
-//! 八个 COUNT 合成一条查询而不是发八次：它们都在同一个 kb 上，一次往返把
-//! 左栏一次性填满，而分开发会让切换知识库时左栏一档一档地跳出来。
+//! The eight COUNTs are folded into one query instead of eight round trips: they are all on the
+//! same kb, so a single round trip fills the left rail in one go, whereas sending them separately
+//! makes the rail pop out one row at a time when you switch knowledge bases.
 
 use sqlx::PgPool;
 use utopia_core::models::ReviewCounts;
 use utopia_core::AppResult;
 use uuid::Uuid;
 
-/// 低置信的阈值。**与 `review_routes` 共用一个常量**——两处各写一个数，
-/// 迟早分叉成「徽标说 12 条，点进去 9 条」。
+/// The low-confidence threshold. **Shared as one constant with `review_routes`** -- write the
+/// number in two places and sooner or later they diverge into "the badge says 12, you click
+/// through and there are 9".
 pub const LOW_CONFIDENCE_BELOW: f32 = 0.75;
 
 pub async fn counts(pool: &PgPool, kb_id: Uuid) -> AppResult<ReviewCounts> {
@@ -27,7 +31,7 @@ pub async fn counts(pool: &PgPool, kb_id: Uuid) -> AppResult<ReviewCounts> {
              WHERE kb_id = $1 AND status = 'pending') AS duplicates,
            (SELECT count(*) FROM fact_conflicts
              WHERE kb_id = $1 AND status = 'open') AS conflicts,
-           -- 待确认 = 有证据、但证据所在的分块全被新版本取代了
+           -- unconfirmed = has evidence, but every chunk it sits in was replaced by a newer version
            (SELECT count(*) FROM facts f
              WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
                AND EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = f.id)

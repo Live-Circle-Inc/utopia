@@ -1,15 +1,20 @@
-// KB 事件流订阅：收到事件只做 react-query 失效重取（事件不带业务数据，天然幂等）。
-// EventSource 断线自动重连；替代 Library/Review 的轮询。
+// KB event-stream subscription: an incoming event only invalidates and refetches through
+// react-query (events carry no business data, so they are idempotent by nature).
+// EventSource reconnects on its own when the connection drops; this replaces the polling in
+// Library/Review.
 //
-// **失效是合并着做的。** 一篇文档抽取时每落一条事实就发一个 graph 事件，
-// 从前每个事件各失效一次，图谱页在那几秒里把 overview 重取了十几遍——
-// 每次都是同一张图，最后一次才算数。所以事件只把 key 记下来，停顿一小会
-// 再一次性失效：一阵事件只换来一次重取，最后那次一定包含之前所有的变化。
-// 幂等性没变，只是把「每条都刷」变成「刷最后一条」。
+// **Invalidation is coalesced.** While a document is being extracted, every fact that lands emits
+// a graph event. Each event used to invalidate on its own, and over those few seconds the graph
+// page refetched the overview a dozen-odd times -- always the same graph, and only the last one
+// counted. So an event now only records the key, and after a short pause everything is
+// invalidated in one go: a burst of events buys exactly one refetch, and that last one is
+// guaranteed to contain every change before it. Idempotence is unchanged; "refresh on every one"
+// simply became "refresh on the last one".
 import { useEffect } from "react";
 import { useQueryClient, type QueryKey } from "@tanstack/react-query";
 
-/** 一阵事件之间的静默期。抽取落事实的间隔远小于它，人眼看不出这点延迟 */
+/** The quiet period between bursts of events. The gap between facts landing during extraction is
+ *  far shorter than this, and the eye cannot see a delay this small */
 const SETTLE_MS = 300;
 
 export function useKbEvents(kbId: string | undefined) {
@@ -33,14 +38,16 @@ export function useKbEvents(kbId: string | undefined) {
     const es = new EventSource(`/api/v1/kbs/${kbId}/events`);
     es.addEventListener("document", () => invalidate(["documents", kbId], ["graph"]));
     es.addEventListener("graph", () => invalidate(["graph"]));
-    // 映射探索跑完发的也是 review：Pending 那一栏得跟着刷新
+    // mapping discovery also emits review when it finishes: the Pending column has to refresh too
     es.addEventListener("review", () => invalidate(["review", kbId], ["mappings", kbId]));
-    // 一句记忆抽出了等人点头的事实（0015）：对话里那张确认卡跟着长出来
+    // a line of memory extracted a fact that waits for a human nod (0015): the confirmation card
+    // in the conversation grows in along with it
     es.addEventListener("pending", () => invalidate(["pending", kbId], ["review", kbId]));
     es.addEventListener("source", () => invalidate(["sources", kbId], ["documents", kbId]));
     return () => {
       es.close();
-      // 卸载时把攒着的刷掉而不是丢掉：换页回来看到的必须是新数据
+      // on unmount, flush what is queued rather than dropping it: coming back to the page must
+      // show fresh data
       if (timer !== null) {
         clearTimeout(timer);
         flush();

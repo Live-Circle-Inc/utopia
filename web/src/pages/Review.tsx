@@ -28,7 +28,8 @@ const CONFLICT_PAGE = 8;
 
 const ym = (iso: string | null) => (iso ? iso.slice(0, 7) : null);
 
-/** `code` 或 `code|detail`。查不到就原样显示——存量行里还是旧的英文散文 */
+/** `code` or `code|detail`. If it is not found, show it as-is -- legacy rows
+ *  still carry the old English prose */
 function escalationText(reason: string): string {
   const [code, detail] = reason.split("|");
   const worded = S.review.escalated[code];
@@ -194,7 +195,8 @@ function FactRow({
   );
 }
 
-/** 时态冲突行：旧事实 vs 新事实，三个动作（Close old / Keep both / Reject new）。 */
+/** A temporal conflict row: old fact vs new fact, three actions
+ *  (Close old / Keep both / Reject new). */
 function ConflictRow({
   conflict,
   busy,
@@ -210,7 +212,7 @@ function ConflictRow({
   const [closeAt, setCloseAt] = useState("");
   const c = conflict;
   const needsDate = !c.new_valid_from;
-  // close_at 输入按天精度转 RFC3339
+  // The close_at input is day-precision, converted to RFC3339
   const closeAtIso = /^\d{4}-\d{2}-\d{2}$/.test(closeAt.trim())
     ? `${closeAt.trim()}T00:00:00Z`
     : undefined;
@@ -284,7 +286,8 @@ function ConflictRow({
   );
 }
 
-/** "文档新版没再提"的事实行：Reject（抽取错误）或 Close at date（这事结束了）。 */
+/** A fact row for "the document's new version stopped mentioning it": Reject
+ *  (extraction error) or Close at date (this thing is over). */
 function UnconfirmedRow({
   fact,
   busy,
@@ -404,7 +407,7 @@ function MergeRow({
   );
 }
 
-/* ---------- 决策台账行 ---------- */
+/* ---------- Decision ledger rows ---------- */
 
 const DECISION_TONE: Record<string, ChipTone> = {
   "review.merge": "violet",
@@ -420,7 +423,8 @@ const DECISION_TONE: Record<string, ChipTone> = {
 };
 
 function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
-  // detail 是决策时的自包含快照——不 join 活数据，事实删了台账也完整
+  // detail is a self-contained snapshot taken at decision time -- no join against live
+  // data, so the ledger stays complete even once the fact is deleted
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const d = e.detail as any;
   let text: string;
@@ -458,12 +462,15 @@ function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
   );
 }
 
-/** 一条待表态的数据映射口径（0011）。
+/** One data-mapping definition awaiting a verdict (0011).
  *
- * 展示的重点是**「这个数怎么算」**——SQL / 表达式 / 表名按这个优先级取一个，
- * 因为人要判断的正是它对不对。概念名与源是身份，unit 是答里必须带的量纲。 */
-/** 本体自己的一处自相矛盾。**两个按钮而不是三个**——这一档压根没看数据，
- *  所以没有「数据错了」这条出路，只能是「我去改了本体」或「先放着」。 */
+ * What it puts front and centre is **"how this number is computed"** -- SQL / expression /
+ * table name, taken in that order of priority, because judging whether that is right is
+ * exactly the human's job. The concept name and the source are identity; unit is the
+ * dimension the answer has to carry. */
+/** One place where the ontology contradicts itself. **Two buttons rather than three** --
+ *  this tier never looked at the data at all, so there is no "the data is wrong" way out;
+ *  it can only be "I went and changed the ontology" or "leave it for now". */
 function DefectRow({
   defect: d,
   busy,
@@ -485,7 +492,8 @@ function DefectRow({
     rules_disagree: S.review.defectRulesDisagree,
   }[d.kind];
   const rules = d.kind === "rules_disagree" ? (d.detail.rules ?? []) : [];
-  // 后两类的后果值得写出来：不可满足的类不会报错，它只是永远空着
+  // The consequence of the last two kinds is worth spelling out: an unsatisfiable class
+  // raises no error, it just stays empty forever
   const unsatisfiable =
     d.kind === "disjoint_with_ancestor" || d.kind === "inherits_disjoint";
   return (
@@ -546,10 +554,12 @@ function DefectRow({
   );
 }
 
-/** 一处公理违规。**三个按钮而不是两个**——第三个是这一档独有的出路：
- *  矛盾可能出在定义上（用户导的本体把某个属性声明成反对称，而他的语料里
- *  那关系其实双向），这时该改的是本体，不是二十条事实。 */
-/** 裁决的附加参数：闭合日期（fact_closed）、撤哪条（fact_retracted） */
+/** One axiom violation. **Three buttons rather than two** -- the third is a way out unique
+ *  to this tier: the contradiction may lie in the definition (the ontology the user imported
+ *  declares some property asymmetric, while in their corpus that relation actually runs both
+ *  ways), and then what should change is the ontology, not twenty facts. */
+/** Extra parameters for a verdict: the close date (fact_closed), which one to retract
+ *  (fact_retracted) */
 type DecideOpts = { closeAt?: string; factId?: string };
 
 function ViolationRow({
@@ -576,9 +586,11 @@ function ViolationRow({
   if (v.kind === "derived_contradiction") {
     return <ContradictionRow {...{ v, what, busy, onDecide, onDuplicates, onOntology }} />;
   }
-  // 自反那一类两条事实是同一条——显示一遍就够，显示两遍像个 bug
+  // In the reflexive kind the two facts are one and the same -- showing it once is enough,
+  // showing it twice looks like a bug
   const single = v.left_fact === v.right_fact;
-  // 「数据错了」要撤具体哪一条：环逐条列，双事实的两条各一个按钮，单事实的不用问（#202）
+  // "The data is wrong" has to retract one specific fact: a cycle is listed item by item, a
+  // two-fact violation gets one button each, and a single-fact one needs no asking (#202)
   const facts =
     v.path.length > 0
       ? v.path
@@ -650,8 +662,10 @@ function ViolationRow({
 }
 
 /**
- * 派生撞上断言（0017）：卡片是一次审核，线索指向上游的错——旧断言该闭合、
- * 两个同名实体其实是一个、抽取本来就没把握。修法就在卡片上，端点替人执行。
+ * A derivation colliding with an assertion (0017): the card is one review, and the clue
+ * points at a mistake upstream -- an old assertion that should have been closed, two
+ * same-named entities that are really one, an extraction that was never sure in the first
+ * place. The fix is right there on the card, and the endpoint carries it out for the human.
  */
 function ContradictionRow({
   v,
@@ -752,25 +766,27 @@ function ContradictionRow({
   );
 }
 
-/* ---------- 页面：左栏分类 + 单类内容区 ---------- */
+/* ---------- The page: category rail on the left + one category's content ---------- */
 
 type Sel =
-  // 记忆抽出、等人点头的事实（0015）。排第一：它是人自己说的话，
-  // 而且在这一档里的东西**还没进图**——别处每一档审的都是已经在图上的
+  // Facts extracted from memory, waiting for a human nod (0015). First in the order: these
+  // are the human's own words, and what sits in this tier is **not in the graph yet** --
+  // every other tier reviews things that are already on the graph
   | "pending"
   | "duplicates"
   | "conflicts"
   | "unconfirmed"
   | "lowconf"
-  // 公理违规（0002 R0）。**与 conflicts 分开**：那一档问「哪条对」，
-  // 这一档还可能答「公理写错了」——出路不同
+  // Axiom violations (0002 R0). **Kept apart from conflicts**: that tier asks "which one is
+  // right", while this one may also answer "the axiom is wrong" -- the ways out differ
   | "violations"
-  // 本体自己的自相矛盾。**与 violations 分开**：那一档看事实，这一档只看定义
+  // The ontology contradicting itself. **Kept apart from violations**: that tier looks at
+  // facts, this one looks only at definitions
   | "defects"
   | "decisions"
   | "merges";
 
-/** 走服务端分页的那几档（决策台账另有自己的接口） */
+/** The tiers that page on the server (the decision ledger has an endpoint of its own) */
 const QUEUE_FETCHED: ReviewQueue[] = [
   "pending",
   "duplicates",
@@ -822,7 +838,8 @@ function RailItem({
   label: string;
   count: number | null;
   onClick: () => void;
-  /** 这一档不在本页办——加个去向记号，免得点下去以为页面没反应 */
+  /** This tier is not handled on this page -- add a "goes elsewhere" marker, so clicking it
+   *  does not look like the page ignored you */
   external?: boolean;
 }) {
   return (
@@ -856,18 +873,22 @@ export function Review() {
   const { kb } = useKb();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  // 面板的争议 chip 带着 queue / item 跳过来：先落到那一档，再把那张卡点亮
+  // The panel's contested chip arrives carrying queue / item: land on that tier first, then
+  // light up that card
   const search = useSearch({ from: "/app/kb/$kbId/review" });
   const [sel, setSel] = useState<Sel | null>(
     QUEUE_ORDER.includes(search.queue as Sel) ? (search.queue as Sel) : null,
   );
   const [page, setPage] = useState(0);
 
-  // 队列变化经 SSE 事件流推送（useKbEvents 挂在 Shell），无需轮询。
+  // Queue changes are pushed over the SSE event stream (useKbEvents is mounted in Shell), so
+  // no polling.
   //
-  // **按分档 + 页码取**：从前一次把八个队列全端回来、每档 100 条、客户端分页，
-  // 于是左栏的徽标是截断后的数字，第十一页之后的东西界面上不存在。现在计数
-  // 每次都回（服务端 COUNT，不受一页多少条影响），内容只回当前这一档的一页。
+  // **Fetched by tier + page number**: this used to bring all eight queues back at once, 100
+  // rows per tier, paginated on the client, so the badges in the left rail were the truncated
+  // numbers and anything past page eleven did not exist in the UI. Now the counts come back
+  // every time (a server-side COUNT, unaffected by how many rows a page holds) and the
+  // content is only the one page of the current tier.
   const queueSel: ReviewQueue = QUEUE_FETCHED.includes(
     (sel ?? "duplicates") as ReviewQueue,
   )
@@ -883,10 +904,11 @@ export function Review() {
         page * PAGE_SIZE[queueSel as Sel],
       ),
     enabled: !!kb,
-    // 翻页时别把上一页闪成空白——计数与骨架都还在，只有条目在换
+    // Do not flash the previous page to blank while paging -- the counts and the skeleton
+    // are still there, only the items change
     placeholderData: (prev) => prev,
   });
-  // 决策台账：服务端分页，仅选中时拉取
+  // The decision ledger: paged on the server, fetched only while selected
   const history = useQuery({
     queryKey: ["reviewHistory", kb?.id, page],
     queryFn: () => api.reviewHistory(kb!.id, page),
@@ -917,8 +939,10 @@ export function Review() {
         : api.rejectFact(kb!.id, id),
     onSettled: invalidate,
   });
-  // 等人点头的事实（0015）：确认进账本，驳回记进 rejected_facts
-  // 点头是写图的动作：Viewer 看得见提议、看不见按钮（与服务端 Editor 门槛同口径）
+  // Facts waiting for a human nod (0015): confirming enters the ledger, rejecting is recorded
+  // into rejected_facts
+  // A nod is an act of writing to the graph: a Viewer sees the proposals but not the buttons
+  // (the same bar as the server's Editor check)
   const canDecidePending = useCanDecide(kb?.id);
   const pendingAction = useMutation({
     mutationFn: ({
@@ -955,8 +979,9 @@ export function Review() {
     }) => api.decideViolation(kb!.id, id, resolution, opts),
     onSettled: invalidate,
   });
-  // 检查是同步的纯计算,所以直接 mutate 不排队。跑完把报告留在按钮旁边——
-  // **零和零不一样**：没有公理时要说「无从判起」,不能说「未发现矛盾」
+  // The check is synchronous pure computation, so mutate directly without queueing. When it
+  // is done the report stays next to the button -- **zero and zero are not the same**: with
+  // no axioms it has to say "nothing to judge from", not "no contradictions found"
   const runCheck = useMutation({
     mutationFn: () => api.runConsistencyCheck(kb!.id),
     onSettled: invalidate,
@@ -984,11 +1009,12 @@ export function Review() {
     onSettled: invalidate,
   });
 
-  // **徽标读服务端的 COUNT，不读列表长度。** 这是从前那个「库里 164、界面写
-  // 100」的根源：数组长度反映的是一页多少条，不是库里有多少条。
+  // **The badges read the server's COUNT, not the length of the list.** This was the root of
+  // the old "164 in the database, 100 in the UI": an array length reflects how many rows a
+  // page holds, not how many rows the database holds.
   const c = review.data?.counts;
-  // mappings 不是本页的一档（审批在「数据映射」页），但计数照收：
-  // 收件箱该说「有几条等你」
+  // mappings is not a tier on this page (the approving happens on the "Data mappings" page),
+  // but the count is taken all the same: an inbox should say "how many are waiting for you"
   const counts: Record<Sel | "mappings", number> = {
     pending: c?.pending ?? 0,
     duplicates: c?.duplicates ?? 0,
@@ -1001,8 +1027,9 @@ export function Review() {
     merges: c?.merges ?? 0,
     decisions: history.data?.total ?? 0,
   };
-  // 当前这一档的一页。**服务端已经切好了**，这里只按档收窄类型——
-  // 收窄错了会在渲染时露馅，而不是悄悄显示空列表
+  // The one page of the current tier. **The server has already sliced it**; all that happens
+  // here is narrowing the type by tier -- narrow it wrongly and it shows at render time,
+  // rather than quietly displaying an empty list
   const rows = review.data?.queue === queueSel ? (review.data.items ?? []) : [];
   const asPending = () => rows as PendingFactItem[];
   const asDuplicates = () => rows as ReviewItem[];
@@ -1013,7 +1040,8 @@ export function Review() {
   const asMerges = () => rows as MergeLog[];
   const queueEmpty = QUEUE_ORDER.every((k) => counts[k] === 0);
 
-  // 首批数据到达：定位到第一个非空队列（全空落在 duplicates 显示"干净"文案）
+  // First batch of data arrives: settle on the first non-empty queue (all-empty lands on
+  // duplicates and shows the "clean" copy)
   useEffect(() => {
     if (sel === null && c)
       setSel(QUEUE_ORDER.find((k) => counts[k] > 0) ?? "duplicates");
@@ -1051,10 +1079,11 @@ export function Review() {
 
   return (
     <div className="h-full flex">
-      {/* 左栏：队列分类 + 历史，各带实时计数（SSE 推动刷新） */}
-      {/* `overflow-y-auto`：矮窗口下这一栏的内容比它高，而底部那条是「去别处办」
-          的出口——没有滚动它会被裁掉且够不着。`mt-auto` 只在有富余空间时把它
-          压到底，两者要一起给 */}
+      {/* Left rail: queue categories + history, each with a live count (refreshed by SSE) */}
+      {/* `overflow-y-auto`: in a short window this rail's content is taller than the rail,
+          and the row at the bottom is the exit to "handle it elsewhere" -- without scrolling
+          it gets clipped and is out of reach. `mt-auto` only pushes it to the bottom when
+          there is spare space, so the two have to be given together */}
       <aside className={`${RAIL_CLS} flex flex-col overflow-y-auto u-scroll`}>
         <RailHeader label={S.review.tabQueue} />
         <div className="px-2 space-y-0.5">
@@ -1117,12 +1146,14 @@ export function Review() {
           />
         </div>
 
-        {/* 数据映射：**两组都不属于，所以压在底部单独一条。**
-            上面那七档问的都是「这条知识对不对」，而口径问的是「这个数怎么算」
-            （0011 已经在数据层把它分出去了）；下面那两档是本页办过的事的流水，
-            而口径的决定从来不进 `review_history`（它只捞 review./fact./
-            conflict./merge.，口径记的是 mapping.decided）。
-            **计数留着**——收件箱该说「有几条等你」，但活在有上下文的那一页干 */}
+        {/* Data mappings: **it belongs to neither group, so it sits alone at the bottom.**
+            The seven tiers above all ask "is this piece of knowledge right", while a mapping
+            definition asks "how is this number computed" (0011 already split it out at the
+            data layer); the two tiers below are the stream of what has been done on this
+            page, and a mapping decision never enters `review_history` (that only scoops up
+            review./fact./conflict./merge., while a mapping records mapping.decided).
+            **The count stays** -- an inbox should say "how many are waiting for you", but the
+            work itself happens on the page that has the context */}
         <div className="mt-auto border-t border-white/5 px-2 py-2">
           <RailItem
             active={false}
@@ -1136,7 +1167,7 @@ export function Review() {
         </div>
       </aside>
 
-      {/* 右侧：一次只显示选中的一类，单一分页 */}
+      {/* Right side: only the selected category at a time, a single pager */}
       <div className="flex-1 min-w-0 overflow-y-auto u-scroll px-8 py-6">
         <div className="max-w-4xl">
           {review.isPending && (
@@ -1150,7 +1181,7 @@ export function Review() {
 
           {review.data && (
             <section>
-              {/* 页级标题：与 Library/KB Settings 同级（text-lg），不是卡片头 */}
+              {/* Page-level heading: same tier as Library/KB Settings (text-lg), not a card head */}
               <h2 className="u-title text-lg mb-1">{SECTION[active].title}</h2>
               {SECTION[active].hint && (
                 <p className="text-xs text-neutral-500 mb-3">
@@ -1158,8 +1189,10 @@ export function Review() {
                 </p>
               )}
 
-              {/* 空态：整个待办全清 vs 单类清空。**公理这一档除外**——它自己那句要
-                  分清「查过、没矛盾」和「还没查过」，通用空态说不出这个差别 */}
+              {/* Empty state: the entire backlog cleared vs one category cleared. **Except
+                  the axiom tier** -- its own sentence has to separate "checked, no
+                  contradictions" from "not checked yet", and the generic empty state cannot
+                  say that difference */}
               {isQueueSel &&
                 active !== "violations" &&
                 active !== "defects" &&
@@ -1295,12 +1328,15 @@ export function Review() {
 
               {active === "violations" && (
                 <div className="space-y-3">
-                  {/* 按钮在这一档里，不在页头：只有看这一档的人才想重跑。
-                      报告留在按钮旁边——空结果要说清是「没矛盾」还是「没判据」 */}
+                  {/* The button lives inside this tier, not in the page header: only someone
+                      looking at this tier wants to rerun it. The report stays next to the
+                      button -- an empty result has to say whether it means "no
+                      contradictions" or "nothing to judge from" */}
                   <div className="flex items-center gap-3">
-                    {/* ghost 而不是实心白：这和「探查映射」是同一种东西——
-                        手动触发一次分析，不是这一页的主操作。留一个实心白给
-                        真正的决定（确认 / 合并） */}
+                    {/* ghost rather than solid white: this is the same kind of thing as
+                        "probe mappings" -- manually triggering one analysis, not this page's
+                        primary action. Keep the one solid white for the real decisions
+                        (confirm / merge) */}
                     <button
                       className="u-btn u-btn-ghost px-3 py-1.5 text-xs"
                       disabled={runCheck.isPending}
@@ -1312,9 +1348,10 @@ export function Review() {
                     </button>
                     {runCheck.data && (
                       <span className="text-xs text-neutral-500">
-                        {/* 三种结果说三句话。**`found` 不是要报的数**：
-                            重跑会把已裁决的那些重新算出来，说「3 处矛盾」而
-                            列表只剩一条，看起来像界面漏了东西 */}
+                        {/* Three outcomes, three sentences. **`found` is not the number to
+                            report**: a rerun recomputes the ones already adjudicated, so
+                            saying "3 contradictions" while the list has only one left looks
+                            like the UI dropped something */}
                         {runCheck.data.predicates_with_axioms === 0
                           ? S.review.checkNoAxioms
                           : runCheck.data.inserted > 0
@@ -1389,7 +1426,7 @@ export function Review() {
                   </div>
                 ))}
 
-              {/* 单一分页：queue/merges 走客户端切片，decisions 服务端分页 */}
+              {/* A single pager: queue/merges slice on the client, decisions page on the server */}
               {active !== "decisions" && (
                 <Pager
                   total={counts[active]}

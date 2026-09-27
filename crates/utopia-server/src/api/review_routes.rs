@@ -1,4 +1,4 @@
-//! 审核队列 API：消解疑似重复对 + 低置信事实 + 合并日志/回滚。
+//! Review queue API: suspected duplicate-pair resolution + low-confidence facts + merge log/revert.
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -12,16 +12,20 @@ use crate::auth::AuthUser;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// 一页多少条。**服务端的默认，不是上限**——前端可以要更少，多则被 clamp 挡住
+/// How many items per page. **A server-side default, not a cap** -- the front end may ask for
+/// fewer; ask for more and the clamp stops it
 const REVIEW_PAGE: i64 = 10;
 
-/// 冲突双方的三元组快照：(旧主语, 旧宾语, 新主语, 新宾语, 谓词标签)。
+/// A triple snapshot of both sides of a conflict: (old subject, old object, new subject,
+/// new object, predicate label).
 type ConflictSnapshot = (String, Option<String>, String, Option<String>, String);
 
-/// 事实快照（决策台账用）：reject 后事实从图里消失，台账必须自包含展示文本。
-/// 一律在动作执行前取。
+/// A fact snapshot (for the decision ledger): after a reject the fact disappears from the graph,
+/// so the ledger has to carry self-contained display text.
+/// Always taken before the action runs.
 async fn fact_snapshot(state: &AppState, kb_id: Uuid, fact_id: Uuid) -> Option<serde_json::Value> {
-    // 宾语可能是实体或字面值；结构化字面值优先取 summary（与队列卡片同一显示口径）
+    // The object may be an entity or a literal; structured literals prefer summary (the same
+    // display convention as the queue card)
     let row: Option<(String, Option<String>, Option<String>, f32)> = sqlx::query_as(
         "SELECT s.canonical_name, COALESCE(r.label, fact_surface_predicate(f.id)),
                 COALESCE(o.canonical_name, f.object_value ->> 'summary',
@@ -43,7 +47,7 @@ async fn fact_snapshot(state: &AppState, kb_id: Uuid, fact_id: Uuid) -> Option<s
 
 #[derive(Deserialize)]
 pub struct ReviewQuery {
-    /// 要看哪一档。缺省 duplicates
+    /// Which queue to look at. Defaults to duplicates
     #[serde(default)]
     pub queue: Option<String>,
     #[serde(default)]
@@ -52,15 +56,18 @@ pub struct ReviewQuery {
     pub offset: Option<i64>,
 }
 
-/// 审核队列：**计数与内容分开取**。
+/// The review queue: **counts and contents are fetched separately**.
 ///
-/// 从前一次把八个队列全端回来，每个固定 100 条，前端再客户端分页——于是左栏
-/// 的徽标是截断后的数字（库里 164 条低置信事实，界面写 100），而第十一页之后
-/// 的东西界面上不存在。
+/// This used to hand back all eight queues in one go, a fixed 100 rows each, with the front end
+/// paginating client-side -- so the badge in the left column was the truncated number (164
+/// low-confidence facts in the database, 100 on screen), and anything past page eleven did not
+/// exist as far as the UI was concerned.
 ///
-/// 现在：计数每次都回（八个 COUNT 一条查询，走的是与列表同一套 WHERE），
-/// 内容只回当前那一档的一页。切换分档或翻页各发一次请求，代价是多几次往返，
-/// 换来的是**数字不再骗人**，而且一个有十万条待办的库也翻得到底。
+/// Now: the counts come back every time (eight COUNTs in one query, going through the same WHERE
+/// clauses as the list), and the contents are only one page of the current queue. Switching
+/// queues or turning a page each sends its own request; the price is a few more round trips, and
+/// what it buys is **numbers that no longer lie**, plus a KB with a hundred thousand pending
+/// items that you can actually page to the end of.
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -70,12 +77,13 @@ pub async fn list(
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
     let counts = utopia_store::review::counts(&state.pool, kb_id).await?;
     let queue = q.queue.as_deref().unwrap_or("duplicates");
-    // 上限挡住「limit=1000000 把库拖垮」，同时留出足够一页的余量
+    // The cap stops "limit=1000000 drags the database down" while leaving ample room for a page
     let limit = q.limit.unwrap_or(REVIEW_PAGE).clamp(1, 200);
     let offset = q.offset.unwrap_or(0).max(0);
 
     let items = match queue {
-        // 记忆抽出、等人点头的事实（0015）。排第一：它是人自己说的话
+        // Facts extracted from a memory, waiting for a human nod (0015). First in the list:
+        // these are the human's own words
         "pending" => json!(utopia_store::pending::list(&state.pool, kb_id, limit, offset).await?),
         "duplicates" => {
             json!(utopia_store::resolution::list_reviews(&state.pool, kb_id, limit, offset).await?)
@@ -110,8 +118,9 @@ pub async fn list(
         "merges" => {
             json!(utopia_store::resolution::list_merges(&state.pool, kb_id, limit, offset).await?)
         }
-        // 认不出的档名当成契约错误报出来，而不是悄悄回空——悄悄回空会让前端
-        // 拼错一个字母之后看到「这一档清空了」
+        // An unrecognised queue name is reported as a contract error rather than quietly coming
+        // back empty -- coming back quietly empty means one mistyped letter in the front end
+        // looks like "this queue has been emptied"
         other => {
             return Err(utopia_core::AppError::invalid(
                 "unknown_queue",
@@ -133,8 +142,8 @@ pub struct CloseFactBody {
     pub valid_to: chrono::DateTime<chrono::Utc>,
 }
 
-/// 人工闭合一条事实的有效区间（"这事在某时结束了"）——走作废+改写，
-/// 与自动闭合同一机制，账本可回放。
+/// Manually close a fact's validity interval ("this ended at such a time") -- via invalidate +
+/// rewrite, the same mechanism as automatic closing, so the ledger stays replayable.
 pub async fn close_fact(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -142,7 +151,8 @@ pub async fn close_fact(
     Json(body): Json<CloseFactBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // 归属与状态校验：本 KB 的、未作废、开放区间的事实才可闭合
+    // Ownership and status check: only a fact of this KB, not invalidated, with an open interval
+    // can be closed
     let ok: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM facts
          WHERE id = $1 AND kb_id = $2 AND invalidated_at IS NULL AND valid_to IS NULL",
@@ -156,7 +166,7 @@ pub async fn close_fact(
         return Err(utopia_core::AppError::NotFound.into());
     }
     let snap = fact_snapshot(&state, kb_id, fact_id).await;
-    // 人在界面上选的是一个日期，所以闭合点按日
+    // What a person picks in the UI is a date, so the closing point has day precision
     utopia_store::temporal::close_superseded(&state.pool, fact_id, body.valid_to, "day").await?;
     if let Some(mut d) = snap {
         d["valid_to"] = json!(body.valid_to.to_rfc3339());
@@ -179,12 +189,12 @@ pub async fn close_fact(
 pub struct ConflictBody {
     /// close | keep | reject_new
     pub action: String,
-    /// close 且新事实无起点时必填
+    /// Required when the action is close and the new fact has no start point
     #[serde(default)]
     pub close_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// 时态冲突裁决（S3：自动闭合拿不准的那些）。
+/// Temporal conflict adjudication (S3: the ones automatic closing could not be sure about).
 pub async fn resolve_conflict(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -192,7 +202,7 @@ pub async fn resolve_conflict(
     Json(body): Json<ConflictBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
-    // 快照双方三元组：裁决会作废/改写事实，先抄后动
+    // Snapshot both triples: adjudication invalidates/rewrites facts, so copy before touching
     let snap: Option<ConflictSnapshot> = sqlx::query_as(
         "SELECT os.canonical_name, oo.canonical_name, ns.canonical_name, no_.canonical_name,
                 r.label
@@ -384,7 +394,7 @@ pub struct ManualMergeBody {
     pub target: Uuid,
 }
 
-/// 手动合并（实体面板"Merge into…"入口）。
+/// A manual merge (the entity panel's "Merge into…" entry point).
 pub async fn manual_merge(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -440,7 +450,7 @@ fn default_history_per() -> i64 {
     20
 }
 
-/// 决策台账：review 域的审计事件，服务端分页。
+/// The decision ledger: audit events in the review domain, paginated on the server.
 pub async fn history(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -461,11 +471,12 @@ pub struct DecideMappingReq {
     pub status: String,
 }
 
-/// 对一条语义层映射表态（0011）。
+/// Take a position on one semantic-layer mapping (0011).
 ///
-/// **改状态不删行**：确认发生过、拒绝也发生过。而拒绝留痕当下就有用——
-/// 下一轮探索会再次算出被拒绝过的那条，`propose` 的 `WHERE status = 'proposed'`
-/// 据此不把它刷回待看。
+/// **The status changes, the row is not deleted**: a confirmation happened, and so did a
+/// rejection. And keeping a trace of a rejection pays off immediately -- the next round of
+/// exploration computes the rejected one again, and `propose`'s `WHERE status = 'proposed'`
+/// uses that to keep it from being pushed back into the to-look-at pile.
 pub async fn decide_mapping(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -499,23 +510,28 @@ pub async fn decide_mapping(
 pub struct DecideViolationReq {
     /// fact_retracted | fact_closed | axiom_relaxed | accepted
     pub resolution: String,
-    /// `fact_closed` 必填：旧断言在哪一天结束
+    /// Required for `fact_closed`: which day the old assertion ends
     #[serde(default)]
     pub close_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// `fact_retracted` 时撤哪条：双事实与环上的违规必填，单事实的可省（#202）
+    /// Which one to retract for `fact_retracted`: required for two-fact and cycle violations,
+    /// omittable for the single-fact ones (#202)
     #[serde(default)]
     pub fact_id: Option<Uuid>,
 }
 
-/// 人裁决一处公理违规。
+/// A human adjudicates one axiom violation.
 ///
-/// **三个出路而不是两个。** `axiom_relaxed` 是这一档独有的：矛盾可能出在定义
-/// 而不是数据——用户导的本体把某个属性声明成反对称，而他自己的语料里那关系
-/// 其实双向。这时该改的是本体，不是二十条事实。
+/// **Three ways out, not two.** `axiom_relaxed` is unique to this queue: the contradiction may
+/// lie in the definition rather than in the data -- the ontology the user imported declares some
+/// property antisymmetric while in their own corpus that relation really is bidirectional. What
+/// should change then is the ontology, not twenty facts.
 ///
-/// **「数据错了」真的撤事实**（#202）：此前只记决定，事实照样活在图里，而队列又
-/// 不再提它。撤哪条由请求指名（`fact_id`），单事实的种类可省；撤完重算一遍检查，
-/// 那条事实牵连的其它违规一并清掉。改公理仍然走本体页——那是另一个页面的事。
+/// **"The data is wrong" really does retract the fact** (#202): before, only the decision was
+/// recorded, the fact went on living in the graph, and the queue stopped mentioning it. Which one
+/// to retract is named by the request (`fact_id`), and may be omitted for the single-fact kinds;
+/// after the retraction the check is recomputed, clearing the other violations that fact was
+/// tangled up in. Changing an axiom still goes through the ontology page -- that is another
+/// page's business.
 pub async fn decide_violation(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -529,7 +545,7 @@ pub async fn decide_violation(
     ) {
         return Err(utopia_core::AppError::invalid(
             "bad_resolution",
-            "resolution 只能是 fact_retracted、fact_closed、axiom_relaxed 或 accepted",
+            "resolution must be one of fact_retracted, fact_closed, axiom_relaxed, accepted",
         )
         .into());
     }
@@ -546,7 +562,8 @@ pub async fn decide_violation(
         return Err(utopia_core::AppError::NotFound.into());
     };
     let repaired = kind == "derived_contradiction";
-    // 撤事实的那条路自己会把违规标成 resolved；其余出路在下面统一记
+    // The retract-the-fact path marks the violation resolved itself; the other ways out are all
+    // recorded together below
     let mut decided = false;
     match (repaired, req.resolution.as_str()) {
         (_, "fact_retracted") => {
@@ -555,7 +572,7 @@ pub async fn decide_violation(
             else {
                 return Err(utopia_core::AppError::invalid(
                     "fact_required",
-                    "这处违规涉及多条事实，要说撤哪一条，且只能是它列出的那几条",
+                    "several facts are involved: name which one to retract, from those listed",
                 )
                 .into());
             };
@@ -586,7 +603,7 @@ pub async fn decide_violation(
             let Some(at) = req.close_at else {
                 return Err(utopia_core::AppError::invalid(
                     "close_at_required",
-                    "fact_closed 要给出结束日期",
+                    "fact_closed requires an end date",
                 )
                 .into());
             };
@@ -601,7 +618,7 @@ pub async fn decide_violation(
             if open.is_none() {
                 return Err(utopia_core::AppError::invalid(
                     "not_open",
-                    "这条断言已有结束日期，或已被撤",
+                    "this assertion already has an end date, or has been retracted",
                 )
                 .into());
             }
@@ -624,7 +641,7 @@ pub async fn decide_violation(
         (false, "fact_closed") => {
             return Err(utopia_core::AppError::invalid(
                 "bad_resolution",
-                "fact_closed 只用于 derived_contradiction",
+                "fact_closed is only for derived_contradiction",
             )
             .into());
         }
@@ -634,12 +651,14 @@ pub async fn decide_violation(
         utopia_store::reasoning::decide(&state.pool, kb_id, violation_id, &req.resolution, user.id)
             .await?;
     }
-    // 路清了就让派生落地，人不必再去点一次「推一遍」。撤与闭合把断言挪开了，
-    // 认可则在 materialize 里放行
+    // Once the path is clear, let the derivations land so nobody has to go and click "derive
+    // again". Retracting and closing move the assertion out of the way; accepting is let through
+    // inside materialize
     if repaired {
         utopia_store::reasoning::materialize(&state.pool, kb_id).await?;
     }
-    // 撤掉的事实可能还挂在别的违规里：重算一遍，那些行随之清掉，队列不留死账
+    // A retracted fact may still be hanging off other violations: recompute, and those rows get
+    // cleared with it, so the queue keeps no dead entries
     if req.resolution == "fact_retracted" {
         utopia_store::reasoning::run(&state.pool, kb_id).await?;
     }
@@ -657,14 +676,16 @@ pub async fn decide_violation(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 手动跑一遍一致性检查。
+/// Run the consistency check once, by hand.
 ///
-/// **同步跑而不是排任务**：这是纯计算，没有模型调用也没有网络——一个几万条
-/// 事实的库跑下来是毫秒级。排进任务队列只会让人点完按钮盯着一个"排队中"，
-/// 而队列真正要解决的是"这活儿要跑几分钟"。
+/// **Runs synchronously rather than as a queued job**: this is pure computation, with no model
+/// calls and no network -- a KB with tens of thousands of facts runs through in milliseconds.
+/// Putting it in the job queue would only leave someone staring at a "queued" after clicking the
+/// button, while what the queue really exists to solve is "this work takes minutes".
 ///
-/// `predicates_with_axioms` 一并回给前端：**零和零的含义不同**。没有公理时
-/// 结论是"没有判据"，界面该说"先导一份带公理的本体"，而不是"未发现矛盾"。
+/// `predicates_with_axioms` goes back to the front end along with it: **zero and zero do not mean
+/// the same thing**. With no axioms the conclusion is "there is nothing to judge by", and the UI
+/// should say "import an ontology with axioms first", not "no contradictions found".
 pub async fn run_consistency_check(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -672,8 +693,9 @@ pub async fn run_consistency_check(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Editor).await?;
     let report = utopia_store::reasoning::run(&state.pool, kb_id).await?;
-    // 本体自洽性一并算。两者判据同源（都是本体声明的公理），分两个按钮
-    // 只会让人点两次
+    // Ontology self-consistency is computed along with it. Both tests come from the same source
+    // (the axioms the ontology declares), and two separate buttons would only make people click
+    // twice
     let onto = utopia_store::reasoning::check_ontology(&state.pool, kb_id).await?;
     let _ = utopia_store::audit::record(
         &state.pool,
@@ -699,8 +721,9 @@ pub async fn run_consistency_check(
         "found": report.found,
         "inserted": report.inserted,
         "cleared": report.cleared,
-        // 本体自己那一档单独回。**不加进 found**：两个数不是一类东西，
-        // 加起来之后「3 处矛盾」既可能是三条事实抵触，也可能是本体自己写反了三处
+        // The ontology's own queue comes back on its own. **Not folded into found**: the two
+        // numbers are not the same kind of thing, and once added up, "3 contradictions" could be
+        // three facts clashing or the ontology itself written backwards in three places
         "classes": onto.classes,
         "defects_found": onto.found,
         "defects_new": onto.inserted,
@@ -713,9 +736,10 @@ pub struct DecideDefectReq {
     pub resolution: String,
 }
 
-/// 人对一处本体缺陷表态。
+/// A human takes a position on one ontology defect.
 ///
-/// **两个出路而不是三个**：本体缺陷压根没看数据，所以没有「数据错了」这一条。
+/// **Two ways out, not three**: an ontology defect never looked at the data at all, so there is
+/// no "the data is wrong" option here.
 pub async fn decide_defect(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -726,7 +750,7 @@ pub async fn decide_defect(
     if !matches!(req.resolution.as_str(), "fixed" | "accepted") {
         return Err(utopia_core::AppError::invalid(
             "bad_resolution",
-            "resolution 只能是 fixed 或 accepted",
+            "resolution must be either fixed or accepted",
         )
         .into());
     }
@@ -746,20 +770,25 @@ pub async fn decide_defect(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 跑一遍推理（R1）。
+/// Run inference once (R1).
 ///
-/// **受 `materialize_inferences` 开关约束。** 默认关，因为这一步往图里加东西，
-/// 而 0001 判据 2 说「本体是引导不是执法」——声明可能是错的，不该在用户没表态时
-/// 就按它改图。开关关着时不静默跳过：回一个明确的错，界面才说得出为什么没动。
+/// **Gated by the `materialize_inferences` switch.** Off by default, because this step adds
+/// things to the graph, while criterion 2 of 0001 says "the ontology guides, it does not
+/// enforce" -- a declaration may be wrong, and the graph should not be changed by it while the
+/// user has taken no position. When the switch is off we do not silently skip: an explicit error
+/// comes back, so the UI can say why nothing happened.
 ///
-/// 同步跑，与一致性检查同一个理由：纯计算，没有模型调用也没有网络。
+/// Runs synchronously, for the same reason as the consistency check: pure computation, no model
+/// calls and no network.
 #[derive(Deserialize)]
 pub struct PendingQuery {
     pub chunk_id: Uuid,
 }
 
-/// 一句记忆抽出的全部待确认项——对话里那张确认卡按这个取（0015）。
-/// Viewer 也能看：看得见提议、看不见按钮，与 Review 页同一口径
+/// All the pending items extracted from one remembered sentence -- the confirmation card in the
+/// chat fetches by this (0015).
+/// A viewer can see it too: the proposals are visible, the buttons are not, the same convention
+/// as the Review page
 pub async fn pending_for_chunk(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -773,15 +802,18 @@ pub async fn pending_for_chunk(
 
 #[derive(Deserialize)]
 pub struct DecidePendingBody {
-    /// `confirm` 进账本；`reject` 记进 `rejected_facts`，下一轮重抽不再提
+    /// `confirm` goes into the ledger; `reject` is recorded in `rejected_facts`, so the next
+    /// round of re-extraction does not bring it up again
     pub action: String,
 }
 
-/// 人对一条待确认事实点头或摇头。
+/// A human nods or shakes their head at one pending fact.
 ///
-/// 两个动作都进决策台账，快照自包含——行删了之后台账上还读得出当时确认的是什么。
-/// 确认走与抽取相同的那条路（事实 + 证据 + 时态对账），所以一句「Mira 交给 Devin 了」
-/// 点头之后，Mira 那条会像从文档里抽出来时一样被闭合
+/// Both actions go into the decision ledger with self-contained snapshots -- once the row is
+/// deleted, the ledger still reads back what it was that got confirmed at the time.
+/// Confirming goes down the same path as extraction (fact + evidence + temporal reconciliation),
+/// so after nodding at a sentence like "Mira handed it over to Devin", Mira's row gets closed
+/// exactly as it would have been when extracted from a document
 pub async fn decide_pending(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

@@ -1,5 +1,6 @@
-//! utopia-ingest: 解析矩阵 + 分块。
-//! 原则：文本层 Rust 原生解决（快、零依赖）；扫描件/复杂版式后续走 docling sidecar。
+//! utopia-ingest: the parsing matrix + chunking.
+//! Principle: solve the text layer natively in Rust (fast, zero dependencies); scans and
+//! complex layouts go through a docling sidecar later.
 
 mod chunker;
 pub mod ontology_rdf;
@@ -7,13 +8,13 @@ mod parsers;
 
 pub use chunker::{chunk_text, ChunkPiece};
 
-/// 解析产物：纯文本 + 可选结构信息。
+/// Parse output: plain text + optional structural info.
 #[derive(Debug)]
 pub struct ParsedDoc {
     pub text: String,
 }
 
-/// 支持的格式（P1）：pdf / docx / xlsx·xls·ods / pptx / md / txt / html / csv / json / yaml / xml / log
+/// Supported formats (P1): pdf / docx / xlsx·xls·ods / pptx / md / txt / html / csv / json / yaml / xml / log
 pub fn parse(filename: &str, bytes: &[u8]) -> anyhow::Result<ParsedDoc> {
     let ext = filename
         .rsplit('.')
@@ -21,7 +22,7 @@ pub fn parse(filename: &str, bytes: &[u8]) -> anyhow::Result<ParsedDoc> {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // 魔数探测优先于扩展名（扩展名可能撒谎）
+    // Magic-number sniffing wins over the extension (extensions can lie)
     let kind = infer::get(bytes).map(|t| t.extension()).unwrap_or("");
 
     let text = match (kind, ext.as_str()) {
@@ -31,7 +32,8 @@ pub fn parse(filename: &str, bytes: &[u8]) -> anyhow::Result<ParsedDoc> {
         ("pptx", _) | (_, "pptx") => parsers::pptx(bytes)?,
         (_, "html") | (_, "htm") => parsers::html(bytes),
         (_, "csv") | (_, "tsv") => parsers::csv_text(bytes, ext == "tsv")?,
-        // md/json/yaml/xml/log/txt 及一切未识别格式：按文本解码（编码探测覆盖 GBK 等）
+        // md/json/yaml/xml/log/txt and every unrecognized format: decode as text
+        // (encoding sniffing covers GBK and friends)
         _ => parsers::plain_text(bytes),
     };
 
@@ -42,7 +44,7 @@ pub fn parse(filename: &str, bytes: &[u8]) -> anyhow::Result<ParsedDoc> {
     Ok(ParsedDoc { text })
 }
 
-/// 压缩连续空白行，统一换行符。
+/// Collapse runs of blank lines, normalize line endings.
 fn normalize(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut blank_run = 0;

@@ -1,22 +1,28 @@
-//! 本体声明的公理要真的落到库里——打在真库上。
+//! The axioms an ontology declares have to really land in the database -- run against a real
+//! one.
 //!
-//! 这条防线的由来是一个既存缺陷:`create_relation_types_bulk` 的文档写着
-//! 「`functional` / `inverse_functional` 必须照词汇表写下去,不能默认 false」,
-//! 而它的 SQL 里是硬编码的 `FALSE, FALSE`——两个数组绑定了却没进 `UNNEST`。
-//! 实测装 FOAF(声明了 17 条 FunctionalProperty)之后,库里 functional 为真的
-//! **一条都没有**。
+//! This line of defence comes from a defect that was already there: the docs on
+//! `create_relation_types_bulk` said "`functional` / `inverse_functional` must be written down
+//! the way the vocabulary has them, they must not default to false", while its SQL hard-coded
+//! `FALSE, FALSE` -- the two arrays were bound but never made it into the `UNNEST`. Measured:
+//! after installing FOAF (which declares 17 FunctionalProperty entries), the rows in the
+//! database with functional true numbered **exactly zero**.
 //!
-//! 那两位是时态引擎自动闭合事实的依据。写错的方向不同,后果也不同:标错成真
-//! 会成批造假冲突(`part_of` 那次 59 条),而这次是反方向——该为真的全成了假,
-//! 于是**该检测出的时态冲突一条都检测不到**,静悄悄地。
+//! Those two flags are what the temporal engine uses to close facts automatically. Getting them
+//! wrong in either direction has different consequences: marking them true by mistake
+//! manufactures conflicts in bulk (59 of them that time with `part_of`), while this was the
+//! opposite direction -- everything that should have been true came out false, so **not one of
+//! the temporal conflicts that should have been detected was**, silently.
 //!
-//! `cargo check` 看不见这种错(类型全对),单元测试也看不见(它在 SQL 字符串里)。
-//! 只有把一行真的写进去再读回来才行。
+//! `cargo check` cannot see this kind of mistake (the types are all correct), and a unit test
+//! cannot either (it lives inside a SQL string). The only thing that works is really writing a
+//! row and reading it back.
 
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// 造一个最小的库:公理落库跟本体大小无关,一条就够。
+/// Build the smallest possible base: whether axioms land in the database has nothing to do
+/// with the size of the ontology, one row is enough.
 async fn kb(pool: &PgPool) -> anyhow::Result<(Uuid, Uuid)> {
     let (org, ws, kb) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
     sqlx::query("INSERT INTO organizations (id, name) VALUES ($1, 'ax-test')")
@@ -61,7 +67,8 @@ async fn every_axiom_survives_the_bulk_insert() -> anyhow::Result<()> {
                 irreflexive: r,
             }
         };
-        // 一条全真、一条全假：全假那条守的是"没声明的不该被写成真"
+        // One row all true, one all false: the all-false row guards "what was not declared
+        // must not be written as true"
         utopia_store::ontology::create_relation_types_bulk(
             &pool,
             kb_id,
@@ -84,18 +91,18 @@ async fn every_axiom_survives_the_bulk_insert() -> anyhow::Result<()> {
         let t = got
             .iter()
             .find(|r| r.0 == "all_true")
-            .expect("all_true 落库");
+            .expect("all_true landed in the database");
         assert!(
             t.1 && t.2 && t.3 && t.4 && t.5 && t.6,
-            "六个公理位都该照写下去，实得 {t:?}"
+            "all six axiom flags should be written down as given, got {t:?}"
         );
         let f = got
             .iter()
             .find(|r| r.0 == "all_false")
-            .expect("all_false 落库");
+            .expect("all_false landed in the database");
         assert!(
             !f.1 && !f.2 && !f.3 && !f.4 && !f.5 && !f.6,
-            "没声明的公理不该凭空为真，实得 {f:?}"
+            "an axiom that was not declared must not come out true from nowhere, got {f:?}"
         );
         Ok::<_, anyhow::Error>(())
     }

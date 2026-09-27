@@ -1,5 +1,5 @@
-//! utopia-store: sqlx 仓储、迁移、任务队列。
-//! 全部使用运行时查询（非编译期宏），构建无需数据库。
+//! utopia-store: sqlx repositories, migrations, job queue.
+//! Everything uses runtime queries (not the compile-time macros), so the build needs no database.
 
 pub mod access;
 pub mod accounts;

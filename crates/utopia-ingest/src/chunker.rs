@@ -1,4 +1,5 @@
-//! 分块：text-splitter 语义分块（段落/句子边界优先），字符预算 + 重叠。
+//! Chunking: text-splitter semantic chunking (paragraph and sentence boundaries first),
+//! character budget + overlap.
 
 use text_splitter::{ChunkConfig, TextSplitter};
 
@@ -10,7 +11,7 @@ pub struct ChunkPiece {
     pub char_end: i32,
 }
 
-/// 默认预算：1200 字符（中文约等于 1000+ token），重叠 150。
+/// Default budget: 1200 characters (roughly 1000+ tokens for Chinese), overlap 150.
 pub fn chunk_text(text: &str) -> Vec<ChunkPiece> {
     let config = ChunkConfig::new(1200)
         .with_overlap(150)

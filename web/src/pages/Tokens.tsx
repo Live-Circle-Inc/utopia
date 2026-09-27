@@ -1,9 +1,12 @@
-/* 个人访问令牌页（docs/decisions/0014，0016 的 A2）。
-   令牌属于人、以人的身份行事：有效权限 = 角色 ∩ scope，`kb_ids` 只收窄不授权。
-   服务端三个端点早就在（发放 / 列表 / 撤销），缺的只是这一页——没有它，
-   MCP 对用户就是「有 API、配不了」。
-   明文只在发放那一次的响应里出现，所以这一页的重心是那一刻：把令牌和一段可复制的
-   客户端配置一起端出来，人复制完点「完成」，之后列表里只剩前缀。 */
+/* The personal access token page (docs/decisions/0014, A2 of 0016).
+   A token belongs to a person and acts as that person: effective permissions = role ∩ scope, and
+   `kb_ids` only narrows, it never grants.
+   The three server endpoints have been there all along (issue / list / revoke); the only thing
+   missing was this page -- without it, MCP is "there's an API, you just can't configure it" as far
+   as the user is concerned.
+   The plaintext appears only in the response to that one issue call, so the weight of this page is
+   on that moment: serve the token together with a copyable client configuration, the person copies
+   it and clicks "Done", and after that the list holds nothing but the prefix. */
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, KeyRound } from "lucide-react";
@@ -23,8 +26,9 @@ function copyText(text: string) {
     .catch(() => {});
 }
 
-/** Claude Code / Claude Desktop 一族的 Streamable HTTP 写法。每个库一个端点（0014：
- *  令牌限定到库，端点也按库分），所以片段里要把库选出来 */
+/** The Streamable HTTP form the Claude Code / Claude Desktop family uses. One endpoint per base
+ *  (0014: tokens are scoped to bases, so the endpoints are split per base too), which is why the
+ *  snippet has to pick a base out */
 function mcpSnippet(kbId: string, kbName: string, token: string): string {
   const slug = kbName
     .toLowerCase()
@@ -59,7 +63,7 @@ function CopyButton({ text, small }: { text: string; small?: boolean }) {
   );
 }
 
-/** 刚发出来的那一枚：明文 + 配置片段，关掉就再也看不到 */
+/** The one just issued: plaintext + config snippet; close it and it is never visible again */
 function IssuedPanel({
   token,
   info,
@@ -71,7 +75,8 @@ function IssuedPanel({
   kbs: { id: string; name: string }[];
   onDone: () => void;
 }) {
-  // 片段默认指向令牌限定的第一个库；没限定就取列表第一个
+  // the snippet points by default at the first base the token is scoped to; if it is not scoped,
+  // take the first in the list
   const candidates = info.kb_ids?.length
     ? kbs.filter((k) => info.kb_ids!.includes(k.id))
     : kbs;
@@ -138,7 +143,8 @@ function TokenRow({
   busy: boolean;
   onRevoke: () => void;
 }) {
-  // 撤销不可撤回，但代价只是重发一枚——轻确认（二次点击），不做打字解锁
+  // revoking cannot be undone, but the cost is only issuing another one -- a light confirmation
+  // (a second click), no type-to-unlock
   const [arm, setArm] = useState(false);
   const revoked = !!t.revoked_at;
   const bases = t.kb_ids?.length
@@ -233,7 +239,8 @@ export function Tokens() {
   }, [kbs]);
 
   if (list.isPending) return <Loading>{S.nav.loading}</Loading>;
-  // 活的在前、按新到旧；撤销过的沉底但仍然列着——撤过这件事本身要看得见
+  // live ones first, newest to oldest; revoked ones sink to the bottom but stay listed -- the
+  // fact that something was revoked has to be visible itself
   const rows = [...(list.data?.tokens ?? [])].sort((a, b) => {
     if (!!a.revoked_at !== !!b.revoked_at) return a.revoked_at ? 1 : -1;
     return b.created_at.localeCompare(a.created_at);

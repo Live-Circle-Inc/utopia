@@ -1,12 +1,18 @@
-//! 实体消解 v2：同名≠同人（流程图与三次实测修洞见 `docs/pipeline.md` 第二节）。
+//! Entity resolution v2: same name ≠ same person (flow chart and three rounds of measured
+//! hole-patching in `docs/pipeline.md`, section two).
 //!
-//! 漏斗：名字候选召回（免费，含泛用后缀词干互推）→ 画像向量相似度分层（毫秒，复用摄入阶段的 chunk embedding）
-//! → 灰区新建实体 + 疑似重复审核项（宁分勿合），LLM 攒批裁决在独立后台任务里跑，
-//! 人工终审兜底。LLM 永远不在抽取写入的关键路径上。
+//! The funnel: name candidate recall (free, includes mutual inference through generic-suffix stems)
+//! → profile vector similarity tiering (milliseconds, reuses the chunk embedding from the ingest
+//! stage) → in the grey zone create a new entity + a suspected-duplicate review item (rather
+//! split than wrongly merge); batched LLM adjudication runs in a separate background task, with
+//! human final review as the backstop. The LLM is never on the critical path of an extraction
+//! write.
 //!
-//! 类型漂移：同名在同类型下无候选时再查其它类型（同一团队被抽成 organization/
-//! project/concept 是常态），按类型对的互斥强度分流——concept 兜底型当召回候选走
-//! 画像分层，易混具体类型照建实体但入队审核对，硬互斥（person vs organization）完全分开。
+//! Type drift: when a name has no candidate under the same type, look under the other types (the
+//! same team getting extracted as organization/project/concept is the norm) and route by how
+//! strongly the type pair is disjoint -- the concept fallback type becomes a recall candidate and
+//! goes through profile tiering, confusable concrete types still get their entity created but a
+//! review pair enqueued, and hard-disjoint pairs (person vs organization) stay entirely apart.
 
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
@@ -16,13 +22,15 @@ use utopia_core::models::{MergeLogView, ReviewItem, ReviewSide};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
-/// 上下文相似度阈值（bge-m3 类模型余弦相似度经验值，后续可调）。
-/// ≥ ATTACH 归并到既有实体；< NEW 判为不同实体；中间灰区宁分勿合 + 审核项。
+/// Context similarity thresholds (empirical cosine values for bge-m3 class models, tunable later).
+/// ≥ ATTACH attaches to the existing entity; < NEW is judged a different entity; the grey zone in
+/// between splits rather than merges + files a review item.
 pub const SIM_ATTACH: f32 = 0.55;
 pub const SIM_NEW: f32 = 0.35;
 
-/// 名称规范化：全角 ASCII → 半角、全角空格 → 半角、空白折叠。
-/// 返回展示形态（保留大小写）；匹配一律再套 SQL lower()。
+/// Name normalization: full-width ASCII → half-width, ideographic space → plain space, and
+/// whitespace collapsed.
+/// Returns the display form (case preserved); matching always wraps it in SQL lower() anyway.
 pub fn normalize_name(raw: &str) -> String {
     let mapped: String = raw
         .chars()
@@ -35,13 +43,15 @@ pub fn normalize_name(raw: &str) -> String {
     mapped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// 泛用后缀词表：中文直接拼在词干后；英文按独立词算、首尾两种语序都认
-/// （"Phoenix Project" / "Project Phoenix"）。只影响召回，判定仍走画像相似度。
+/// Generic suffix lists: Chinese suffixes attach straight onto the stem; English ones count as
+/// standalone words and both orders are accepted ("Phoenix Project" / "Project Phoenix"). This
+/// only affects recall; the decision still goes through profile similarity.
 const GENERIC_SUFFIXES_CJK: &[&str] = &["项目", "公司", "集团", "部门", "团队"];
 const GENERIC_WORDS_EN: &[&str] = &["project", "corp", "inc", "team"];
 
-/// 词干：剥去一个泛用后缀后的 lower 形态。未命中、剥空、或词干本身就是
-/// 泛用词（"项目团队"）时返回 None。输入应已过 normalize_name。
+/// Stem: the lowercased form left after stripping one generic suffix. Returns None when nothing
+/// matches, when stripping leaves nothing, or when the stem is itself a generic word
+/// ("项目团队"). The input should already have been through normalize_name.
 pub fn name_stem(name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     let strip_punct = |w: &str| w.trim_end_matches(['.', ',']).to_string();
@@ -74,9 +84,11 @@ pub fn name_stem(name: &str) -> Option<String> {
     None
 }
 
-/// mention 的召回键集合（全 lower）：本名 + 词干 + 词干的泛用后缀增广。
-/// 增广覆盖反方向（库内是"星尘项目"、mention 只说"星尘"）；词干含 CJK 拼中文
-/// 尾缀，否则拼英文词（两种语序）。键数 ≤10，走 (kb,type,lower(name)) 索引多点查。
+/// The recall key set for a mention (all lowercased): the name itself + its stem + the stem
+/// augmented with generic suffixes. The augmentation covers the reverse direction (the store holds
+/// "星尘项目" while the mention only says "星尘"); if the stem contains CJK we append Chinese
+/// suffixes, otherwise English words (in both orders). At most 10 keys, served as a multi-point
+/// lookup on the (kb,type,lower(name)) index.
 pub fn recall_keys(name: &str) -> Vec<String> {
     let lower = name.to_lowercase();
     let base = name_stem(name).unwrap_or_else(|| lower.clone());
@@ -101,52 +113,65 @@ pub fn recall_keys(name: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// 类型漂移：同名实体被抽成了不同类型（"Orion platform team" ↔ organization/project）
+// Type drift: same-name entities got extracted under different types ("Orion platform team" ↔
+// organization/project)
 // ---------------------------------------------------------------------------
 
-/// 易混具体类型：抽取常在这几类间摇摆（一个团队算组织还是项目？平台算项目还是产品？）。
-/// 同名跨这组类型 → 照建实体（宁分勿合），但入队审核对交 LLM/人工裁决。
+/// Confusable concrete types: extraction keeps wavering between these (is a team an organization
+/// or a project? is a platform a project or a product?).
+/// A shared name across this set of types → create the entity anyway (rather split than wrongly
+/// merge), but enqueue a review pair for LLM/human adjudication.
 ///
-/// **本体说了算，这张表只是没声明时的退路。** 判两个类能不能指同一个东西，先看
-/// `owl:disjointWith`（`entity_type_disjoint`，含继承：Person ⟂ Organization 就让
-/// Corporation ⟂ Person）——声明了互斥的一律分开，哪怕它们在类层级上是一家；
-/// 没声明的再看类层级（同一支系当易混，#226），最后才是这三个硬 key。
-/// 没装包也没声明的库里这三个 key 不存在，于是所有跨类型同名判 `Disjoint`——
-/// 变严不变松，不会错合（0016 B3）
+/// **The ontology has the last word; this table is only the fallback when nothing is declared.**
+/// To judge whether two classes can refer to the same thing, look first at `owl:disjointWith`
+/// (`entity_type_disjoint`, inheritance included: Person ⟂ Organization makes
+/// Corporation ⟂ Person) -- anything declared disjoint is always kept apart, even if the two are
+/// kin in the class hierarchy; for undeclared pairs look at the class hierarchy next (the same
+/// branch counts as confusable, #226), and only then at these three hard keys.
+/// In a knowledge base with no package installed and nothing declared these three keys do not
+/// exist, so every cross-type name match is judged `Disjoint` -- stricter, never looser, so it
+/// cannot merge wrongly (0016 B3)
 pub const CONFUSABLE_TYPE_KEYS: &[&str] = &["organization", "project", "product"];
 
-/// 单次消解最多入队的漂移审核对（防同名大组刷爆审核队列）。
+/// Most drift review pairs a single resolution may enqueue (keeps a big same-name group from
+/// flooding the review queue).
 const MAX_DRIFT_REVIEWS: usize = 4;
 
-/// 跨类型同名的处置分类。
+/// How a cross-type name match gets handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeDrift {
-    /// 一侧是兜底类型：当召回候选，走画像相似度分层（可 ATTACH）
+    /// One side is a fallback type: treat as a recall candidate and run profile similarity
+    /// tiering (an ATTACH is possible)
     Recall,
-    /// 两个易混具体类型：新建 + 审核对
+    /// Two confusable concrete types: create a new entity + a review pair
     Review,
-    /// 硬互斥（person vs organization 等，含未知自定义类型）：完全分开
+    /// Hard disjoint (person vs organization and the like, including unknown custom types):
+    /// entirely apart
     Disjoint,
 }
 
 fn classify_type_drift(a: Option<&str>, b: Option<&str>) -> TypeDrift {
-    // **同一个类型当然可能是同一个东西。**
+    // **Two things of the same type can of course be the same thing.**
     //
-    // 这一档原本不存在，因为这个函数生来只服务"类型漂移"——同名被抽成两种
-    // 类型——那里两边相同根本不会发生。后来 containment_reviews 借它当相容性
-    // 判据，而那里**两边相同才是最常见的情形**，于是 person 对 person 落进了
-    // 最后那行 Disjoint，被读成"永不可能是同一个东西"。
+    // This arm did not exist originally, because the function was born to serve "type drift"
+    // alone -- one name extracted under two types -- and there both sides being equal simply
+    // cannot happen. Later containment_reviews borrowed it as a compatibility test, and there
+    // **both sides being equal is the most common case**, so person against person fell through
+    // to that last Disjoint line and was read as "can never be the same thing".
     //
-    // 代价是全文最明显的同指关系一对都进不了队列：福尔摩斯前六篇里
-    // Sherlock Holmes 与 Holmes 是两个实体，488 个实体只合并掉 14 个。
-    // 原有的 12 个单元测试全在测跨类型，一个都没测相同类型。
+    // The price was that not one of the most obvious coreference pairs in the text made it into
+    // the queue: across the first six Holmes stories, Sherlock Holmes and Holmes were two
+    // entities, and out of 488 entities only 14 got merged.
+    // All 12 of the existing unit tests were testing cross-type pairs; not one tested the same
+    // type.
     if a == b {
         return TypeDrift::Recall;
     }
-    // **一侧还没判出来** → 当召回候选，走画像相似度分层。
-    // 从前比的是 `== FALLBACK_TYPE_KEY`，那个 key 已经没有了：
-    // 「还没判出来」现在由 `None` 表达（0009）。两边都是 None
-    // 已经被上面 `a == b` 那行接住
+    // **One side has not been determined yet** → treat as a recall candidate and run profile
+    // similarity tiering.
+    // This used to compare `== FALLBACK_TYPE_KEY`; that key is gone now:
+    // "not determined yet" is expressed by `None` these days (0009). Both sides
+    // being None is already caught by the `a == b` line above
     let (Some(a), Some(b)) = (a, b) else {
         return TypeDrift::Recall;
     };
@@ -180,8 +205,9 @@ struct Candidate {
     degree: i64,
 }
 
-/// 消解结果：mention 落到了哪个实体；附带需要入队的疑似重复审核对
-/// （同名灰区 / 类型漂移），由调用方写入审核队列并触发裁决任务。
+/// Resolution result: which entity the mention landed on, plus the suspected-duplicate review
+/// pairs that need enqueuing (same-name grey zone / type drift); the caller writes them into the
+/// review queue and kicks off the adjudication task.
 #[derive(Debug)]
 pub struct Resolution {
     pub entity_id: Uuid,
@@ -189,7 +215,7 @@ pub struct Resolution {
     pub reviews: Vec<ReviewRequest>,
 }
 
-/// 待入队的审核对：`Resolution::entity_id` vs `other_id`。
+/// A review pair waiting to be enqueued: `Resolution::entity_id` vs `other_id`.
 #[derive(Debug)]
 pub struct ReviewRequest {
     pub other_id: Uuid,
@@ -197,19 +223,22 @@ pub struct ReviewRequest {
     pub reason: String,
 }
 
-/// 单条 mention 消解。`context` 为 mention 所在分块的向量（无 embedding 模型时为 None，
-/// 退化为 v1 行为：同名归并到事实最多的候选）。
+/// Resolve a single mention. `context` is the vector of the chunk the mention sits in (None when
+/// there is no embedding model, which degrades to v1 behavior: a name match attaches to the
+/// candidate with the most facts).
 pub async fn resolve_mention(
     pool: &PgPool,
     kb_id: Uuid,
-    // None = 抽取器给的类型不在本体里，或库里根本没有类（0009）
+    // None = the extractor's type is not in the ontology, or the KB has no classes at all (0009)
     type_id: Option<Uuid>,
     raw_name: &str,
     context: Option<&[f32]>,
 ) -> AppResult<Resolution> {
     let name = normalize_name(raw_name);
-    // 召回键 = 本名 + 泛用后缀词干及其增广（"星尘"↔"星尘项目"互为候选）。
-    // 只扩召回，归并与否仍由下方画像相似度分层定夺。
+    // Recall keys = the name itself + the generic-suffix stem and its augmentations
+    // ("星尘" ↔ "星尘项目" become candidates for each other).
+    // This only widens recall; whether to merge is still settled by the profile similarity
+    // tiering below.
     let keys = recall_keys(&name);
     let candidates: Vec<Candidate> = sqlx::query_as(
         "SELECT e.id, e.profile_embedding, e.profile_n,
@@ -228,13 +257,15 @@ pub async fn resolve_mention(
     .await?;
 
     if candidates.is_empty() {
-        // 同类型无候选 ≠ 新名字：类型标签会漂（同一团队被抽成 organization/project/
-        // concept），先查其它类型下的同名实体，按类型对的互斥强度分流。
+        // No candidate under the same type ≠ a new name: type labels drift (the same team gets
+        // extracted as organization/project/concept), so look for same-name entities under the
+        // other types first and route by how disjoint the type pair is.
         return resolve_type_drift(pool, kb_id, type_id, &name, &keys, context).await;
     }
 
     let Some(ctx) = context else {
-        // 无向量可比：v1 兼容 —— 归并到事实最多的同名候选
+        // No vector to compare: v1 compatibility -- attach to the same-name candidate that has
+        // the most facts
         let best = candidates
             .iter()
             .max_by_key(|c| c.degree)
@@ -247,7 +278,8 @@ pub async fn resolve_mention(
         });
     };
 
-    // 有画像的候选算相似度；无画像（历史数据/无 embedding 期创建）单独归类
+    // Candidates with a profile get scored for similarity; the ones without (legacy data, or
+    // created during a period with no embedding model) are bucketed separately
     let mut best_scored: Option<(&Candidate, f32)> = None;
     let mut unprofiled: Option<&Candidate> = None;
     for c in &candidates {
@@ -280,7 +312,8 @@ pub async fn resolve_mention(
         }
     }
     if let Some(c) = unprofiled {
-        // 无画像候选无从判别：v1 兼容归并，并用本次上下文初始化画像
+        // There is no way to judge a profile-less candidate: attach for v1 compatibility, and
+        // initialize its profile from this context
         update_profile(pool, c.id, c.profile_n, ctx).await?;
         return Ok(Resolution {
             entity_id: c.id,
@@ -289,7 +322,8 @@ pub async fn resolve_mention(
         });
     }
 
-    // 走到这里：所有候选都有画像且最高分 < ATTACH → 新建实体（同名不同人）
+    // Reaching here means every candidate has a profile and the top score is < ATTACH → create a
+    // new entity (same name, not the same person)
     let id = create_entity(pool, kb_id, type_id, &name, context).await?;
     refresh_disambiguators(pool, kb_id, &name).await?;
     let mut reviews = best_scored
@@ -302,8 +336,9 @@ pub async fn resolve_mention(
             }]
         })
         .unwrap_or_default();
-    // 名字互相包含的既有实体：等值召回看不见它们（前缀枚举不完），
-    // 于是简称会静默变成第二个实体。只入队，不合并
+    // Existing entities whose names contain each other: equality recall cannot see them (the
+    // prefixes cannot all be enumerated), so a short form silently becomes a second entity.
+    // Enqueue only, never merge
     reviews.extend(containment_reviews(pool, kb_id, type_id, &name, id, context).await?);
     Ok(Resolution {
         entity_id: id,
@@ -312,55 +347,67 @@ pub async fn resolve_mention(
     })
 }
 
-/// 包含关系候选的最短边：两个名字里**较短的那个**至少这么长才算数。
-/// 低于它的多是「研究院」「中心」这类通名，配对没有信息量，只会刷爆队列。
+/// Lower bound for containment candidates: the **shorter** of the two names has to be at least
+/// this long to count. Below that they are mostly generic words like "研究院" or "中心",
+/// where a pairing carries no information at all and only floods the queue.
 const MIN_CONTAIN_CHARS: i32 = 4;
 
-/// 单次最多产出的包含关系审阅对。与 `MAX_DRIFT_REVIEWS` 同理：
-/// 一个通名可能包含在几十个实体里，全放进去就把队列淹了。
+/// Most containment review pairs produced in one pass. Same reasoning as `MAX_DRIFT_REVIEWS`:
+/// one generic word can be contained in dozens of entities, and putting them all in drowns the
+/// queue.
 const MAX_CONTAIN_REVIEWS: usize = 4;
 
-/// SQL 侧多取几行：类型硬互斥的在 Rust 侧才筛得掉，
-/// 只取 4 行的话可能 4 行全是互斥类型，真正那一对反而被 LIMIT 切掉。
+/// Fetch a few extra rows on the SQL side: hard-disjoint types can only be filtered out on the
+/// Rust side, so if we took only 4 rows all 4 could be disjoint types and the pair that actually
+/// mattered would be cut off by the LIMIT.
 const CONTAIN_SCAN_LIMIT: i64 = 16;
 
-/// 新建实体之后，找出**名字互相包含**的既有实体，作为审阅候选。
+/// After creating a new entity, find the existing entities whose **names contain each other** and
+/// offer them as review candidates.
 ///
-/// 中文商业文本在一篇之内就会全称转简称（「星云科技上海研究院」→「上海研究院」），
-/// 而 [`recall_keys`] 是等值查：它靠枚举泛用后缀命中反向，可前缀是任意组织名，
-/// **枚举不完**。于是这三类全部漏网，静默变成第二个实体：
+/// Chinese business text switches from the full name to a short form inside a single document
+/// ("星云科技上海研究院" → "上海研究院"), while [`recall_keys`] is an equality lookup: it hits
+/// the reverse direction by enumerating generic suffixes, but the prefix can be any
+/// organization name, and **there is no enumerating that**. So all three of these slip through
+/// and silently become a second entity:
 ///
 /// ```text
-/// 上海研究院       ⊂ 星云科技上海研究院      后缀被限定
-/// 启明 X7 加速卡   ~ 启明 X7 推理加速卡      中间插词（靠 LIKE 覆盖不到，见下）
-/// 沧海             ⊂ 沧海分布式推理平台 2.0  前缀被扩展
+/// 上海研究院       ⊂ 星云科技上海研究院      suffix gets qualified
+/// 启明 X7 加速卡   ~ 启明 X7 推理加速卡      word inserted mid-name (LIKE misses it, below)
+/// 沧海             ⊂ 沧海分布式推理平台 2.0  prefix gets extended
 /// ```
 ///
-/// **只出候选，永不自动合并。** 同名候选那条路在相似度 ≥ [`SIM_ATTACH`] 时直接归并，
-/// 包含关系绝不能走它：`华瑞集团技术中心` 与 `星云科技技术中心` 都含「技术中心」，
-/// 同一篇文档里上下文相似度很容易过线，而它们是两个部门。宁分勿合。
+/// **Candidates only, never an automatic merge.** The same-name candidate path merges outright
+/// once similarity is ≥ [`SIM_ATTACH`]; containment must never take that road: `华瑞集团技术中心`
+/// and `星云科技技术中心` both contain "技术中心", and inside one document their context
+/// similarity clears the line easily -- yet they are two different departments. Rather split
+/// than merge.
 ///
-/// **别名一并参与**：合并会把名字搬进 `aliases`，只查 `canonical_name` 的话，
-/// 每成功合并一次就少一条召回的桥——`Holmes` 并入 `Sherlock Holmes` 之后，
-/// 后来的 `Mr. Holmes` 就再也搭不上了（它跟 `Sherlock Holmes` 谁也不含谁）。
-/// 合并越成功、漏得越多，是个会自我加剧的洞。
+/// **Aliases take part as well**: merging moves names into `aliases`, so looking only at
+/// `canonical_name` loses one recall bridge with every successful merge -- once `Holmes` has been
+/// merged into `Sherlock Holmes`, a later `Mr. Holmes` can never hook on again (neither it nor
+/// `Sherlock Holmes` contains the other).
+/// The more successful merging is, the more we miss: a hole that aggravates itself.
 ///
-/// **已知不覆盖**：两个名字既不互相包含、又没有共同别名做桥的情形
-///（`启明 X7 加速卡` 与 `启明 X7 推理加速卡`）。那要三元组相似度，而
-/// `CREATE EXTENSION pg_trgm` 需要超级权限——本仓库是受限角色连库（见 `migrations/0010_least_privilege_role.sql`），
-/// 装扩展会在部署上失败。留给需要时再说。
+/// **Known gap**: the case where two names neither contain each other nor share an alias to bridge
+/// them (`启明 X7 加速卡` and `启明 X7 推理加速卡`). That would need trigram similarity,
+/// and `CREATE EXTENSION pg_trgm` requires superuser -- this repo connects to the database with a
+/// restricted role (see `migrations/0010_least_privilege_role.sql`), so installing the extension
+/// would fail on deployment. Left until we actually need it.
 ///
-/// **性能**：反向那半（新名字包含旧名字）用不上任何索引，别名那半同样，
-/// 所以这里靠 `kb_id` 收窄行集并设上限，且只在**新建实体时**跑一次，
-/// 不是每条 mention。大库上如果不够，正解是建一张「后缀键」表走等值查，
-/// 而不是加模糊索引。
-/// 包含扫描的一行：(id, 本名, 类型 key, 类型 id, 画像)。类型 id 用来比本体声明的互斥
+/// **Performance**: the reverse half (the new name containing the old one) cannot use any index,
+/// and the alias half is the same, so this narrows the row set by `kb_id` and caps it, and runs
+/// once **only when a new entity is created**, not for every mention. If that is not enough on a
+/// large knowledge base, the right answer is a "suffix key" table with an equality lookup,
+/// not a fuzzy index.
+/// One row of the containment scan: (id, name, type key, type id, profile). The type id is there to
+/// compare against the disjointness the ontology declares
 type ContainRow = (Uuid, String, Option<String>, Option<Uuid>, Option<Vector>);
 
 async fn containment_reviews(
     pool: &PgPool,
     kb_id: Uuid,
-    // None = 抽取器给的类型不在本体里，或库里根本没有类（0009）
+    // None = the extractor's type is not in the ontology, or the KB has no classes at all (0009)
     type_id: Option<Uuid>,
     name: &str,
     new_id: Uuid,
@@ -370,7 +417,7 @@ async fn containment_reviews(
     if lower.chars().count() < MIN_CONTAIN_CHARS as usize {
         return Ok(Vec::new());
     }
-    // 实体可能还没判出类型（0009），那时没有 key 可查
+    // The entity may not have a type determined yet (0009), and then there is no key to look up
     let mention_key: Option<String> = match type_id {
         Some(t) => sqlx::query_as::<_, (String,)>("SELECT key FROM entity_types WHERE id = $1")
             .bind(t)
@@ -379,14 +426,16 @@ async fn containment_reviews(
             .map(|(k,)| k),
         None => None,
     };
-    // **不按类型过滤**：简称经常掉进 concept 兜底，而全称是具体类型
-    //（实测 上海研究院→concept vs 星云科技上海研究院→organization，
-    //  启明 X7 加速卡→concept vs 启明 X7 推理加速卡→product），
-    //  按类型相等去查，这两对一个都捞不到。相容性交给下面的 classify_type_drift。
-    //  多取一些行，因为硬互斥的会在 Rust 侧被筛掉
-    // 本体声明了跟这个类互斥的那些类（含继承），一次取出，逐行比 id
+    // **No filtering by type**: the short form often falls into the concept fallback while the
+    //  full name gets a concrete type (measured: 上海研究院→concept vs
+    //  星云科技上海研究院→organization, 启明 X7 加速卡→concept vs
+    //  启明 X7 推理加速卡→product), so looking them up by type equality catches neither
+    //  pair. Compatibility is left to classify_type_drift below.
+    //  Take a few extra rows, because the hard-disjoint ones get filtered out on the Rust side
+    // The classes the ontology declares disjoint from this one (inheritance included), fetched in
+    // one go and compared row by row on id
     let disjoint = declared_disjoint_from(pool, kb_id, type_id).await?;
-    // 第三列可空：未分类实体也要参与包含关系扫描（0009）
+    // Third column is nullable: unclassified entities have to join the containment scan too (0009)
     let rows: Vec<ContainRow> = sqlx::query_as(
         "SELECT e.id, e.canonical_name, t.key, e.type_id, e.profile_embedding
          FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id
@@ -397,15 +446,17 @@ async fn containment_reviews(
              (char_length(e.canonical_name) >= $4
               AND (lower(e.canonical_name) LIKE '%' || $3 || '%'
                    OR $3 LIKE '%' || lower(e.canonical_name) || '%'))
-             -- **别名也要参与召回，否则每合并一次就少一条桥。**
+             -- **Aliases have to join recall too, or every merge tears down a bridge.**
              --
-             -- 合并把名字搬进 aliases：Holmes 并入 Sherlock Holmes 之后，
-             -- Holmes 那一行 merged_into 非空、被上面第一个条件滤掉了。可十分钟后
-             -- 出现的 Mr. Holmes 跟 Sherlock Holmes 谁也不含谁——本来正是靠
-             -- Holmes 才桥得上。实测就是这么漏的：同类型那个 bug 修好、Holmes
-             -- 正确合并之后，Mr. Holmes 反而永远进不了队列。
+             -- Merging moves names into aliases: once Holmes is merged into Sherlock Holmes,
+             -- the Holmes row has a non-null merged_into and is filtered out by the first
+             -- condition above. But the Mr. Holmes that shows up ten minutes later contains
+             -- neither Sherlock Holmes nor the other way round -- Holmes was exactly what
+             -- bridged them. That is measurably how it leaked: after the same-type bug was
+             -- fixed and Holmes merged correctly, Mr. Holmes could never get into the queue.
              --
-             -- 合并越成功，桥拆得越多。这个洞会自我加剧。
+             -- The more successful merging is, the more bridges it tears down. This hole
+             -- aggravates itself.
              OR EXISTS (
                SELECT 1 FROM unnest(e.aliases) AS alias
                WHERE char_length(alias) >= $4
@@ -425,9 +476,10 @@ async fn containment_reviews(
 
     Ok(rows
         .into_iter()
-        // 哪些类型对可能指同一个东西，既有规则已经想清楚了，别另发明一套：
-        // 本体声明互斥的永不合并，person vs organization 永不合并，
-        // concept 兜底与谁都可能是一个
+        // Which type pairs can refer to the same thing has already been thought through by the
+        // existing rules; do not invent a second set: what the ontology declares disjoint never
+        // merges, person vs organization never merges, and the concept fallback can be one and
+        // the same as anything
         .filter(|(_, _, type_key, other_type, _)| {
             !other_type.is_some_and(|t| disjoint.contains(&t))
                 && classify_type_drift(mention_key.as_deref(), type_key.as_deref())
@@ -435,8 +487,8 @@ async fn containment_reviews(
         })
         .take(MAX_CONTAIN_REVIEWS)
         .map(|(id, other_name, _, _, emb)| {
-            // 分数只是给队列排序用的参考，**不参与是否合并的判断**——
-            // 那个判断本来就不在这条路上
+            // The score is only a hint for ordering the queue, it **takes no part in deciding
+            // whether to merge** -- that decision was never on this path anyway
             let score = ctx
                 .and_then(|x| emb.as_ref().and_then(|p| cosine(p.as_slice(), x)))
                 .unwrap_or(0.0);
@@ -453,21 +505,24 @@ async fn containment_reviews(
 struct CrossCandidate {
     id: Uuid,
     canonical_name: String,
-    // None = 这个候选还没判出类型（0009）
+    // None = this candidate has no type determined yet (0009)
     type_key: Option<String>,
-    // 同上；`types_are_kin` 要按 id 走类层级
+    // Same as above; `types_are_kin` walks the class hierarchy by id
     type_id: Option<Uuid>,
-    // 抽取升格要看它：人说过「就是没有类型」时，那也是一个决定
+    // Promotion during extraction has to consult this: when a human has said "it simply has no
+    // type", that is a decision too
     type_source: String,
     profile_embedding: Option<Vector>,
     profile_n: i32,
 }
 
-/// `reason` 存 code，措辞归界面（docs/decisions/0004）——这一列不该一半 code
-/// 一半英文句子，那样中文界面上就是一半能翻一半不能。
+/// `reason` stores a code, the wording belongs to the interface (docs/decisions/0004) -- this
+/// column should not be half code and half English sentence, because on a Chinese interface that
+/// comes out half translatable and half not.
 fn drift_reason(mention_key: Option<&str>, other_key: Option<&str>, sim: Option<f32>) -> String {
-    // 未分类的一侧写成 `(untyped)`。这一列存 code 供界面翻译，
-    // 留空会让 `a vs b` 变成 `a vs `，读起来像被截断而不像"没有"
+    // An unclassified side is written as `(untyped)`. This column stores a code for the interface
+    // to translate, and leaving it empty turns `a vs b` into `a vs `, which reads like truncation
+    // rather than "absent"
     let a = mention_key.unwrap_or("(untyped)");
     let b = other_key.unwrap_or("(untyped)");
     match sim {
@@ -476,13 +531,15 @@ fn drift_reason(mention_key: Option<&str>, other_key: Option<&str>, sim: Option<
     }
 }
 
-/// 本体声明了跟这个类互斥的全部类（0016 B3）。
+/// Every class the ontology declares disjoint from this one (0016 B3).
 ///
-/// **互斥是继承的**：Person ⟂ Organization 一条声明，就让 Person 的每个子类跟
-/// Organization 的每个子类都互斥。所以先沿父链往上收集这个类的祖先，取它们声明的
-/// 互斥对象，再沿子链往下展开。表里两个方向各存一行，问一个方向就够。
+/// **Disjointness is inherited**: one declaration of Person ⟂ Organization makes every subclass
+/// of Person disjoint from every subclass of Organization. So we first walk up the parent chain to
+/// collect this class's ancestors, take what they declare disjoint, and then expand down the child
+/// chain. The table stores a row for each direction, so asking one direction is enough.
 ///
-/// 没判出类型（`None`）时没有类可问，回空集：那一侧本来就走召回候选那一档
+/// With no type determined (`None`) there is no class to ask about, so return the empty set: that
+/// side goes into the recall-candidate arm anyway
 async fn declared_disjoint_from(
     pool: &PgPool,
     kb_id: Uuid,
@@ -513,16 +570,18 @@ async fn declared_disjoint_from(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 两个类是不是一家的：一方是另一方的祖先，或者两者共有一个**不是根**的祖先。
+/// Whether two classes are kin: one is an ancestor of the other, or they share an ancestor that is
+/// **not the root**.
 ///
-/// `CONFUSABLE_TYPE_KEYS` 那张三 key 的硬表是给没装包的库准备的；装了 schema.org
-/// 之后同一家公司会被抽成 Organization / Corporation / OnlineBusiness 三种类型，
-/// 全都在 Organization 之下，却一对都过不了硬表，于是三个同名实体并存、
-/// 审阅队列里一条都没有，面板还指着 Review 说"去那里合并"（#226）。
+/// The three-key hard table in `CONFUSABLE_TYPE_KEYS` is there for knowledge bases with no package
+/// installed; once schema.org is installed the same company gets extracted as three types --
+/// Organization / Corporation / OnlineBusiness -- all of them under Organization, yet not one of
+/// those pairs passes the hard table, so three same-name entities coexist, the review queue holds
+/// nothing at all, and the dashboard still points at Review saying "go merge them there" (#226).
 ///
-/// 根不算共同祖先：schema.org 里万物皆 Thing，算上它 Person 与 Organization
-/// 也成了一家。没有根的词汇表（W3C Org 的 Organization 自己就是顶）靠
-/// 祖先/后代那一半接住
+/// The root does not count as a shared ancestor: in schema.org everything is a Thing, and counting
+/// it would make Person and Organization kin as well. Vocabularies with no root (W3C Org's
+/// Organization is its own top) are caught by the ancestor/descendant half
 async fn types_are_kin(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<bool> {
     let (kin,): (bool,) = sqlx::query_as(
         "WITH RECURSIVE up_a(id) AS (
@@ -548,7 +607,7 @@ async fn types_are_kin(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<bool> {
 }
 
 fn confusable_reviews(
-    // None = 这一侧还没判出类型（0009）
+    // None = this side has no type determined yet (0009)
     mention_key: Option<&str>,
     cands: &[&CrossCandidate],
     ctx: Option<&[f32]>,
@@ -570,20 +629,22 @@ fn confusable_reviews(
         .collect()
 }
 
-/// 同类型召回为空时的跨类型处置（类型漂移）。
-/// concept 兜底型候选跑既有画像分层：高相似直接 ATTACH（漂移的召回修复，concept
-/// 侧类型升格为具体类型），灰区/无从判别 → 宁分勿合新建 + 审核对；易混具体类型
-/// 一律新建 + 审核对（同名 + 类型摇摆本身就是信号，不设相似度门槛）；硬互斥忽略。
+/// Cross-type handling for when same-type recall comes back empty (type drift).
+/// Concept-fallback candidates run the existing profile tiering: high similarity ATTACHes outright
+/// (recall repaired for the drift, and the concept side gets promoted to the concrete type), grey
+/// zone / nothing to judge by → rather split than merge, so create + a review pair; confusable
+/// concrete types always create + a review pair (a shared name plus a wavering type is itself the
+/// signal, so there is no similarity threshold); hard-disjoint pairs are ignored.
 async fn resolve_type_drift(
     pool: &PgPool,
     kb_id: Uuid,
-    // None = 抽取器给的类型不在本体里，或库里根本没有类（0009）
+    // None = the extractor's type is not in the ontology, or the KB has no classes at all (0009)
     type_id: Option<Uuid>,
     name: &str,
     keys: &[String],
     context: Option<&[f32]>,
 ) -> AppResult<Resolution> {
-    // 这一侧也可能还没判出类型（0009），那时没有 key 可查
+    // This side may have no type determined yet either (0009), and then there is no key to look up
     let mention_key: Option<String> = match type_id {
         Some(t) => sqlx::query_as::<_, (String,)>("SELECT key FROM entity_types WHERE id = $1")
             .bind(t)
@@ -596,8 +657,8 @@ async fn resolve_type_drift(
         "SELECT e.id, e.canonical_name, t.key AS type_key, e.type_id, e.type_source,
                 e.profile_embedding, e.profile_n
          FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id
-         -- IS DISTINCT FROM 而不是 <>：后者遇 NULL 返回 NULL，被 WHERE 当假，
-         -- 未分类实体会被整个漏掉（0009）
+         -- IS DISTINCT FROM rather than <>: the latter returns NULL against NULL, WHERE takes
+         -- that as false, and unclassified entities get missed entirely (0009)
          WHERE e.kb_id = $1 AND e.type_id IS DISTINCT FROM $2 AND e.merged_into IS NULL
            AND (lower(e.canonical_name) = ANY($3)
                 OR EXISTS (SELECT 1 FROM unnest(e.aliases) a WHERE lower(a) = ANY($3)))",
@@ -608,18 +669,22 @@ async fn resolve_type_drift(
     .fetch_all(pool)
     .await?;
 
-    // 本体声明了互斥的类，一次取出（含继承）。声明优先于下面所有启发式
+    // The classes the ontology declares disjoint, fetched in one go (inheritance included). A
+    // declaration outranks every heuristic below
     let disjoint = declared_disjoint_from(pool, kb_id, type_id).await?;
     let mut recall_cands: Vec<&CrossCandidate> = Vec::new();
     let mut review_cands: Vec<&CrossCandidate> = Vec::new();
     for c in &cross {
         let mut drift = classify_type_drift(mention_key.as_deref(), c.type_key.as_deref());
         if c.type_id.is_some_and(|t| disjoint.contains(&t)) {
-            // 本体说这两类互斥：哪怕硬表说易混、类层级说一家，也分开。
-            // 声明是人写下的判断，启发式只是没声明时的猜测
+            // The ontology says these two classes are disjoint: keep them apart even if the
+            // hard table calls them confusable and the class hierarchy calls them kin.
+            // A declaration is a judgement a human wrote down; the heuristics are only a guess
+            // for when nothing was declared
             drift = TypeDrift::Disjoint;
         } else if drift == TypeDrift::Disjoint {
-            // 硬表判不上的，再看类层级：同一支系下的同名当易混，进审阅队列
+            // What the hard table cannot place, look at the class hierarchy next: a shared name
+            // within the same branch counts as confusable and goes to the review queue
             if let (Some(a), Some(b)) = (type_id, c.type_id) {
                 if types_are_kin(pool, a, b).await? {
                     drift = TypeDrift::Review;
@@ -646,12 +711,14 @@ async fn resolve_type_drift(
         if let Some((best, sim)) = best {
             if sim >= SIM_ATTACH {
                 update_profile(pool, best.id, best.profile_n, ctx).await?;
-                // 候选还没判出类型而这次抽取判出来了 → 升格。
-                // 不是合并（没有第二个实体），不入 entity_merges；本体页可手工改回
+                // The candidate had no type determined yet and this extraction determined one
+                // → promote. This is not a merge (there is no second entity), so nothing goes
+                // into entity_merges; the ontology page can change it back by hand
                 //
-                // **人说过的「没有类型」不算「还没判出来」。** 0009 之后两者都是
-                // NULL，只看 type_key.is_none() 分不出——于是一个人看过、认为
-                // 本体里没有合适类的实体，会在下一次抽取时被安上一个类型
+                // **A human saying "no type" is not the same as "not determined yet".** Since
+                // 0009 both are NULL, and looking only at type_key.is_none() cannot tell them
+                // apart -- so an entity a human looked at and judged to have no fitting class in
+                // the ontology would get a type slapped on it at the next extraction
                 if best.type_key.is_none() && best.type_source != "human" && type_id.is_some() {
                     sqlx::query(
                         "UPDATE entities
@@ -662,10 +729,11 @@ async fn resolve_type_drift(
                     .bind(type_id)
                     .execute(pool)
                     .await?;
-                    // 类型标签兜底的消歧后缀可能已过时
+                    // The disambiguator that falls back to the type label may be stale now
                     refresh_disambiguators(pool, kb_id, &best.canonical_name).await?;
                 }
-                // mention 已定居到召回实体；同名易混类型实体的疑点仍在 → 照常入队
+                // The mention has settled on the recalled entity; the doubt about same-name
+                // confusable-type entities still stands → enqueue as usual
                 let mut reviews =
                     confusable_reviews(mention_key.as_deref(), &review_cands, Some(ctx));
                 reviews.truncate(MAX_DRIFT_REVIEWS);
@@ -680,7 +748,8 @@ async fn resolve_type_drift(
 
     let id = create_entity(pool, kb_id, type_id, name, context).await?;
     if !cross.is_empty() {
-        // 跨类型同名并存：消歧后缀按名字分组（不分类型），需要刷新
+        // The same name now coexists across types: disambiguators group by name (not by type),
+        // so they need refreshing
         refresh_disambiguators(pool, kb_id, name).await?;
     }
     let mut reviews = confusable_reviews(mention_key.as_deref(), &review_cands, context);
@@ -691,9 +760,11 @@ async fn resolve_type_drift(
                 .and_then(|p| cosine(p.as_slice(), ctx))
         });
         match sim {
-            // 画像明确不像：完全分开，不打扰审核队列
+            // The profiles are clearly unalike: keep them entirely apart, do not bother the
+            // review queue
             Some(s) if s < SIM_NEW => {}
-            // 灰区或无从判别（无 embedding / 候选无画像）：宁分勿合 + 审核对
+            // Grey zone, or nothing to judge by (no embedding / candidate has no profile):
+            // rather split than merge + a review pair
             _ => reviews.push(ReviewRequest {
                 other_id: c.id,
                 score: sim.unwrap_or(0.0),
@@ -702,7 +773,7 @@ async fn resolve_type_drift(
         }
     }
     reviews.truncate(MAX_DRIFT_REVIEWS);
-    // 漂移这条路一样会新建实体，包含关系照查
+    // The drift path creates a new entity just the same, so run the containment check here too
     reviews.extend(containment_reviews(pool, kb_id, type_id, name, id, context).await?);
     Ok(Resolution {
         entity_id: id,
@@ -714,7 +785,7 @@ async fn resolve_type_drift(
 async fn create_entity(
     pool: &PgPool,
     kb_id: Uuid,
-    // None = 抽取器给的类型不在本体里，或库里根本没有类（0009）
+    // None = the extractor's type is not in the ontology, or the KB has no classes at all (0009)
     type_id: Option<Uuid>,
     name: &str,
     context: Option<&[f32]>,
@@ -743,8 +814,9 @@ async fn touch_entity(pool: &PgPool, id: Uuid) -> AppResult<()> {
     Ok(())
 }
 
-/// 画像增量质心：profile ← (profile·n + ctx) / (n+1)。
-/// 维度不匹配（换过 embedding 模型）时用新向量重置画像。
+/// Incremental profile centroid: profile ← (profile·n + ctx) / (n+1).
+/// On a dimension mismatch (the embedding model was swapped) the profile is reset to the new
+/// vector.
 async fn update_profile(pool: &PgPool, id: Uuid, n: i32, ctx: &[f32]) -> AppResult<()> {
     let existing: Option<(Option<Vector>,)> =
         sqlx::query_as("SELECT profile_embedding FROM entities WHERE id = $1")
@@ -777,8 +849,9 @@ async fn update_profile(pool: &PgPool, id: Uuid, n: i32, ctx: &[f32]) -> AppResu
     Ok(())
 }
 
-/// 同名组展示消歧：组内 ≥2 个存活实体时，各自取最强区分性事实
-/// （works_at/part_of/located_in/leads 的宾语名），否则退回类型标签；组内唯一则清空。
+/// Display disambiguation for a same-name group: when the group holds ≥2 live entities, each
+/// takes its most distinguishing fact (the object name of works_at/part_of/located_in/leads),
+/// otherwise it falls back to the type label; if it is alone in the group, clear it.
 pub async fn refresh_disambiguators(pool: &PgPool, kb_id: Uuid, name: &str) -> AppResult<()> {
     let group: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM entities
@@ -814,8 +887,9 @@ pub async fn refresh_disambiguators(pool: &PgPool, kb_id: Uuid, name: &str) -> A
         .bind(id)
         .fetch_optional(pool)
         .await?;
-        // 关联事实找不着就退到类型标签；**类型也可能没有**（0009），
-        // 那就没有可写的后缀——留 NULL，界面按同名并列显示，别编一个出来
+        // With no related fact to find, fall back to the type label; **there may be no type
+        // either** (0009), and then there is no suffix to write -- leave it NULL and let the
+        // interface list the identical names side by side rather than inventing one
         let disambiguator: Option<String> = match label {
             Some((l,)) => Some(l),
             None => sqlx::query_as::<_, (String,)>(
@@ -837,10 +911,10 @@ pub async fn refresh_disambiguators(pool: &PgPool, kb_id: Uuid, name: &str) -> A
 }
 
 // ---------------------------------------------------------------------------
-// 审核队列
+// Review queue
 // ---------------------------------------------------------------------------
 
-/// 灰区疑似重复对入队（同一 pending 对幂等）。
+/// Enqueue a grey-zone suspected-duplicate pair (idempotent for the same pending pair).
 pub async fn create_review(
     pool: &PgPool,
     kb_id: Uuid,
@@ -894,8 +968,9 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
                 (SELECT count(*) FROM facts f
                  WHERE (f.subject_id = e.id OR f.object_id = e.id)
                    AND f.invalidated_at IS NULL) AS degree
-         -- LEFT JOIN：没判出类型的实体照样要能进审核（0009）。
-         -- 内连接会让它整条审核项取不出来，而漂移审核恰恰最常发生在它们身上
+         -- LEFT JOIN: entities with no type determined still have to be reviewable (0009).
+         -- An inner join makes the whole review item unfetchable, and drift reviews are
+         -- exactly what happens to them most often
          FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id
          WHERE e.kb_id = $1 AND e.id = $2",
     )
@@ -916,7 +991,8 @@ async fn review_side(pool: &PgPool, kb_id: Uuid, entity_id: Uuid) -> AppResult<R
     })
 }
 
-/// 实体的事实摘要行："works at → 星云科技 (2023-01 → now)"，裁决 prompt 与审核 UI 共用。
+/// Fact summary lines for an entity: "works at → 星云科技 (2023-01 → now)", shared by the
+/// adjudication prompt and the review UI.
 pub async fn entity_fact_lines(
     pool: &PgPool,
     kb_id: Uuid,
@@ -992,7 +1068,8 @@ async fn assemble_reviews(
     Ok(items)
 }
 
-/// 全部待处理审核项（LLM 裁决中 + 等人工的都展示，人工可随时抢先定夺）。
+/// Every pending review item (both those under LLM adjudication and those waiting on a human are
+/// shown; a human can step in and settle it at any time).
 pub async fn list_reviews(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1013,7 +1090,7 @@ pub async fn list_reviews(
     assemble_reviews(pool, kb_id, rows).await
 }
 
-/// 等待 LLM 裁决的审核项（后台裁决任务消费）。
+/// Review items waiting on LLM adjudication (consumed by the background adjudication task).
 pub async fn pending_adjudications(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1032,11 +1109,13 @@ pub async fn pending_adjudications(
     assemble_reviews(pool, kb_id, rows).await
 }
 
-/// LLM 不确定 / 未配模型 → 转人工。
-/// `reason` 存的是 **code**，可选地跟 `|detail`——不是给人看的句子。
+/// The LLM is unsure / no model is configured → hand it to a human.
+/// `reason` stores a **code**, optionally followed by `|detail` -- not a sentence for people to
+/// read.
 ///
-/// 界面语言在客户端（见 docs/decisions/0004），服务端没有 locale 可用来措辞；
-/// 写进这一列的英文散文会永久留在中文界面上。措辞归 i18n，这里只留稳定的 code。
+/// The interface language lives on the client (see docs/decisions/0004) and the server has no
+/// locale to phrase anything with; English prose written into this column would stay on a Chinese
+/// interface forever. Wording belongs to i18n, and only a stable code lives here.
 pub async fn escalate_review(pool: &PgPool, review_id: Uuid, reason: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE resolution_reviews SET stage = 'human', reason = $2
@@ -1049,7 +1128,8 @@ pub async fn escalate_review(pool: &PgPool, review_id: Uuid, reason: &str) -> Ap
     Ok(())
 }
 
-/// 自动定夺（LLM 高置信）：merged / kept。合并动作本身由调用方先执行。
+/// Settled automatically (high-confidence LLM): merged / kept. The merge action itself is carried
+/// out by the caller first.
 pub async fn close_review_auto(
     pool: &PgPool,
     review_id: Uuid,
@@ -1068,7 +1148,8 @@ pub async fn close_review_auto(
     Ok(())
 }
 
-/// 人工定夺。merge 方向：度数高（事实多）的一方作为存活目标，平局取更早创建的。
+/// Settled by a human. Merge direction: the side with the higher degree (more facts) becomes the
+/// surviving target; on a tie the earlier-created one wins.
 pub async fn decide_review(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1122,7 +1203,7 @@ pub async fn decide_review(
     Ok(())
 }
 
-/// 合并方向：返回 (target 存活, source 被并)。
+/// Merge direction: returns (target that survives, source that gets merged away).
 pub async fn merge_direction(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<(Uuid, Uuid)> {
     let (deg_a,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM facts WHERE (subject_id = $1 OR object_id = $1) AND invalidated_at IS NULL",
@@ -1136,7 +1217,7 @@ pub async fn merge_direction(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<(Uuid
     .bind(b)
     .fetch_one(pool)
     .await?;
-    // uuidv7 时间有序：度数平局时更早创建的一方存活
+    // uuidv7 is time-ordered: on a degree tie the earlier-created side survives
     Ok(if deg_a > deg_b || (deg_a == deg_b && a < b) {
         (a, b)
     } else {
@@ -1145,12 +1226,12 @@ pub async fn merge_direction(pool: &PgPool, a: Uuid, b: Uuid) -> AppResult<(Uuid
 }
 
 // ---------------------------------------------------------------------------
-// 合并 / 回滚
+// Merge / revert
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
 struct EntityFull {
-    // None = 还没判出来（0009）
+    // None = not determined yet (0009)
     type_id: Option<Uuid>,
     canonical_name: String,
     aliases: Vec<String>,
@@ -1171,8 +1252,10 @@ async fn entity_full(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<EntityFu
     .ok_or(AppError::NotFound)
 }
 
-/// 合并 source → target：事实改挂 target、互指事实与合并后的重复事实作废、
-/// source 名并入 target 别名、画像加权合并、source 标记 merged_into。全程记日志可回滚。
+/// Merge source → target: facts get re-hung on target, facts pointing at each other and the
+/// duplicates the merge creates are invalidated, source's name joins target's aliases, the profiles
+/// are merged with weights, and source is marked merged_into. The whole thing is logged and can be
+/// reverted.
 pub async fn merge_entities(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1195,7 +1278,7 @@ pub async fn merge_entities(
 
     let mut tx = pool.begin().await?;
 
-    // 互指事实（合并后变自环）→ 作废
+    // Facts pointing at each other (they become self-loops after the merge) → invalidate
     let cross: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE facts SET invalidated_at = now()
          WHERE kb_id = $1 AND invalidated_at IS NULL
@@ -1232,12 +1315,15 @@ pub async fn merge_entities(
     .map(|(id,)| id)
     .collect();
 
-    // 合并后 SPO+valid_from 重复的 live 事实：留最早 recorded_at 的一条，其余作废。
+    // Live facts that duplicate on SPO+valid_from after the merge: keep the one with the earliest
+    // recorded_at, invalidate the rest.
     //
-    // **宾语两侧都要分组。** 字面值事实的 object_id 全是 NULL，只按它分组就等于
-    // 把同主同谓下的**所有值**当成同一条断言：一次合并之后，
-    // (公司, 成立年份, 2015) 与 (公司, 注册资本, …) 之外，同谓词的多个值只活得下来
-    // 最早记的那一个，其余无声消失，且没有 supersedes 可查。
+    // **Both object columns have to be in the grouping.** Literal-value facts all have object_id
+    // NULL, so grouping on that alone treats **every value** under the same subject and predicate
+    // as one and the same assertion: after a single merge, beyond
+    // (company, founding year, 2015) versus (company, registered capital, …), multiple values of
+    // the same predicate leave only the earliest-recorded one alive, the rest vanish silently,
+    // and there is no supersedes to trace them by.
     let dups: Vec<(Vec<Uuid>,)> = sqlx::query_as(
         "SELECT (array_agg(id ORDER BY recorded_at))[2:] FROM facts
          WHERE kb_id = $1 AND invalidated_at IS NULL
@@ -1258,7 +1344,7 @@ pub async fn merge_entities(
         invalidated.extend(dup_ids);
     }
 
-    // source 名与别名并入 target 别名（去重、排除 target 本名）
+    // Source's name and aliases join target's aliases (deduplicated, target's own name excluded)
     let mut aliases = target.aliases.clone();
     let taken: std::collections::HashSet<String> = std::iter::once(&target.canonical_name)
         .chain(aliases.iter())
@@ -1271,7 +1357,7 @@ pub async fn merge_entities(
         }
     }
 
-    // 画像加权合并
+    // Weighted merge of the profiles
     let (profile, profile_n) = match (&target.profile_embedding, &source.profile_embedding) {
         (Some(t), Some(s)) if t.as_slice().len() == s.as_slice().len() => {
             let (nt, ns) = (
@@ -1294,11 +1380,13 @@ pub async fn merge_entities(
         (None, None) => (None, 0),
     };
 
-    // 类型调和：**没有类型的一侧让位**。存活方还没判出来而被并方判出来了，
-    // 就把那个类型带过来；否则保留存活方的。
+    // Type reconciliation: **the side without a type yields**. If the survivor has nothing
+    // determined yet while the side being merged away does, bring that type over; otherwise keep
+    // the survivor's.
     //
-    // 从前这里要先查库找出 concept 那行的 id 再跟两侧比对。「还没判出来」
-    // 现在是 `None`（0009），一个 `or` 就说完了，那次查询也省了
+    // This used to query the database for the id of the concept row and then compare it against
+    // both sides. "Not determined yet" is `None` now (0009), a single `or` says all of it, and
+    // that query is gone too
     let new_type_id = target.type_id.or(source.type_id);
 
     sqlx::query(
@@ -1318,17 +1406,21 @@ pub async fn merge_entities(
         .execute(&mut *tx)
         .await?;
 
-    // 其余涉及 source 的 pending 审核项：**改指到合并目标，不是关掉**。
+    // The remaining pending review items that involve source: **repoint them at the merge target,
+    // do not close them**.
     //
-    // 这里原本一律关掉，理由写的是"疑点若仍在会由后续 mention 重新提起"。
-    // **那句是错的**：包含关系召回只在**新建实体时**跑一次，而这些实体早就存在了，
-    // 不会再被新建，也就没有"后续 mention"来重提。关掉就是永远关掉。
+    // This used to close all of them, and the stated reason was "if the doubt still stands a later
+    // mention will raise it again". **That sentence was wrong**: containment recall runs once
+    // **only when an entity is created**, and these entities existed long ago, will never be
+    // created again, so there is no "later mention" to raise anything. Closing them closes them
+    // forever.
     //
-    // 实测：`Mr. Holmes` 跟 `Holmes` 配对入队（0.70），随后 `Holmes` 并入
-    // `Sherlock Holmes`，这一对被关成 superseded by merge——而
-    // `Mr. Holmes` vs `Sherlock Holmes` 这个仍然成立的问题，再没人问过。
+    // Measured: `Mr. Holmes` was paired with `Holmes` and enqueued (0.70), then `Holmes` was
+    // merged into `Sherlock Holmes` and that pair was closed as superseded by merge -- while the
+    // question of `Mr. Holmes` vs `Sherlock Holmes`, which still stands, was never asked again.
     //
-    // 先关掉两类真正过时的：重定向后会变成自环的，和目标对已经在队列里的。
+    // First close the two kinds that really are obsolete: the ones that would become self-loops
+    // after redirection, and the ones whose target pair is already in the queue.
     sqlx::query(
         "UPDATE resolution_reviews AS r
          SET status = 'kept', reason = 'superseded by merge', decided_at = now()
@@ -1352,9 +1444,11 @@ pub async fn merge_entities(
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
-    // 剩下的改指到目标，问题继续挂在队列上等裁决。
-    // (source, target) 这一对本身除外——它正是本次合并的裁决对象，由调用方标记 merged，
-    // 在这里动它会让它在历史里错误地显示为"保持分开"
+    // The rest get repointed at the target, and the question stays hanging in the queue awaiting
+    // adjudication.
+    // The (source, target) pair itself is the exception -- it is exactly what this merge decided,
+    // the caller marks it merged, and touching it here would make it show up wrongly in the
+    // history as "kept apart"
     sqlx::query(
         "UPDATE resolution_reviews
          SET left_id = CASE WHEN left_id = $2 THEN $3 ELSE left_id END,
@@ -1395,31 +1489,38 @@ pub async fn merge_entities(
 
     tx.commit().await?;
 
-    // 搬移后的时态对账：换了主/宾的事实等价于新观察落库——两个对象折成一个后，
-    // 唯一性不变量才第一次看得到旧开放区间与继任者相撞（如"星尘"并入"星尘项目"，
-    // 旧负责人的 leads 应在新任起点闭合）。
-    // 修正行 id 记入合并账本：这些修正的唯一成因是本次合并，回滚时必须随之撤销。
-    // 注：本步在事务外，失败有自愈性——残留的旧开放行会在下一条相关新事实落库时
-    // 被常规插入对账撞到并闭合。
+    // Temporal reconciliation after the move: a fact whose subject/object changed is equivalent to
+    // a new observation landing -- only once two objects are folded into one can the uniqueness
+    // invariant see for the first time that an old open interval collides with its successor (e.g.
+    // "星尘" merged into "星尘项目", where the former lead's leads should be closed at the
+    // new lead's start point).
+    // The ids of the corrected rows go into the merge ledger: this merge is the only cause of those
+    // corrections, so a revert has to undo them along with it.
+    // Note: this step is outside the transaction, and failure is self-healing -- a leftover old
+    // open row will be run into and closed by the ordinary insert-time reconciliation as soon as
+    // the next related fact lands.
     let moved_all: Vec<Uuid> = moved_subject
         .iter()
         .chain(moved_object.iter())
         .copied()
         .collect();
 
-    // **合并是第三条改写事实的路**（#196）：换掉主语或宾语，就可能把一条合法事实
-    // 变成签名违规——抽取写入时掰正过的方向，合并一次就能再反回去。这里不掰、不改，
-    // 只报：对搬动过的事实查一遍 domain / range，违反的进 `axiom_violations`
-    //（kind = signature），与其它公理违规同一个队列、同样三个出路。
-    // 放在事务之后：目标实体的类型在事务里刚调和过，提交了才看得见
+    // **Merging is the third path that rewrites facts** (#196): swapping the subject or the object
+    // can turn a legal fact into a signature violation -- a direction that was straightened out at
+    // extraction time can be flipped right back by one merge. This one does not straighten and
+    // does not modify, it only reports: run domain / range over the facts that moved and put the
+    // violations into `axiom_violations` (kind = signature), the same queue as every other axiom
+    // violation, with the same three ways out.
+    // Placed after the transaction: the target entity's type was only just reconciled inside it,
+    // and is visible once committed
     match crate::reasoning::signature_breaks(pool, kb_id, Some(&moved_all)).await {
         Ok(broken) if !broken.is_empty() => {
             if let Err(e) = crate::reasoning::record_signature_breaks(pool, kb_id, &broken).await {
-                tracing::warn!(%kb_id, error = %e, "合并后的签名违规没能入库");
+                tracing::warn!(%kb_id, error = %e, "post-merge signature breaks failed to land");
             }
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(%kb_id, error = %e, "合并后的签名检查失败"),
+        Err(e) => tracing::warn!(%kb_id, error = %e, "post-merge signature check failed"),
     }
     let report = crate::temporal::reconcile_moved_facts(pool, kb_id, &moved_all).await?;
     if !report.corrected.is_empty() {
@@ -1454,7 +1555,8 @@ struct MergeRow {
     reverted_at: Option<DateTime<Utc>>,
 }
 
-/// 精确回滚一次合并：事实原路搬回、作废撤销、target 画像与类型恢复快照、source 复活。
+/// Revert one merge exactly: facts move back the way they came, invalidations are undone, target's
+/// profile and type are restored from the snapshot, and source comes back to life.
 pub async fn revert_merge(pool: &PgPool, kb_id: Uuid, merge_id: Uuid) -> AppResult<()> {
     let m: MergeRow = sqlx::query_as(
         "SELECT source_id, target_id, moved_subject_facts, moved_object_facts,
@@ -1487,9 +1589,12 @@ pub async fn revert_merge(pool: &PgPool, kb_id: Uuid, merge_id: Uuid) -> AppResu
         .execute(&mut *tx)
         .await?;
 
-    // 合并引发的时态修正随之撤销：这些修正的唯一成因是本次合并（两实体折一后
-    // 不变量才看到的相撞），成因既撤、修正随撤——先恢复被取代的原行，再作废修正行。
-    // 只撤仍存活的修正：之后被真实新观察再度改写过的链保持不动（那部分有独立依据）。
+    // The temporal corrections the merge caused are undone with it: this merge is their only cause
+    // (the collision the invariant could only see once two entities were folded into one), so once
+    // the cause is undone the corrections follow -- first restore the superseded original rows,
+    // then invalidate the correction rows.
+    // Only live corrections are undone: a chain that was rewritten again afterwards by a genuine
+    // new observation stays put (that part rests on independent grounds).
     sqlx::query(
         "UPDATE facts SET invalidated_at = NULL WHERE id IN (
              SELECT supersedes FROM facts
@@ -1507,7 +1612,7 @@ pub async fn revert_merge(pool: &PgPool, kb_id: Uuid, merge_id: Uuid) -> AppResu
     .await?;
 
     let source = entity_full(pool, kb_id, m.source_id).await?;
-    // target 别名回退：剔除来自 source 的名字
+    // Roll target's aliases back: strip out the names that came from source
     sqlx::query(
         "UPDATE entities SET
             aliases = (SELECT coalesce(array_agg(a), '{}') FROM unnest(aliases) a
@@ -1542,7 +1647,7 @@ pub async fn revert_merge(pool: &PgPool, kb_id: Uuid, merge_id: Uuid) -> AppResu
     Ok(())
 }
 
-/// 合并日志（审核页历史区）。
+/// The merge log (history section of the review page).
 pub async fn list_merges(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1568,7 +1673,7 @@ pub async fn list_merges(
 }
 
 // ---------------------------------------------------------------------------
-// LLM 裁决缓存
+// LLM adjudication cache
 // ---------------------------------------------------------------------------
 
 pub async fn get_verdict(
@@ -1610,11 +1715,13 @@ pub async fn put_verdict(
     Ok(())
 }
 
-/// 记下模型提议、但本体装不下的类型。
+/// Record a type the model proposed that the ontology has no room for.
 ///
-/// **只写第一次**：同一实体会被多篇文档提到，第一次的提议就算它的提议；
-/// 后来的覆盖会让"哪些实体在等 model 类"随最后一篇文档抖动。
-/// 采纳了对应的类之后由改写流程清空——那时它已经不是"提议"而是既成事实。
+/// **Only the first write counts**: the same entity gets mentioned by several documents, and the
+/// first proposal is taken as its proposal; letting later ones overwrite would make "which
+/// entities are waiting on a model class" jitter with whichever document came last.
+/// Cleared by the retype flow once the corresponding class is adopted -- at that point it is no
+/// longer a "proposal" but an accomplished fact.
 pub async fn set_proposed_type(pool: &PgPool, entity_id: Uuid, proposed: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE entities SET proposed_type = left($2, 60)
@@ -1627,10 +1734,12 @@ pub async fn set_proposed_type(pool: &PgPool, entity_id: Uuid, proposed: &str) -
     Ok(())
 }
 
-/// 待认领的实体类型：模型提议过、本体没有、实体因此降级成了 concept。
+/// Entity types waiting to be claimed: proposed by the model, absent from the ontology, and the
+/// entity was demoted to concept as a result.
 ///
-/// 与谓词那边的 `graph::proposed_predicates` 对称——连着具体实体，所以采纳时
-/// 能说清"将重新归类 43 个"并真的去改，而不是只建一个空类。
+/// Symmetric with `graph::proposed_predicates` on the predicate side -- it is tied to concrete
+/// entities, so adoption can say "will reclassify 43 of them" and actually go and do it, instead of
+/// just creating an empty class.
 pub async fn proposed_types(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1641,7 +1750,7 @@ pub async fn proposed_types(
                 (array_agg(e.canonical_name ORDER BY e.created_at))[1] AS example
          FROM entities e
          WHERE e.kb_id = $1 AND e.merged_into IS NULL AND e.proposed_type IS NOT NULL
-           -- 用户拒绝过的类型不再出现在候选里
+           -- Types the user has dismissed no longer show up among the candidates
            AND NOT EXISTS (SELECT 1 FROM ontology_misses m
                            WHERE m.kb_id = $1 AND m.kind = 'entity_type'
                              AND m.key = e.proposed_type AND m.dismissed_at IS NOT NULL)
@@ -1653,35 +1762,42 @@ pub async fn proposed_types(
     .await?)
 }
 
-/// 把提议过 `forms` 里那些类型的实体改到 `type_id` 上。返回 (批次 id, 改动数)。
+/// Retype the entities that proposed any of the types in `forms` onto `type_id`. Returns
+/// (batch id, number changed).
 ///
-/// 与谓词那边的 `graph::adopt_proposed_predicates` 对称：**只建类型不动实体，
-/// 本体长大了、图没变好**——提议过 model 的实体会继续挂在 concept 下。
+/// Symmetric with `graph::adopt_proposed_predicates` on the predicate side: **creating the type
+/// without touching the entities means the ontology grew and the graph got no better** -- the
+/// entities that proposed model would go on hanging under concept.
 ///
-/// 实体是可变行（P0 的 PATCH 就直接改），所以这里就是 UPDATE，撤销靠账本
-/// 记下改之前的类型，而不是靠 supersedes 链。
+/// Entities are mutable rows (the P0 PATCH modifies them in place), so this is a plain UPDATE, and
+/// the undo relies on the ledger recording the type from before the change rather than on a
+/// supersedes chain.
 pub async fn adopt_proposed_types(
     pool: &PgPool,
     kb_id: Uuid,
     type_id: Uuid,
     forms: &[String],
-    // None = 引擎自动（本体长出新类之后的收尾认领没有人在按）
+    // None = the engine on its own (the mop-up claim after the ontology grows a new class has
+    // nobody pressing anything)
     actor: Option<Uuid>,
 ) -> AppResult<(Uuid, u32)> {
     let batch_id = Uuid::now_v7();
     if forms.is_empty() {
         return Ok((batch_id, 0));
     }
-    // 已经在目标类上的不算改动，也不进账本——撤销时不该把它们推回去。
+    // Entities already on the target class do not count as changed and do not enter the ledger --
+    // a revert should not push them back anywhere.
     //
-    // **`IS DISTINCT FROM` 而不是 `<>`**：0009 之后 type_id 可能是 NULL，而
-    // `NULL <> uuid` 求值为 NULL 不是 true，那一行会被悄悄滤掉——偏偏带着
-    // proposed_type 的几乎全是还没判出类型的实体，整个认领功能会一声不响地空转
+    // **`IS DISTINCT FROM`, not `<>`**: since 0009 type_id can be NULL, and `NULL <> uuid`
+    // evaluates to NULL rather than true, so that row gets silently filtered out -- and of all
+    // things, almost everything carrying a proposed_type is an entity with no type determined yet,
+    // so the whole claim feature would spin without a sound and do nothing
     let targets: Vec<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
         "SELECT id, type_id, canonical_name FROM entities
          WHERE kb_id = $1 AND merged_into IS NULL
-           -- 人拍过板的不认领。**这一行顺带让 unadopt 天然正确**：human 行
-           -- 永远不进采纳批次，撤销时也就不会遇到它们，不必额外还原 type_source
+           -- Do not claim what a human has settled. **This line incidentally makes unadopt
+           -- correct for free**: human rows never enter an adoption batch, so a revert never
+           -- meets them and does not have to restore type_source separately
            AND type_source <> 'human'
            AND proposed_type = ANY($2) AND type_id IS DISTINCT FROM $3",
     )
@@ -1696,8 +1812,10 @@ pub async fn adopt_proposed_types(
     for (entity_id, from_type, name) in targets {
         let mut tx = pool.begin().await?;
         sqlx::query(
-            // actor 有值 = 人在界面上点的批准，他背书了这个类型 → 受保护。
-            // 无值 = 本体长出新类之后的收尾认领，没人在按
+            // actor present = a human clicked approve in the interface and endorsed this type
+            // → protected.
+            // absent = the mop-up claim after the ontology grew a new class; nobody pressed
+            // anything
             "UPDATE entities
                 SET type_id = $2, proposed_type = NULL, updated_at = now(),
                     type_source = CASE WHEN $3::uuid IS NULL THEN 'inferred' ELSE 'human' END
@@ -1725,20 +1843,24 @@ pub async fn adopt_proposed_types(
         names.insert(name);
         moved += 1;
     }
-    // 消歧后缀的兜底值就是类型标签，改了类就得重算（同 P0 的实体改类）
+    // The disambiguator's fallback value is the type label, so a class change means recomputing it
+    // (same as the P0 entity retype)
     for n in &names {
         refresh_disambiguators(pool, kb_id, n).await?;
     }
     Ok((batch_id, moved))
 }
 
-/// 撤销一次实体改类：把它们放回原来的类型。
+/// Undo one batch of entity retypes: put them back on their original type.
 ///
-/// 类型本身不删——与谓词那边同一条理由：有实体指向过它，而"它存在过"是历史。
-/// `proposed_type` 也一并恢复，否则撤销之后那些实体就再也认领不回来了。
+/// The type itself is not deleted -- the same reason as on the predicate side: entities have
+/// pointed at it, and "it existed" is history.
+/// `proposed_type` is restored along with it, otherwise those entities could never be claimed
+/// again after the undo.
 pub async fn unadopt_types(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppResult<u32> {
-    // from_type_id 可能是 NULL：0009 之后最常见的一次改类正是"从没有类到有类"，
-    // 撤销就是把它推回没有类。解成 Uuid 会在这里当场崩
+    // from_type_id can be NULL: since 0009 the most common retype is exactly "from no class to a
+    // class", and undoing it pushes the entity back to having no class. Decoding it as Uuid would
+    // blow up right here
     let rows: Vec<(Uuid, Option<Uuid>, String)> = sqlx::query_as(
         "SELECT r.entity_id, r.from_type_id, t.key
          FROM entity_retypes r JOIN entity_types t ON t.id = r.to_type_id
@@ -1784,11 +1906,12 @@ pub async fn unadopt_types(pool: &PgPool, kb_id: Uuid, batch_id: Uuid) -> AppRes
     Ok(reverted)
 }
 
-/// 把提议的类型规整成 key 的形状：小写、非字母数字换下划线、压缩重复。
-/// "AI Model" → "ai_model"，与 validate_key 允许的字符集对齐。
+/// Normalize a proposed type into the shape of a key: lowercased, non-alphanumerics turned into
+/// underscores, repeats collapsed.
+/// "AI Model" → "ai_model", aligned with the character set validate_key allows.
 fn normalize_type_key(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut last_us = true; // 前导下划线也算重复
+    let mut last_us = true; // a leading underscore counts as a repeat too
     for c in s.trim().chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
@@ -1804,14 +1927,17 @@ fn normalize_type_key(s: &str) -> String {
     out.chars().take(40).collect()
 }
 
-/// 认领那些"类型已经在本体里、实体却还挂在 concept 下"的实体。
+/// Claim the entities whose "type is already in the ontology while the entity still hangs under
+/// concept".
 ///
-/// `adopt_proposed_types` 只在**建类的那一刻**被调用，于是类先建好、实体后被
-/// 抽出来的情形就永远等不到搬运——而这恰恰是常态：本体第一轮建好，后续文档
-/// 继续产出提议。这个扫描把它们收尾。
+/// `adopt_proposed_types` is only called **at the moment a class is created**, so the case where
+/// the class is built first and the entity is extracted afterwards never gets carried over -- and
+/// that is exactly the norm: the ontology is built in the first round and later documents keep
+/// producing proposals. This sweep mops them up.
 ///
-/// 只做**规整后精确同名**的匹配，不做近似——猜错就是把实体放进错的类，
-/// 而"再等一轮"的代价接近零。
+/// It only matches on **an exact name match after normalization**, never approximately -- a wrong
+/// guess puts an entity into the wrong class, while the cost of "wait one more round" is close to
+/// zero.
 pub async fn sweep_proposed_types(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1857,14 +1983,15 @@ mod tests {
         assert_eq!(name_stem("Project Phoenix").as_deref(), Some("phoenix"));
         assert_eq!(name_stem("Acme Inc.").as_deref(), Some("acme"));
         assert_eq!(name_stem("星尘"), None);
-        assert_eq!(name_stem("项目"), None); // 剥空不算词干
-        assert_eq!(name_stem("项目团队"), None); // 词干本身是泛用词
+        assert_eq!(name_stem("项目"), None); // stripping to nothing is not a stem
+        assert_eq!(name_stem("项目团队"), None); // the stem is itself a generic word
         assert_eq!(name_stem("Team Project"), None);
     }
 
     #[test]
     fn recall_keys_bidirectional() {
-        // 无后缀 mention 能召回带后缀实体（增广），反之靠词干
+        // A suffix-less mention can recall a suffixed entity (augmentation); the other direction
+        // relies on the stem
         let k = recall_keys("星尘");
         assert!(k.contains(&"星尘".to_string()));
         assert!(k.contains(&"星尘项目".to_string()));
@@ -1881,8 +2008,8 @@ mod tests {
 
     #[test]
     fn type_drift_classes() {
-        // 还没判出类型的那一侧 → 召回候选。0009 之前这一档比的是 `concept`
-        // 这个 key，现在比的是"有没有类"本身
+        // The side with no type determined yet → recall candidate. Before 0009 this arm compared
+        // against the `concept` key; now it compares whether there is a class at all
         assert_eq!(
             classify_type_drift(None, Some("organization")),
             TypeDrift::Recall
@@ -1891,9 +2018,9 @@ mod tests {
             classify_type_drift(Some("project"), None),
             TypeDrift::Recall
         );
-        // 两边都还没判出来：也归召回，由画像相似度说话
+        // Neither side determined yet: recall as well, and let profile similarity do the talking
         assert_eq!(classify_type_drift(None, None), TypeDrift::Recall);
-        // 易混具体类型两两 → 审核对
+        // Confusable concrete types, pairwise → a review pair
         assert_eq!(
             classify_type_drift(Some("organization"), Some("project")),
             TypeDrift::Review
@@ -1906,7 +2033,7 @@ mod tests {
             classify_type_drift(Some("product"), Some("organization")),
             TypeDrift::Review
         );
-        // 硬互斥与未知自定义类型 → 完全分开
+        // Hard-disjoint and unknown custom types → entirely apart
         assert_eq!(
             classify_type_drift(Some("person"), Some("organization")),
             TypeDrift::Disjoint
@@ -1934,44 +2061,54 @@ mod tests {
     }
 }
 
-/// 一个等着精化类型的实体，连同用来判断它是什么的全部材料。
+/// One entity waiting for its type to be refined, together with all the material used to judge
+/// what it is.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TypeCandidateSubject {
     pub id: Uuid,
     pub canonical_name: String,
     pub aliases: Vec<String>,
-    /// 现在挂着的类，**可能没有**（0009：没判出来就是 NULL）。名字里的"粗"
-    /// 是历史——抽取现在也可能直接给一个细类，而且可能给错（实测
-    /// `绍兴 → address`），所以这里也可能是要被**纠正**的那个
+    /// The class currently attached, which **may be absent** (0009: not determined means NULL).
+    /// The "coarse" in the name is history -- extraction can now hand back a fine class directly,
+    /// and can get it wrong (measured: `绍兴 → address`), so this may just as well be the one
+    /// that needs **correcting**
     pub coarse_key: Option<String>,
     pub coarse_id: Option<Uuid>,
-    /// 现类的描述。裁决要判"现在这个类对不对"，光看 key 不够——
-    /// 导入本体的 key 常常自解释不了（`entry_point` 是什么？）
+    /// The description of the current class. Adjudication has to judge "is the current class
+    /// right", and the key alone is not enough -- keys from an imported ontology often cannot
+    /// explain themselves (what is an `entry_point`?)
     pub coarse_description: Option<String>,
-    /// 抽取时模型自己报的类型名，**词表里没有**才会留在这儿
+    /// The type name the model itself reported at extraction time; it only stays here when the
+    /// vocabulary does **not** have it
     pub proposed_type: Option<String>,
-    /// 模型对它自己的说法，每个实体都有。
+    /// What the model says this thing is, present on every entity.
     ///
-    /// 这是最强的信号，因为它把任务从"读懂这是什么"换回"本体里哪个类叫这个"
-    /// ——短名字对短标签。实测的失败正出在另一头：拿一段中文画像去匹配
-    /// schema.org 的 "A software application."，两边形状根本不对等
+    /// This is the strongest signal, because it turns the task from "work out what this is" back
+    /// into "which class in the ontology is called this" -- a short name against a short label.
+    /// The measured failure was at the other end: matching a paragraph of Chinese profile text
+    /// against schema.org's "A software application." -- the two shapes are simply not comparable
     pub specific_type: Option<String>,
-    /// 它参与的谓词，连着对方的名字（`produces 深蓝`、`leads by 张伟`）。
-    /// **跨文档累积**，这正是抽取当场没有的东西
+    /// The predicates it takes part in, each with the other side's name (`produces 深蓝`,
+    /// `leads by 张伟`). **Accumulated across documents**, which is exactly what extraction does
+    /// not have in the moment
     pub roles: Vec<String>,
-    /// 证据引文，最多几句。抽取看的是同一批句子，但那一次要同时做实体识别、
-    /// 关系判断、时态解析、JSON 格式化，还要跟几十个别的实体抢注意力
-    /// 证据引文，**只取它当主语的那些**。宾语位的引文讲的是主语：
-    /// 「上海浦东新区」是 located_in 的宾语，引文却是"星云科技（上海）
-    /// 有限公司是一家注册于上海浦东新区的股份有限公司"，整句重心在
-    /// "股份有限公司"上——实测那一版检索给出的候选全是 corporation 一类
+    /// Evidence quotes, a few sentences at most. Extraction looked at the same sentences, but in
+    /// that pass it had to do entity recognition, relation judgement, temporal parsing and JSON
+    /// formatting all at once, while fighting dozens of other entities for attention
+    /// Evidence quotes, **only the ones where it is the subject**. A quote from the object
+    /// position is about the subject: "上海浦东新区" is the object of located_in, yet the quote
+    /// reads "星云科技（上海）有限公司是一家注册于上海浦东新区的股份有限公司", whose centre
+    /// of gravity sits entirely on "股份有限公司" -- measured, that version of the retrieval
+    /// gave back candidates that were all corporation-ish
     pub quotes: Vec<String>,
     pub fact_count: i64,
 }
 
-/// 值得送去精化类型的实体：**还没有类的**，或者模型报过一个词表外类型的。
+/// The entities worth sending off for type refinement: **the ones with no class yet**, or the ones
+/// where the model reported a type from outside the vocabulary.
 ///
-/// 类型化得已经很具体的实体不动——重判一次只有下降风险，没有上升空间。
+/// Entities that are already typed very specifically are left alone -- re-adjudicating one can only
+/// go downhill, there is no upside.
 pub async fn entities_for_type_resolution(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1981,12 +2118,14 @@ pub async fn entities_for_type_resolution(
         "SELECT e.id, e.canonical_name, e.aliases, t.key AS coarse_key, t.id AS coarse_id,
                 t.description AS coarse_description,
                 e.proposed_type, e.specific_type,
-                -- 对方写**名字**，不写它的类型 key。
-                -- 写 key 是自毁：查询里出现 organization / product / event 这些词，
-                -- 而检索的目标正是这些类自己，于是候选就是画像里那几个词。
-                -- 实测「张伟」的画像是 leads→organization … works_at→organization，
-                -- 回来的候选是 corporation、organization、business_entity_type——
-                -- 检索到的是画像自己，不是这个人是什么
+                -- Write the other side's **name**, not its type key.
+                -- Writing the key is self-destruction: the words organization / product / event
+                -- then appear in the query, while the target of the retrieval is those very
+                -- classes, so the candidates are just those few words from the profile.
+                -- Measured, the profile of \"张伟\" was leads→organization …
+                -- works_at→organization, and the candidates that came back were corporation,
+                -- organization, business_entity_type -- the retrieval found the profile itself,
+                -- not what this person is
                 ARRAY(
                   SELECT DISTINCT COALESCE(rt.key, fact_surface_predicate(f.id))
                                   || CASE WHEN f.subject_id = e.id THEN ' ' ELSE ' by ' END
@@ -2014,19 +2153,24 @@ pub async fn entities_for_type_resolution(
          FROM entities e
          LEFT JOIN entity_types t ON t.id = e.type_id
          WHERE e.kb_id = $1 AND e.merged_into IS NULL
-           -- **人拍过板的不再重判。**
+           -- **What a human has settled is not re-adjudicated.**
            --
-           -- 少了这一行，下面第三种条件会把它们全都捞回来：一个人工定成
-           -- organization 的实体，只要 organization 有子类就够格，于是引擎
-           -- 每一轮都去重新裁决一遍人已经决定过的事，而账本事后才看得出是谁改的。
+           -- Without this line the third condition below drags them all back in: an entity a
+           -- human set to organization qualifies as soon as organization has any subclass, so
+           -- every round the engine re-adjudicates what a person already decided, and the
+           -- ledger only shows who changed it after the fact.
            --
-           -- 「不落库」不等于「不许说话」：引擎若认为人定错了，该走 Review 队列，
-           -- 而不是直接改掉。憋着不说和直接改掉都是失真，只是方向相反
+           -- \"Do not write to the database\" is not the same as \"do not speak\": if the engine
+           -- thinks the human got it wrong, it should go through the Review queue rather than
+           -- change it outright. Bottling it up and changing it outright are both distortions,
+           -- just in opposite directions
            AND e.type_source <> 'human'
-           -- 值得看的三种：**还没有类的**、模型报过词表外类型的、
-           -- **以及现类本身还有子类的**。第三种是主力：抽取只认基类之后，
-           -- organization 下面挂着一大批更具体的类，那才是导进来的本体
-           -- 唯一的用武之地。只看前两种就把它整个漏掉了
+           -- The three kinds worth looking at: **those with no class yet**, those where the
+           -- model reported a type from outside the vocabulary, **and those whose current class
+           -- still has subclasses**. The third kind is the main force: now that extraction only
+           -- recognizes base classes, a large batch of more specific classes hangs under
+           -- organization, and that is the only place an imported ontology gets to prove its
+           -- worth. Looking only at the first two misses it entirely
            AND (e.type_id IS NULL OR e.proposed_type IS NOT NULL OR e.specific_type IS NOT NULL
                 OR EXISTS (SELECT 1 FROM entity_type_parents p WHERE p.parent_id = t.id))
          ORDER BY fact_count DESC, e.created_at
@@ -2038,10 +2182,12 @@ pub async fn entities_for_type_resolution(
     .await?)
 }
 
-/// 某个类的全部后代（含自身）。精化只能往粗类的后代走。
+/// Every descendant of a class (including itself). Refinement may only move to a descendant of the
+/// coarse class.
 ///
-/// **递归而不是一层**：本体是 DAG，`software_application ⊂ creative_work ⊂ thing`，
-/// 只查一层就把绝大多数正确答案挡在门外了。
+/// **Recursive, not one level**: the ontology is a DAG,
+/// `software_application ⊂ creative_work ⊂ thing`, and querying a single level shuts the vast
+/// majority of the correct answers out.
 pub async fn descendants_of(pool: &PgPool, kb_id: Uuid, root: Uuid) -> AppResult<Vec<Uuid>> {
     let rows: Vec<(Uuid,)> = sqlx::query_as(
         "WITH RECURSIVE d(id) AS (
@@ -2058,11 +2204,12 @@ pub async fn descendants_of(pool: &PgPool, kb_id: Uuid, root: Uuid) -> AppResult
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// 记下模型对这个实体自己的说法。
+/// Record what the model says this entity itself is.
 ///
-/// **后写者不覆盖先写者**（`IS NULL` 才写），与 `set_proposed_type` 同一条：
-/// 同一个实体会被多个分块提到，第一次的说法通常出自最完整的那句话，
-/// 后面的分块往往只是顺带一提。
+/// **A later write does not overwrite an earlier one** (it only writes when `IS NULL`), the same
+/// rule as `set_proposed_type`: the same entity gets mentioned by several chunks, the first
+/// statement usually comes from the most complete sentence, and the later chunks are often just a
+/// passing mention.
 pub async fn set_specific_type(pool: &PgPool, entity_id: Uuid, value: &str) -> AppResult<()> {
     sqlx::query(
         "UPDATE entities SET specific_type = left($2, 80)
@@ -2075,18 +2222,22 @@ pub async fn set_specific_type(pool: &PgPool, entity_id: Uuid, value: &str) -> A
     Ok(())
 }
 
-/// 跟这个实体最像的**已定类**实体，连同它们的类。
+/// The entities most like this one that **already have a class**, together with their classes.
 ///
-/// 类型消解的第二个候选来源。第一个是拿画像去搜类的描述，它的软肋实测很清楚：
-/// 中文画像对 schema.org 的 "A software application."，两边形状根本不对等。
-/// 这一条绕开了那道坎——**名字对名字、同语言**，而且库越大越准：
-/// 「深蓝向量数据库」像「Milvus」，而 Milvus 已经标成 software_application。
+/// The second candidate source for type resolution. The first is searching class descriptions with
+/// the profile, and measurement makes its weak spot very clear: a Chinese profile against
+/// schema.org's "A software application." -- the two shapes are simply not comparable.
+/// This one sidesteps that hurdle -- **name against name, in the same language** -- and it gets
+/// more accurate the larger the knowledge base: "深蓝向量数据库" is like "Milvus", and
+/// Milvus is already tagged software_application.
 ///
-/// 比的是双方的 `profile_embedding`（出现语境的滑动平均），**同一种向量对同一种
-/// 向量**，不是拿文本画像去比语境向量。代价是零——这个向量实体消解本来就在维护。
+/// What gets compared is both sides' `profile_embedding` (the running average of the contexts they
+/// appear in), **the same kind of vector against the same kind of vector**, not a text profile
+/// against a context vector. The cost is zero -- entity resolution maintains this vector anyway.
 ///
-/// 已知弱点：只出现在一篇文档里的实体，语境向量就是那一块的向量，同文档的实体
-/// 会互相成为近邻。调用方要看得到 `same_document`，别把它当成类型证据。
+/// Known weakness: for an entity that appears in only one document, the context vector is just
+/// that chunk's vector, so entities from the same document become each other's nearest neighbours.
+/// The caller has to be able to see `same_document` and must not take it as evidence of type.
 pub async fn nearest_typed_entities(
     pool: &PgPool,
     kb_id: Uuid,
@@ -2109,8 +2260,8 @@ pub async fn nearest_typed_entities(
                         WHERE f2.kb_id = $1 AND (f2.subject_id = e.id OR f2.object_id = e.id)
                           AND ev2.document_id IN (SELECT document_id FROM my_docs))
                 AS same_document
-         -- 内连接就是那道门：没判出类型的实体（type_id IS NULL）不是答案，
-         -- 拿它当邻居的证据只会把「没判出来」传染开
+         -- The inner join is that gate: an entity with no type determined (type_id IS NULL) is
+         -- not an answer, and using it as neighbour evidence only spreads \"not determined\" around
          FROM entities e
          JOIN entity_types t ON t.id = e.type_id
          WHERE e.kb_id = $1 AND e.merged_into IS NULL AND e.id <> $2
@@ -2126,43 +2277,53 @@ pub async fn nearest_typed_entities(
     .await?)
 }
 
-/// 按实体逐个改类，写进同一本账。返回 (批次 id, 改动数)。
+/// Retype entities one at a time, writing into the same ledger. Returns (batch id, number
+/// changed).
 ///
-/// 与 [`adopt_proposed_types`] 的区别只在挑选方式：那个按 `proposed_type` 这个
-/// **说法**认领一批，这个由调用方点名——类型消解裁决出来的是"这个实体是那个类"，
-/// 不是"叫这个说法的都是那个类"。
+/// The only difference from [`adopt_proposed_types`] is how they get picked: that one claims a
+/// batch by the **wording** in `proposed_type`, this one takes the caller's picks -- what type
+/// resolution adjudicates is "this entity is that class", not "everything called this wording is
+/// that class".
 ///
-/// 账本格式一字不差，所以 [`unadopt_types`] 原样能撤。
+/// The ledger format is identical down to the character, so [`unadopt_types`] can revert it as-is.
 pub async fn retype_entities(
     pool: &PgPool,
     kb_id: Uuid,
     picks: &[(Uuid, Uuid)],
-    // None = 引擎自动裁决。跟 entity_merges.merged_by 一个约定,
-    // 实体历史据此区分"某某某改的"与"高置信自动改的"
+    // None = the engine adjudicated on its own. The same convention as entity_merges.merged_by,
+    // and entity history uses it to tell "changed by so-and-so" from "changed automatically with
+    // high confidence"
     actor: Option<Uuid>,
 ) -> AppResult<(Uuid, u32)> {
     let batch_id = Uuid::now_v7();
     let mut moved = 0u32;
     let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // 一个实体在一批里只改一次。账本主键是 (batch_id, entity_id)，同一个 id
-    // 来两次会撞——而调用方拿到的是 500,整批一个都没落。这里挡住比在那边
-    // 追每一条产生 picks 的路子可靠:重复的第二条本来也没有意义
+    // An entity is retyped only once per batch. The ledger's primary key is
+    // (batch_id, entity_id), so the same id arriving twice collides -- and what the caller gets is
+    // a 500 with not a single row of the batch landing. Blocking it here is more reliable than
+    // chasing down every path that produces picks over there: a duplicate second entry was
+    // meaningless anyway
     let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for (entity_id, type_id) in picks {
         if !seen.insert(*entity_id) {
             continue;
         }
         let mut tx = pool.begin().await?;
-        // 已经在目标类上的不算改动，也不进账本——撤销时不该把它们推回去。
+        // Entities already on the target class do not count as changed and do not enter the
+        // ledger -- a revert should not push them back anywhere.
         //
-        // **旧类型要从 CTE 里读**：`UPDATE … RETURNING` 给的是新值，而账本要记的
-        // 是改之前那个。直接 RETURNING type_id 拿到的就是刚写进去的那一个，
-        // 撤销时等于把实体"放回"它现在的位置——账本看着满满当当，实际什么都撤不了。
-        // 条件也一并放进 CTE：这一行还在、没被合并、且确实要变
+        // **The old type has to be read out of the CTE**: `UPDATE … RETURNING` hands back the new
+        // value, while what the ledger needs is the one from before the change. A plain
+        // RETURNING type_id gives exactly what was just written, so a revert would "put" the
+        // entity back where it already is -- the ledger looks packed while nothing can actually
+        // be undone.
+        // The conditions go into the CTE as well: this row still exists, has not been merged, and
+        // really is about to change
         //
-        // **`IS DISTINCT FROM` 而不是 `<>`**：0009 之后起点常常是 NULL，而
-        // `NULL <> uuid` 是 NULL 不是 true——CTE 会空掉，UPDATE 一行不动，
-        // 于是"给没有类的实体定类"这个最主要的场景整个变成空操作
+        // **`IS DISTINCT FROM`, not `<>`**: since 0009 the starting point is often NULL, and
+        // `NULL <> uuid` is NULL rather than true -- the CTE would come out empty, the UPDATE
+        // would touch no rows, and the single most important case, "give a class to an entity
+        // that has none", would turn into a complete no-op
         let row: Option<(Option<Uuid>, String)> = sqlx::query_as(
             "WITH before AS (
                  SELECT id, type_id, canonical_name FROM entities
@@ -2202,19 +2363,20 @@ pub async fn retype_entities(
         names.insert(name);
         moved += 1;
     }
-    // 消歧后缀的兜底值就是类型标签，改了类就得重算
+    // The disambiguator's fallback value is the type label, so a class change means recomputing it
     for n in &names {
         refresh_disambiguators(pool, kb_id, n).await?;
     }
     Ok((batch_id, moved))
 }
 
-/// 人认可过的"粗类 → 细类"配对。
+/// The "coarse class → fine class" pairings a human has approved.
 ///
-/// 待人工那一档由"跨没跨分类轴"触发，而那条判据测的常常是**种子类跟导入词汇表
-/// 连没连上**，不是风险：schema.org 的 Place 另起 key，内置 location 零子类，
-/// 于是每个城市都要问一遍。配对是类与类之间的事，实体只是碰巧撞上它——
-/// 认可一次就该一直算数。
+/// The awaiting-human arm is triggered by "does this cross a classification axis", and what that
+/// test usually measures is **whether the seed classes are wired up to the imported vocabulary at
+/// all**, not risk: schema.org's Place gets its own key, the built-in location has zero subclasses,
+/// and so every city has to be asked about again. A pairing is a matter between two classes and an
+/// entity only happens to run into it -- approve it once and it should count from then on.
 pub async fn approved_refinements(
     pool: &PgPool,
     kb_id: Uuid,
@@ -2228,7 +2390,7 @@ pub async fn approved_refinements(
     Ok(rows.into_iter().collect())
 }
 
-/// 记下一个被认可的配对。重复认可是幂等的。
+/// Record an approved pairing. Approving the same one again is idempotent.
 pub async fn approve_refinement(
     pool: &PgPool,
     kb_id: Uuid,
@@ -2254,26 +2416,29 @@ pub async fn approve_refinement(
 mod same_type_tests {
     use super::{classify_type_drift, TypeDrift};
 
-    /// **相同类型是最常见的情形，而它曾经落在 Disjoint 上。**
+    /// **The same type is the most common case, and it used to land on Disjoint.**
     ///
-    /// 这个函数生来服务"类型漂移"（同名被抽成两种类型），那里两边相同不会发生；
-    /// 后来被 `containment_reviews` 借去当相容性判据，那里两边相同是常态。
-    /// 结果是 `Sherlock Holmes` 与 `Holmes` 一对都进不了审阅队列。
+    /// This function was born to serve "type drift" (one name extracted under two types), where
+    /// both sides being equal cannot happen; later `containment_reviews` borrowed it as a
+    /// compatibility test, and there both sides being equal is the norm.
+    /// The result was that `Sherlock Holmes` and `Holmes` never made it into the review queue as
+    /// a pair.
     #[test]
     fn the_same_type_is_a_recall_candidate() {
         for k in ["person", "location", "organization", "product", "event"] {
             assert_eq!(
                 classify_type_drift(Some(k), Some(k)),
                 TypeDrift::Recall,
-                "{k} 对 {k} 必须可召回"
+                "{k} against {k} must be recallable"
             );
         }
-        // 自定义类型同样——这里判的是"两边是不是同一种东西"，不是"它在不在白名单里"
+        // Custom types just the same -- what gets judged here is "are the two sides the same kind
+        // of thing", not "is it on the allowlist"
         assert_eq!(
             classify_type_drift(Some("drug"), Some("drug")),
             TypeDrift::Recall
         );
-        // 跨类型的老结论一条都不变
+        // Not one of the old cross-type conclusions changes
         assert_eq!(
             classify_type_drift(Some("person"), Some("organization")),
             TypeDrift::Disjoint

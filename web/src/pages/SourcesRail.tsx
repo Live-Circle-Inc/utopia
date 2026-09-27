@@ -1,4 +1,4 @@
-/* 来源栏（"来源即文件夹"）：Library 与 DocViewer 共用的左侧导航。 */
+/* The sources rail ("a source is a folder"): the left nav shared by Library and DocViewer. */
 import type { SourceKind } from "../sourceKinds";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -34,10 +34,10 @@ import { api, type SourceView } from "../api";
 import { S } from "../i18n";
 import { RAIL_CLS } from "../ui";
 
-/** 左栏选择：全部 / 手动上传 / 某个来源 id */
+/** Left-rail selection: all / manual uploads / the id of some source */
 export type LibrarySelection = "all" | "uploads" | string;
 
-/** 可选的来源图标（lucide 图标名 → 组件）。 */
+/** The source icons available to pick from (lucide icon name → component). */
 export const SOURCE_ICONS: Record<string, LucideIcon> = {
   "folder-open": FolderOpen,
   globe: Globe,
@@ -60,7 +60,7 @@ export const SOURCE_ICONS: Record<string, LucideIcon> = {
   users: Users,
 };
 
-// 按 SourceKind 键全：加一种来源没配图标，tsc 就红
+// keyed exhaustively by SourceKind: add a source kind without an icon and tsc goes red
 export const KIND_ICON: Record<SourceKind, LucideIcon> = {
   folder: FolderOpen,
   url: Globe,
@@ -78,7 +78,7 @@ export const KIND_ICON: Record<SourceKind, LucideIcon> = {
   upload: Upload,
 };
 
-/** 有拉取/同步语义的来源类型（folder/api 无同步概念） */
+/** Source kinds that have fetch/sync semantics (folder/api have no notion of syncing) */
 export const SYNCING_KINDS = new Set([
   "url",
   "rss",
@@ -101,7 +101,7 @@ export const SYNC_DOT: Record<SourceView["last_sync_status"], string> = {
 };
 
 export function sourceIcon(s: SourceView): LucideIcon {
-  // 内置类型图标固定，只有 custom 尊重用户自选图标
+  // built-in kinds have fixed icons; only custom respects the user's own icon choice
   if (s.kind === "custom" && s.icon && SOURCE_ICONS[s.icon]) return SOURCE_ICONS[s.icon];
   return KIND_ICON[s.kind] || Globe;
 }
@@ -145,11 +145,12 @@ export function SourcesRail({
   kbId: string;
   active: LibrarySelection | null;
   onSelect: (sel: LibrarySelection) => void;
-  /** 缺省时隐藏 "+"（如文档查看页） */
+  /** When omitted, the "+" is hidden (as on the document viewer page) */
   onAdd?: () => void;
 }) {
-  // 左栏只要两个数：整库多少篇、没有来源的多少篇。**各取一页零条**——
-  // 统计随响应回来，不必把文档拉下来数
+  // the rail needs only two numbers: how many documents in the whole base, and how many with no
+  // source. **Each asks for one page and zero rows** -- the totals come back with the response,
+  // so there is no need to pull the documents down and count them
   const docs = useQuery({
     queryKey: ["docCount", kbId],
     queryFn: () => api.documents(kbId, { limit: 1, offset: 0 }),
@@ -168,7 +169,8 @@ export function SourcesRail({
 
   return (
     <aside className={`${RAIL_CLS} flex flex-col`}>
-      {/* 全部文档置顶为一级入口；SOURCES 小节（含 +）居其下 */}
+      {/* All documents is pinned at the top as a first-class entry; the SOURCES section
+          (including its +) sits below it */}
       <div className="px-2 pt-3">
         <RailItem
           active={active === "all"}
@@ -193,7 +195,7 @@ export function SourcesRail({
         )}
       </div>
       <div className="u-scroll flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
-        {/* Uploads：常驻默认来源（上传的默认去处，不可删除） */}
+        {/* Uploads: the permanent default source (where uploads land by default, undeletable) */}
         <RailItem
           active={active === "uploads"}
           onClick={() => onSelect("uploads")}

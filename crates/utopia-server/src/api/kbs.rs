@@ -19,10 +19,12 @@ pub struct CreateKbReq {
     pub description: Option<String>,
     #[serde(default)]
     pub visibility: Option<String>,
-    /// 预置本体包的 id，按给定顺序装。空 = 只有十个种子。
+    /// The ids of the preset ontology packs, installed in the order given. Empty = only the
+    /// ten seeds.
     ///
-    /// **顺序有意义**：第一个包的类会认领同名的种子类（它们没有 IRI），
-    /// 后面的包撞名时查对齐表。schema.org 放第一个，别的包才对得上。
+    /// **The order matters**: the classes of the first pack claim the seed classes of the
+    /// same name (which have no IRI), and later packs consult the alignment table when names
+    /// collide. Put schema.org first, or the other packs have nothing to line up with.
     #[serde(default)]
     pub ontology_packs: Vec<String>,
 }
@@ -32,21 +34,24 @@ pub struct UpdateKbReq {
     pub name: Option<String>,
     pub description: Option<String>,
     pub visibility: Option<String>,
-    /// 自动扩本体开关（缺省开；关掉不影响"留意"，只是变成你点一下的提案）
+    /// The auto-extend-ontology switch (on by default; turning it off does not affect the
+    /// "noticing", it only turns the result into a proposal you have to click)
     #[serde(default)]
     pub auto_extend_ontology: Option<bool>,
-    /// 本体语言（`en` | `zh`）：跟语料走，不跟界面走。见 docs/decisions/0004
+    /// Ontology language (`en` | `zh`): follows the corpus, not the UI. See docs/decisions/0004
     #[serde(default)]
     pub ontology_lang: Option<String>,
-    /// 物化推理开关（缺省关）。见 docs/decisions/0002 R1
+    /// The materialised-inference switch (off by default). See docs/decisions/0002 R1
     #[serde(default)]
     pub materialize_inferences: Option<bool>,
-    /// 多久重推一次（分钟）。事实持续在变，只靠手点会让派生一直是缺的
+    /// How often to re-infer (minutes). Facts keep changing, and relying on hand-clicks
+    /// alone leaves the derivations permanently missing
     #[serde(default)]
     pub inference_interval_minutes: Option<i32>,
 }
 
-/// 用户可见的 KB 列表（restricted 库仅矩阵成员与系统管理员可见）。
+/// The KBs visible to a user (a restricted KB is visible only to matrix members and system
+/// admins).
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -59,7 +64,8 @@ pub async fn list(
     Ok(Json(list))
 }
 
-/// 建库：部署管理员（工作区 Admin+ 或系统管理员）。创建者自动进入矩阵为 admin。
+/// Creating a KB: a deployment admin (workspace Admin+ or a system admin). The creator
+/// automatically enters the matrix as admin.
 pub async fn create(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -74,8 +80,10 @@ pub async fn create(
     if !matches!(kind, "knowledge" | "memory") {
         return Err(AppError::Validation("kind must be 'knowledge' or 'memory'".into()).into());
     }
-    // 建库是部署管理动作（入口在 System settings）：系统管理员或工作区 Admin+。
-    // 用户自建库前端默认 restricted，不污染全员切换器；General 由系统初建保持 open
+    // Creating a KB is a deployment-administration action (the entry point is in System
+    // settings): a system admin, or workspace Admin+.
+    // A KB a user creates for themselves defaults to restricted in the frontend, so it does
+    // not pollute everyone's switcher; General, created by the system at init, stays open
     let ws_role =
         utopia_store::workspaces::require_role(&state.pool, user.id, workspace_id, Role::Viewer)
             .await?;
@@ -111,7 +119,8 @@ pub async fn create(
     Ok(Json(kb))
 }
 
-/// 我的知识库全景（账户层）：可见库 + 我的角色 + 加入信息 + 概览统计。
+/// The panorama of my knowledge bases (account level): visible KBs + my role + joining
+/// information + overview stats.
 pub async fn my_kbs(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -148,8 +157,9 @@ async fn kb_with_role(
     utopia_store::access::require_kb(&state.pool, user, kb_id, min).await
 }
 
-/// 详情附带调用者在本库的角色：前端据此门控破坏性操作（重建/删除）的入口，
-/// 不必让用户点到底才吃 403。
+/// The detail response carries the caller's role in this KB: the frontend gates the entry
+/// points to destructive operations (rebuild/delete) on it, instead of letting the user click
+/// all the way through only to eat a 403.
 pub async fn get_one(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -162,7 +172,7 @@ pub async fn get_one(
     Ok(Json(body))
 }
 
-/// 库设置（名称/描述/可见性）：库 admin 起步。
+/// KB settings (name/description/visibility): KB admin and up.
 pub async fn update(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -182,7 +192,7 @@ pub async fn update(
         req.inference_interval_minutes,
     )
     .await?;
-    // 审计只记不阻断
+    // The audit is recorded, never blocking
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(id),
@@ -203,7 +213,8 @@ pub async fn delete(
 ) -> ApiResult<Json<serde_json::Value>> {
     let kb = kb_with_role(&state, &user, id, Role::Admin).await?;
     utopia_store::kbs::delete(&state.pool, id).await?;
-    // kb_id 置 NULL：库已级联删除，事件留在部署层（actor 与库名在 detail）
+    // kb_id set to NULL: the KB is already cascade-deleted, so the event stays at the
+    // deployment layer (the actor and the KB name are in detail)
     let _ = utopia_store::audit::record(
         &state.pool,
         None,
@@ -218,7 +229,7 @@ pub async fn delete(
 }
 
 // ---------------------------------------------------------------------------
-// KB 成员矩阵（库自己的 Settings → Members）
+// The KB member matrix (the KB's own Settings → Members)
 // ---------------------------------------------------------------------------
 
 pub async fn members(
@@ -278,15 +289,15 @@ pub async fn remove_member(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 库级审计日志（Admin 起步；纯审计展示）。
+/// KB-level audit log (Admin and up; purely an audit display).
 #[derive(Deserialize)]
 pub struct AuditQuery {
-    /// 动作前缀。`entity.` 捞出 entity.retyped / entity.renamed 一族
+    /// An action prefix. `entity.` scoops up the entity.retyped / entity.renamed family
     #[serde(default)]
     pub action: Option<String>,
     #[serde(default)]
     pub actor: Option<Uuid>,
-    /// 含起点、不含终点，与半开区间的惯例一致
+    /// Start inclusive, end exclusive, in line with the half-open interval convention
     #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]
@@ -297,7 +308,7 @@ pub struct AuditQuery {
     pub offset: Option<i64>,
 }
 
-/// 日期参数：按天给（`2026-08-30`）或 RFC3339 都收。
+/// Date parameters: by day (`2026-08-30`) or RFC3339, both accepted.
 fn parse_day(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -310,8 +321,9 @@ fn parse_day(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>,
         .map_err(|_| AppError::invalid("bad_date", "expected YYYY-MM-DD or RFC3339"))
 }
 
-/// 审计台账。**分页 + 筛选**——从前是固定最近 100 条，而台账是合规材料，
-/// 「只看得到最近一百条」等于查不了历史。
+/// The audit ledger. **Paged + filtered** -- this used to be a fixed most-recent 100, and a
+/// ledger is compliance material, so "you can only see the last hundred" amounts to not being
+/// able to look up history at all.
 pub async fn audit_log(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -333,23 +345,28 @@ pub async fn audit_log(
         offset,
     )
     .await?;
-    // 下拉按这个库实际发生过的动作填，而不是一份硬编码清单——
-    // 后者会列出一堆这个库从来没有过的选项
+    // The dropdown is filled from the actions that have actually happened in this KB rather
+    // than from a hard-coded list -- the latter would list a pile of options this KB has
+    // never had
     let actions = utopia_store::audit::actions_for_kb(&state.pool, id).await?;
     Ok(Json(
         json!({ "events": events, "total": total, "actions": actions }),
     ))
 }
-/// 建库时装选中的本体包。
+/// Install the selected ontology packs at KB-creation time.
 ///
-/// 从前这里要先跑一次 `ensure_default_ontology`：包里的类要认领同名的种子类
-/// （`schema:Organization` 接管 `organization`），而认领的前提是那一行已经存在。
-/// **现在没有种子可认领了**——0009 删掉内置实体类、0010 与 `#125` 删掉种子关系、
-/// 0011 把 `mapped_to` 搬去语义层之后，播种函数本身也退场了。包直接落进空库。
+/// This used to run `ensure_default_ontology` first: the classes in a pack claim the seed
+/// classes of the same name (`schema:Organization` takes over `organization`), and claiming
+/// requires that row to already exist. **There are no seeds left to claim now** -- after 0009
+/// deleted the built-in entity types, 0010 and `#125` deleted the seed relations, and 0011
+/// moved `mapped_to` into the semantic layer, the seeding function itself left the stage too.
+/// Packs land straight into an empty KB.
 ///
-/// **一个包失败不回滚已装的**：本体是加法，装了一半的库仍然可用，
-/// 而回滚要撤已经建好的类——那正是 0008 决定不做导入撤销的理由。
-/// 失败信息里带上是哪个包，让人知道从哪补。
+/// **One pack failing does not roll back the ones already installed**: an ontology is
+/// additive, a half-installed KB is still usable, and rolling back would mean retracting
+/// classes that have already been created -- which is exactly why 0008 decided against
+/// undoing an import. The failure message names which pack it was, so a person knows where
+/// to pick up.
 async fn install_packs(
     state: &AppState,
     kb_id: Uuid,
@@ -362,31 +379,33 @@ async fn install_packs(
     let mut packs = Vec::with_capacity(pack_ids.len());
     for id in pack_ids {
         let pack = crate::ontology_packs::get(id)
-            .ok_or_else(|| AppError::invalid("unknown_pack", format!("未知的本体包：{id}")))?;
+            .ok_or_else(|| AppError::invalid("unknown_pack", format!("unknown pack: {id}")))?;
         packs.push((pack, crate::ontology_packs::bytes(pack)?));
     }
     for (pack, bytes) in &packs {
         crate::owl_import::apply(state, kb_id, actor, pack.filename, bytes)
             .await
-            .map_err(|e| AppError::Other(anyhow::anyhow!("装本体包 {} 失败：{e}", pack.id)))?;
+            .map_err(|e| AppError::Other(anyhow::anyhow!("installing {} failed: {e}", pack.id)))?;
     }
-    // 第二遍：跨包的 domain / range。包是挨个装的，先装的看不见后装的类——
-    // W3C Org 的 headOf 要等 FOAF 的 Agent（#222）。只装一个包时没有"别的包"
+    // Second pass: cross-pack domain / range. Packs are installed one by one, so an earlier
+    // one cannot see the classes of a later one -- W3C Org's headOf has to wait for FOAF's
+    // Agent (#222). With only one pack installed there is no "other pack"
     if packs.len() > 1 {
         for (pack, bytes) in &packs {
             let (d, r) =
                 crate::owl_import::relink_domains_ranges(state, kb_id, pack.filename, bytes)
                     .await
                     .map_err(|e| {
-                        AppError::Other(anyhow::anyhow!("补本体包 {} 的签名失败：{e}", pack.id))
+                        AppError::Other(anyhow::anyhow!("{} relink failed: {e}", pack.id))
                     })?;
-            tracing::debug!(%kb_id, pack = pack.id, domains = d, ranges = r, "跨包签名补链");
+            tracing::debug!(%kb_id, pack = pack.id, domains = d, ranges = r, "cross-pack relink");
         }
     }
     Ok(())
 }
 
-/// 可选的本体包清单，给建库界面。不需要登录之外的权限——它是静态数据。
+/// The list of available ontology packs, for the KB-creation UI. Needs no permission beyond
+/// being logged in -- it is static data.
 pub async fn list_packs(AuthUser(_): AuthUser) -> ApiResult<Json<serde_json::Value>> {
     let packs: Vec<_> = crate::ontology_packs::PACKS
         .iter()

@@ -13,12 +13,14 @@ use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct UploadQuery {
-    /// 目标 folder 来源：上传直接归入该文件夹（仅 kind=folder 接受上传）
+    /// The target folder source: the upload goes straight into that folder (only
+    /// kind=folder accepts uploads)
     #[serde(default)]
     pub source: Option<Uuid>,
 }
 
-/// 批量上传（multipart，可多文件）。重复内容（同 KB 同 sha256）跳过。
+/// Bulk upload (multipart, may be several files). Duplicate content (same KB, same sha256)
+/// is skipped.
 pub async fn upload(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -109,13 +111,13 @@ pub async fn upload(
 
 #[derive(serde::Deserialize)]
 pub struct DocsQuery {
-    /// 来源作用域：缺省 = 全部；`none` = 没有来源的；否则一个来源 id
+    /// Source scope: absent = all; `none` = the ones with no source; otherwise a source id
     #[serde(default)]
     pub source: Option<String>,
-    /// 文件名包含
+    /// Filename contains
     #[serde(default)]
     pub q: Option<String>,
-    /// 抽取状态：none | queued | extracting | done | failed
+    /// Extraction status: none | queued | extracting | done | failed
     #[serde(default)]
     pub graph: Option<String>,
     #[serde(default)]
@@ -124,10 +126,12 @@ pub struct DocsQuery {
     pub offset: Option<i64>,
 }
 
-/// 文库一页。
+/// One page of the library.
 ///
-/// **改成服务端筛选与分页**：从前一次取回整库、前端切片。27 篇没事，两万篇会把
-/// 整张表打进浏览器；而客户端筛选还有个更隐蔽的毛病——它只筛得到已经拿下来的那些。
+/// **Moved to server-side filtering and pagination**: this used to fetch the whole KB in one
+/// go and slice it on the front end. Fine for 27 documents, but twenty thousand will push the
+/// entire table into the browser; and client-side filtering has a more insidious flaw -- it
+/// can only filter over what has already been fetched.
 pub async fn list(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -148,10 +152,10 @@ pub async fn list(
     Ok(Json(page))
 }
 
-/// `None` = 全部，`Some(None)` = 没有来源的，`Some(Some(id))` = 某个来源。
+/// `None` = all, `Some(None)` = the ones with no source, `Some(Some(id))` = one source.
 ///
-/// 认不出的字符串当成「全部」而不是报错：这个参数来自界面上的一次点击，
-/// 而一次点击不该把整页变成一条错误。
+/// An unrecognised string is treated as "all" rather than an error: this parameter comes from
+/// a single click in the interface, and one click should not turn a whole page into an error.
 fn parse_scope(raw: Option<&str>) -> Option<Option<Uuid>> {
     match raw {
         None | Some("") => None,
@@ -160,10 +164,11 @@ fn parse_scope(raw: Option<&str>) -> Option<Option<Uuid>> {
     }
 }
 
-/// 一键重试这个作用域里全部抽取失败的文档。
+/// Retry every document in this scope whose extraction failed, in one click.
 ///
-/// **存在的理由是一条条点太慢**：一个来源里五篇失败就是点五次，而失败往往是
-/// 成批的（模型端点断了一阵，那段时间进来的全挂）。
+/// **It exists because clicking them one by one is too slow**: five failures in one source
+/// means five clicks, and failures tend to come in batches (the model endpoint was down for a
+/// while, and everything that arrived during that window died).
 pub async fn retry_failed(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -174,8 +179,10 @@ pub async fn retry_failed(
     let ids =
         utopia_store::documents::failed_ids(&state.pool, kb_id, parse_scope(q.source.as_deref()))
             .await?;
-    // 逐个入队而不是一条 SQL 批量改状态：排队本身有别的动作（解雇在跑的任务、
-    // 清增量标记），那些在 `queue_extraction_one` 里，绕过它会留下半截状态
+    // Enqueue one at a time rather than flipping the status in bulk with one SQL statement:
+    // enqueueing does other things too (dismissing the running job, clearing the incremental
+    // marker), those live in `queue_extraction_one`, and going around it leaves half-finished
+    // state behind
     let mut queued = 0usize;
     for id in &ids {
         if utopia_store::documents::queue_extraction_one(&state.pool, *id)
@@ -191,7 +198,7 @@ pub async fn retry_failed(
     Ok(Json(json!({ "queued": queued, "found": ids.len() })))
 }
 
-/// 文档详情 + 全部分块（文档查看器用）。
+/// Document detail + all its chunks (for the document viewer).
 pub async fn detail(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -203,7 +210,8 @@ pub async fn detail(
     Ok(Json(json!({ "document": doc, "chunks": chunks })))
 }
 
-/// 反向证据链：文档各分块抽出的事实（文档查看器右栏）。
+/// The reverse evidence chain: the facts extracted from each chunk of the document (the
+/// right-hand column of the document viewer).
 pub async fn extractions(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -243,7 +251,7 @@ pub async fn delete(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// 重新处理（解析器升级/失败重试）。
+/// Reprocess (parser upgrade / retry after failure).
 pub async fn reprocess(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -265,9 +273,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 抽取丢弃信号：哪些事实抽出来了却没能落地。整库一次取回——按
-/// (文档 × 原因 × 具体对象) 聚合后行数很小，Library 既算总数又展开详情，
-/// 不必逐行发请求。
+/// The extraction drop signal: which facts were extracted but never landed. Fetched for the
+/// whole KB in one go -- once aggregated by (document × reason × specific object) the row
+/// count is small, and the Library both counts the total and expands the details, so there is
+/// no need to send a request per row.
 pub async fn extraction_drops(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,

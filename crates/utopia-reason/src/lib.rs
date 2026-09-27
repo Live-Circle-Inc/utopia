@@ -1,16 +1,21 @@
-//! 一致性检查：拿本体声明的公理去量已经落库的事实（见 `docs/decisions/0002` R0）。
+//! Consistency checking: measuring the facts already in the ledger against the axioms the
+//! ontology declares (see `docs/decisions/0002` R0).
 //!
-//! **不写 `facts` 表，也不碰数据库。** 这一层只做判断：输入是边与公理，输出是
-//! 「哪几条事实互相矛盾」。取数与落库在 `utopia-store` / `utopia-server`。
+//! **Does not write the `facts` table, does not touch the database either.** This layer only
+//! judges: the input is edges and axioms, the output is "which facts contradict each other".
+//! Reading and persisting live in `utopia-store` / `utopia-server`.
 //!
-//! 这样分不是洁癖。ADR 说 R0 的价值在于「引擎的难点——规则表示、求值、终止——
-//! 全部建成并验证，而风险面为零」，而那些难点是纯逻辑：不起数据库就能跑几百个
-//! 用例，包括那些真实语料里未必凑得出来的形状（十一个节点的环、自环套在环里、
-//! 同一对节点被两条不同谓词连着）。
+//! Splitting it this way is not fastidiousness. The ADR says R0's value is that "the hard parts
+//! of the engine -- rule representation, evaluation, termination -- are all built and verified,
+//! with a risk surface of zero", and those hard parts are pure logic: with no database running
+//! you can put hundreds of cases through it, including shapes a real corpus may never happen to
+//! produce (an eleven-node cycle, a self-loop nested inside a cycle, the same pair of nodes
+//! joined by two different predicates).
 //!
-//! **没有公理就没有依据。** 四类检查每一类都由本体里的一位布尔决定要不要查，
-//! 没声明就不查——不报矛盾比猜一个公理出来安全。所以一个没装本体包的库跑出来
-//! 是零，那是实情不是故障。
+//! **No axiom, no grounds.** Each of the four kinds of check is decided by one boolean in the
+//! ontology; not declared means not checked -- reporting no contradiction is safer than guessing
+//! an axiom into existence. So a knowledge base with no ontology pack installed comes out at
+//! zero, and that is the truth, not a malfunction.
 
 pub mod derive;
 pub mod ontology;
@@ -18,7 +23,7 @@ pub mod ontology;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-/// 一条参与检查的事实：谁、什么关系、指向谁。
+/// One fact taking part in a check: who, what relation, pointing at whom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edge {
     pub fact: Uuid,
@@ -27,7 +32,7 @@ pub struct Edge {
     pub object: Uuid,
 }
 
-/// 一个谓词声明了哪些公理。四位都为假的谓词根本不进检查。
+/// Which axioms a predicate declares. A predicate with all four bits false never enters a check.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Axioms {
     pub transitive: bool,
@@ -36,59 +41,64 @@ pub struct Axioms {
     pub irreflexive: bool,
     pub functional: bool,
     pub inverse_functional: bool,
-    /// `p⁻¹ = q`：这个谓词的逆是哪一个。**跨谓词的规则从这里来**——
-    /// `A p B` 推出 `B q A`，而 R0 的检查也要看它（自己是自己的逆等于对称）
+    /// `p⁻¹ = q`: which predicate this one's inverse is. **This is where cross-predicate rules
+    /// come from** -- `A p B` entails `B q A`, and the R0 checks look at it too (being its own
+    /// inverse is the same as symmetric)
     pub inverse_of: Option<Uuid>,
-    /// `p ⊑ q`：断言了具体的，通用的也成立。链要防成环，R0 那边查
+    /// `p ⊑ q`: assert the specific one and the general one holds too. The chain has to be kept
+    /// from closing into a ring, which R0 checks
     pub sub_property_of: Option<Uuid>,
 }
 
 impl Axioms {
-    /// 一位都没声明的谓词不必检查——**这是性能上的事，也是语义上的事**：
-    /// 没有公理就没有判据，扫它只会白扫。
+    /// A predicate that declares not one bit needs no checking -- **that is a performance matter
+    /// and a semantic one**: no axiom means no criterion, and scanning it is wasted work.
     fn says_nothing(&self) -> bool {
         *self == Axioms::default()
     }
 }
 
-/// 查出来的一处矛盾。落库在 `axiom_violations`——**不进 `fact_conflicts`**：
-/// 那张表问的是「哪条对」，而公理违规问的是「错在数据还是错在定义」，
-/// 后者的出路可能是去改本体。
+/// One contradiction found. Persisted in `axiom_violations` -- **not in `fact_conflicts`**:
+/// that table asks "which one is right", whereas an axiom violation asks "is the data wrong or
+/// is the definition wrong", and the way out of the latter may be to go change the ontology.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     pub kind: Kind,
-    /// 涉及的事实。**自反违反只有一条**——它跟自己矛盾，不需要第二条。
-    /// 环取首尾两条（中间那些在 `path` 里）。
+    /// The facts involved. **An irreflexivity violation has only one** -- it contradicts itself,
+    /// no second fact needed. A cycle takes the first and the last (the ones in between are in
+    /// `path`).
     pub left: Uuid,
     pub right: Uuid,
-    /// 环的完整路径，按事实排列；其余三类为空。
-    /// 留着是因为「A→B→C→A」比「A 与 C 矛盾」有用得多——人要顺着看一遍才知道
-    /// 该撤哪一条
+    /// The cycle's full path, as a list of facts; empty for the other three kinds.
+    /// Kept because "A→B→C→A" is far more useful than "A contradicts C" -- a human has to walk
+    /// it once to know which link to retract
     pub path: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
-    /// `A p A`，而 p 声明了 irreflexive
+    /// `A p A`, and p declares irreflexive
     SelfLoop,
-    /// `A p B` 且 `B p A`，而 p 声明了 asymmetric
+    /// `A p B` and `B p A`, and p declares asymmetric
     Asymmetry,
-    /// `A p B p … p A`，而 p 声明了 transitive——闭包里推出 `A p A`
+    /// `A p B p … p A`, and p declares transitive -- the closure entails `A p A`
     Cycle,
-    /// 同一主语与谓词同时指向两个宾语，而 p 声明了 functional
-    /// （inverse_functional 则是同一宾语被两个主语指）
+    /// The same subject and predicate pointing at two objects at once, and p declares functional
+    /// (inverse_functional is the same object being pointed at by two subjects)
     Functional,
-    /// `A p B`，而 A 不在 p 声明的 domain 里、或 B 不在 range 里（#190 / #196）。
+    /// `A p B`, but A is not in p's declared domain, or B is not in its range (#190 / #196).
     ///
-    /// **这一类不由本 crate 算出**：它要看实体的类型与 domain / range 的闭包，那是
-    /// 库里的东西，`utopia-store::reasoning::signature_breaks` 用 SQL 量。列在这里
-    /// 是为了与其它四类走同一条落库、清陈、裁决的路——left 与 right 同一条事实，
-    /// 与自反那类同款
+    /// **This kind is not computed by this crate**: it needs the entities' types and the closure
+    /// of domain / range, which live in the database, and
+    /// `utopia-store::reasoning::signature_breaks` measures it in SQL. It is listed here so it
+    /// travels the same persist / clear-stale / adjudicate path as the other four kinds -- left
+    /// and right are the same fact, the same way as the irreflexive kind
     Signature,
-    /// 一条派生撞上了一条断言（0017）：推出来的 `A p B` 与账本里的某条断言在 p 的
-    /// 公理上不能并存。派生不落地，这一行把它摆到人面前。`left` 是被撞的断言，
-    /// `right` 是派生的最后一条前提，`path` 是全部前提；推出来的三元组本身在
-    /// `axiom_violations.detail` 里——它没有落库，没有 id 可指
+    /// A derivation ran into an assertion (0017): the entailed `A p B` cannot coexist with some
+    /// assertion in the ledger under p's axioms. The derivation is not persisted; this row puts
+    /// it in front of a human. `left` is the assertion that was hit, `right` is the derivation's
+    /// last premise, `path` is all the premises; the entailed triple itself sits in
+    /// `axiom_violations.detail` -- it was never persisted, so there is no id to point at
     DerivedContradiction,
 }
 
@@ -105,18 +115,20 @@ impl Kind {
     }
 }
 
-/// 环检测的深度上限。
+/// Depth cap for cycle detection.
 ///
-/// **必须有，不是防御性编程。** 0002 在真实语料上量过：`part_of` 的传递闭包
-/// 从 185 条膨胀到 828 条且**不收敛**——深度分布 `1:185 2:181 3:141 4:45
-/// 5:52 6:40 7:52 8:40 9:52 10:40`，第 5 层起振荡而不是衰减，那是有环的形状。
-/// 没有上限，一个环就能让求值不终止。
+/// **Required, not defensive programming.** 0002 measured it on a real corpus: the transitive
+/// closure of `part_of` swelled from 185 rows to 828 and **did not converge** -- the depth
+/// distribution was `1:185 2:181 3:141 4:45 5:52 6:40 7:52 8:40 9:52 10:40`, oscillating rather
+/// than decaying from level 5 onwards, which is the shape of a cycle. Without a cap, one cycle
+/// is enough to stop evaluation from terminating.
 pub const MAX_DEPTH: usize = 12;
 
-/// 拿公理量一遍这批边。
+/// Measure this batch of edges against the axioms.
 ///
-/// 每个谓词各查各的：公理是挂在谓词上的，跨谓词的边之间没有可比性
-/// （`A part_of B` 与 `B produces A` 同时成立不是矛盾）。
+/// Each predicate is checked on its own: axioms hang off predicates, and edges of different
+/// predicates are not comparable (`A part_of B` and `B produces A` holding at once is not a
+/// contradiction).
 pub fn check(edges: &[Edge], axioms: &HashMap<Uuid, Axioms>) -> Vec<Violation> {
     let mut out = Vec::new();
     let mut by_pred: HashMap<Uuid, Vec<Edge>> = HashMap::new();
@@ -156,7 +168,8 @@ fn self_loops(edges: &[Edge]) -> Vec<Violation> {
         .filter(|e| e.subject == e.object)
         .map(|e| Violation {
             kind: Kind::SelfLoop,
-            // 两列填同一条：它跟自己矛盾，没有第二条事实可指
+            // Both columns get the same fact: it contradicts itself, there is no second fact to
+            // point at
             left: e.fact,
             right: e.fact,
             path: Vec::new(),
@@ -169,7 +182,7 @@ fn asymmetries(edges: &[Edge]) -> Vec<Violation> {
     let mut out = Vec::new();
     for e in edges {
         if e.subject == e.object {
-            // 自环由 irreflexive 那一档负责；反对称在这里报一遍是重复
+            // Self-loops are the irreflexive check's job; reporting them here too is a duplicate
             continue;
         }
         if let Some(&other) = seen.get(&(e.object, e.subject)) {
@@ -185,13 +198,14 @@ fn asymmetries(edges: &[Edge]) -> Vec<Violation> {
     out
 }
 
-/// 找环。**每个环只报一次**，从环上最小的节点起算。
+/// Find cycles. **Each cycle is reported once**, counted from the smallest node on it.
 ///
-/// 用深度优先而不是半朴素闭包求值：两者都能发现环，但闭包只告诉你「A 推出了
-/// A」，而人要的是**路径**——顺着 `A→B→C→A` 看一遍才知道该撤哪一条。闭包丢掉
-/// 的正是这个。
+/// Depth-first rather than semi-naive closure evaluation: both find cycles, but the closure only
+/// tells you "A entailed A", whereas what a human wants is the **path** -- you have to walk
+/// `A→B→C→A` once to know which link to retract. That is exactly what the closure throws away.
 ///
-/// R1 物化推导要的是闭包本身，那时再建；R0 要的是「哪几条边凑成了环」。
+/// R1's materialised inference wants the closure itself; build it then. R0 wants "which edges
+/// add up to a cycle".
 fn cycles(edges: &[Edge]) -> Vec<Violation> {
     let mut adj: HashMap<Uuid, Vec<&Edge>> = HashMap::new();
     for e in edges {
@@ -232,8 +246,9 @@ fn walk<'a>(
     let Some(next) = adj.get(&at) else { return };
     for e in next {
         if e.object == start && !path.is_empty() {
-            // 回到起点：成环。**按事实 id 排序去重**——同一个环从不同节点
-            // 出发会被走到 n 次，报 n 遍就是让人把同一件事看 n 次
+            // Back at the start: a cycle. **Deduplicate on sorted fact ids** -- the same cycle
+            // gets walked n times, once from each node on it, and reporting it n times just
+            // makes a human look at the same thing n times
             let mut facts: Vec<Uuid> = path.iter().map(|x| x.fact).collect();
             facts.push(e.fact);
             let mut key = facts.clone();
@@ -259,10 +274,10 @@ fn walk<'a>(
     }
 }
 
-/// 函数性违反：同一个「一端」指向了两个不同的「另一端」。
+/// A functionality violation: the same "one end" pointing at two different "other ends".
 ///
-/// `functional` 与 `inverse_functional` 是同一个判断的两个方向，所以共用这一个
-/// 函数，由调用方决定哪一端是键。
+/// `functional` and `inverse_functional` are two directions of the same judgement, so they share
+/// this one function and the caller decides which end is the key.
 fn too_many(edges: &[Edge], key: fn(&Edge) -> Uuid, val: fn(&Edge) -> Uuid) -> Vec<Violation> {
     let mut by_key: HashMap<Uuid, Vec<&Edge>> = HashMap::new();
     for e in edges {
@@ -270,8 +285,9 @@ fn too_many(edges: &[Edge], key: fn(&Edge) -> Uuid, val: fn(&Edge) -> Uuid) -> V
     }
     let mut out = Vec::new();
     for (_, group) in by_key {
-        // 只报第一对。同一个主语指了五个宾语时报十对（两两组合）只是把同一件事
-        // 说十遍——人要处理的是「这里有冲突」，看一对就够去查了
+        // Only report the first pair. When one subject points at five objects, reporting ten
+        // pairs (every combination) just says the same thing ten times -- what a human has to
+        // deal with is "there is a conflict here", and one pair is enough to go looking
         let mut distinct: Vec<&Edge> = Vec::new();
         for e in group {
             if !distinct.iter().any(|d| val(d) == val(e)) {
@@ -294,13 +310,15 @@ fn too_many(edges: &[Edge], key: fn(&Edge) -> Uuid, val: fn(&Edge) -> Uuid) -> V
 mod tests {
     use super::*;
 
-    /// 造边的简写。节点用小整数编出稳定的 uuid，读断言时看得出谁是谁。
+    /// Shorthand for building edges. Nodes get stable uuids out of small integers, so you can
+    /// tell who is who when reading the assertions.
     fn n(i: u8) -> Uuid {
         Uuid::from_bytes([i; 16])
     }
     fn f(i: u8) -> Uuid {
-        // 与节点 id 分段:节点用低位,事实用高位。`u8` 装得下 0..=255,
-        // 而测试里造过 30 条边的链——用 `200 + i` 会溢出
+        // Kept in a different range from node ids: nodes use the low end, facts the high end.
+        // `u8` only holds 0..=255, and the tests build a chain of 30 edges -- `200 + i` would
+        // overflow
         Uuid::from_bytes([i; 16].map(|b| b ^ 0xF0))
     }
     fn e(fact: u8, s: u8, o: u8) -> Edge {
@@ -320,14 +338,16 @@ mod tests {
         k
     }
 
-    /// **没声明公理的谓词一条都不查。** 这是整套检查的地基：没有依据就不报矛盾。
+    /// **A predicate that declares no axioms is not checked at all.** This is the bedrock of the
+    /// whole set of checks: no grounds, no contradiction reported.
     ///
-    /// 反过来说也成立——一个没装本体包的库跑出来是零，那是实情不是故障。
+    /// The converse holds too -- a knowledge base with no ontology pack installed comes out at
+    /// zero, and that is the truth, not a malfunction.
     #[test]
     fn a_predicate_that_declares_nothing_is_never_checked() {
         let edges = [e(1, 1, 1), e(2, 1, 2), e(3, 2, 1)];
         assert!(check(&edges, &with(Axioms::default())).is_empty());
-        // 连 axioms 里都没有这个谓词时同样不查（本体里没有这一行）
+        // Same when the predicate is not even in `axioms` (no such row in the ontology)
         assert!(check(&edges, &HashMap::new()).is_empty());
     }
 
@@ -350,12 +370,13 @@ mod tests {
             }),
         );
         assert_eq!(kinds(&v), vec![Kind::SelfLoop]);
-        // 只有一条事实：两列填同一个 id
+        // Only one fact: both columns get the same id
         assert_eq!(v[0].left, v[0].right);
     }
 
-    /// 反对称那一档**不重复报自环**。`A p A` 同时满足「有反向边」的字面意思，
-    /// 不挡掉的话一条自环会在两档里各报一次，人看到两条要处理的东西而其实是一件。
+    /// The asymmetry check **does not re-report self-loops**. `A p A` also satisfies the literal
+    /// reading of "has an edge the other way", and without the guard one self-loop would be
+    /// reported once in each check, so a human sees two things to deal with when there is one.
     #[test]
     fn a_self_loop_is_reported_once_not_twice() {
         let edges = [e(1, 1, 1)];
@@ -393,7 +414,8 @@ mod tests {
         assert_eq!((v[0].left, v[0].right), (f(1), f(2)));
     }
 
-    /// 长环要报出**路径**，而不只是「首尾矛盾」——人要顺着看一遍才知道撤哪一条。
+    /// A long cycle has to report the **path**, not merely "the two ends contradict" -- a human
+    /// has to walk it once to know which link to retract.
     #[test]
     fn a_long_cycle_reports_the_whole_path() {
         let edges = [e(1, 1, 2), e(2, 2, 3), e(3, 3, 4), e(4, 4, 1)];
@@ -404,12 +426,13 @@ mod tests {
                 ..Default::default()
             }),
         );
-        assert_eq!(v.len(), 1, "一个环只报一次");
-        assert_eq!(v[0].path.len(), 4, "四条边都该在路径里");
+        assert_eq!(v.len(), 1, "one cycle is reported only once");
+        assert_eq!(v[0].path.len(), 4, "all four edges belong in the path");
     }
 
-    /// **同一个环从不同节点出发会被走到 n 次。** 去重是这个函数存在的一半理由：
-    /// 报四遍就是让人把同一件事看四遍。
+    /// **The same cycle gets walked n times, once from each node on it.** Deduplication is half
+    /// the reason this function exists: reporting it four times just makes a human look at the
+    /// same thing four times.
     #[test]
     fn one_cycle_is_one_finding_however_many_ways_in() {
         let edges = [e(1, 1, 2), e(2, 2, 3), e(3, 3, 1)];
@@ -423,7 +446,7 @@ mod tests {
         assert_eq!(v.len(), 1);
     }
 
-    /// 两个互不相干的环各报一次。
+    /// Two unrelated cycles are reported once each.
     #[test]
     fn separate_cycles_stay_separate() {
         let edges = [e(1, 1, 2), e(2, 2, 1), e(3, 5, 6), e(4, 6, 5)];
@@ -437,11 +460,12 @@ mod tests {
         assert_eq!(v.len(), 2);
     }
 
-    /// **深度上限挡得住不收敛。** 0002 在真实语料上量到 `part_of` 闭包深度到 10
-    /// 仍在振荡；没有上限，一条长链加一个环就能让求值不终止。
+    /// **The depth cap is what holds off non-convergence.** 0002 measured the `part_of` closure
+    /// on a real corpus still oscillating at depth 10; without a cap, one long chain plus one
+    /// cycle is enough to stop evaluation from terminating.
     ///
-    /// 这里造一条比上限更长的链再闭合——它不该让检查挂住，报不报得出那个环是
-    /// 次要的，**不挂住是首要的**。
+    /// Here we build a chain longer than the cap and then close it -- it must not hang the
+    /// check. Whether that cycle gets reported is secondary; **not hanging is primary**.
     #[test]
     fn a_chain_longer_than_the_limit_still_terminates() {
         let mut edges: Vec<Edge> = (0..30).map(|i| e(i, i, i + 1)).collect();
@@ -453,13 +477,13 @@ mod tests {
                 ..Default::default()
             }),
         );
-        // 断言的是"跑完了"，长度不作要求
+        // What is asserted is "it ran to completion"; the length is not required to be anything
         assert!(v.len() <= 1);
     }
 
     #[test]
     fn functional_and_its_inverse_are_two_directions_of_one_check() {
-        // 同一个主语指了两个宾语
+        // One subject pointing at two objects
         let out = [e(1, 1, 2), e(2, 1, 3)];
         assert_eq!(
             kinds(&check(
@@ -480,7 +504,7 @@ mod tests {
         )
         .is_empty());
 
-        // 同一个宾语被两个主语指
+        // One object pointed at by two subjects
         let inn = [e(1, 2, 1), e(2, 3, 1)];
         assert_eq!(
             kinds(&check(
@@ -502,8 +526,9 @@ mod tests {
         .is_empty());
     }
 
-    /// 同一个主语指五个宾语只报一对。报十对（两两组合）是把同一件事说十遍——
-    /// 人要处理的是「这里有冲突」，看一对就够去查了。
+    /// One subject pointing at five objects reports one pair. Reporting ten pairs (every
+    /// combination) says the same thing ten times -- what a human has to deal with is "there is
+    /// a conflict here", and one pair is enough to go looking.
     #[test]
     fn one_finding_per_conflicting_key_not_one_per_pair() {
         let edges = [e(1, 1, 2), e(2, 1, 3), e(3, 1, 4), e(4, 1, 5), e(5, 1, 6)];
@@ -517,7 +542,8 @@ mod tests {
         assert_eq!(v.len(), 1);
     }
 
-    /// 同一个主语两次指向**同一个**宾语不是冲突——重复断言而已。
+    /// The same subject pointing twice at the **same** object is not a conflict -- just a
+    /// repeated assertion.
     #[test]
     fn saying_the_same_thing_twice_is_not_a_contradiction() {
         let edges = [e(1, 1, 2), e(2, 1, 2)];
@@ -531,8 +557,8 @@ mod tests {
         .is_empty());
     }
 
-    /// **公理挂在谓词上，跨谓词的边之间没有可比性。**
-    /// `A p B` 与 `B q A` 同时成立不是矛盾，哪怕 p 声明了反对称。
+    /// **Axioms hang off predicates, and edges of different predicates are not comparable.**
+    /// `A p B` and `B q A` holding at once is not a contradiction, even if p declares asymmetric.
     #[test]
     fn axioms_do_not_leak_across_predicates() {
         let a = Edge {

@@ -1,48 +1,62 @@
-//! 把模型说出的谓词落到本体里**已经有**的关系上。
+//! Lands the predicate the model came out with on a relation the ontology **already has**.
 //!
-//! 抽取原本只做精确 key 比对（`rel_ids.get(f.predicate)`），对不上就降级成
-//! `related_to`，原词留在 `fact_evidence.proposed_predicate` 等人来采纳。
+//! Extraction used to do nothing but an exact key comparison (`rel_ids.get(f.predicate)`); when
+//! that missed it downgraded to `related_to` and left the original word in
+//! `fact_evidence.proposed_predicate` for a human to adopt.
 //!
-//! 实测这样漏得很凶。ai-timeline 语料（维基百科的 AI 公司条目）跑到一半时，
-//! 49.8% 的事实是 `related_to`，`ontology_misses` 里 398 个不同的关系名、895 次使用。
-//! 其中一类根本不是缺词汇，是**词汇就在本体里，模型只是说反了或换了时态**：
-//! `produced_by | ChatGPT → OpenAI` 想说的就是已有的 `produces`，主宾对调而已。
+//! Measured, that leaks badly. Halfway through the ai-timeline corpus (Wikipedia articles on AI
+//! companies), 49.8% of the facts were `related_to`, and `ontology_misses` held 398 distinct
+//! relation names across 895 uses. One class of those is not missing vocabulary at all, it is
+//! **vocabulary that is right there in the ontology, with the model merely saying it backwards
+//! or in a different tense**: `produced_by | ChatGPT → OpenAI` means the `produces` we already
+//! have, just with subject and object swapped.
 //!
-//! 那个 49.8% 是**测量台把自动扩本体关掉之后**的数字（`run.mjs` 建库即置
-//! `auto_extend_ontology=FALSE`，而列默认值是 true）。产品的实际冷启动路径是
-//! `bootstrap_ontology` 事后补本体，所以别拿这个占比去说产品有多糟——
-//! 它量的是"缺词汇时降级有多频繁"，而这正是本模块要减少的那一部分。
+//! That 49.8% is the number **after the measurement harness turned off automatic extension of
+//! the ontology** (`run.mjs` sets `auto_extend_ontology=FALSE` at base creation, while the
+//! column default is true). The product's actual cold-start path is `bootstrap_ontology`
+//! filling the ontology in afterwards, so do not use this proportion to say how bad the product
+//! is -- it measures "how often we downgrade when vocabulary is missing", and that is exactly
+//! the part this module is here to reduce.
 //!
-//! 这里补三段，**顺序即优先级**，宽的永远排在窄的后面：
+//! Three stages are added here, **order is priority**, and the wide ones always come after the
+//! narrow ones:
 //!
-//! 1. 精确 key —— 原有行为，一字不改
-//! 2. 写法对齐 —— `acquiredFrom` / `acquired_from` / `Acquired From` 是同一个
-//! 3. 屈折归一 —— `produced` 与 `produces` 折到同一串（只削时态与单复数，见 `inflect_base`）
+//! 1. Exact key -- the existing behaviour, not a character changed
+//! 2. Spelling alignment -- `acquiredFrom` / `acquired_from` / `Acquired From` are one and the same
+//! 3. Inflection folding -- `produced` and `produces` fold to the same string (only tense and
+//!    plurals get shaved, see `inflect_base`)
 //!
-//! 2、3 各再试一次「去掉结尾的 by」，命中就**把主宾对调**：英语里 `_by` 是被动的
-//! 明确标记，`X produced_by Y` 与 `Y produces X` 是同一条边。
+//! Stages 2 and 3 each get one more try at "drop a trailing by", and on a hit they **swap
+//! subject and object**: in English `_by` is an explicit marker of the passive, and
+//! `X produced_by Y` is the same edge as `Y produces X`.
 //!
-//! **撞车就不匹配。** 本体里若同时有 `produces` 和 `produced`，两者折到同一串，
-//! 这时选谁都是猜——宁可降级，让人去采纳。只有精确 key 不受此限，它本来就唯一。
+//! **A collision means no match.** If the ontology holds both `produces` and `produced`, the two
+//! fold to the same string, and picking either is a guess -- better to downgrade and let a human
+//! adopt it. Only the exact key is exempt from this; it is unique to begin with.
 //!
-//! **量到了什么**（同一份 895 次未匹配，两种词表）：种子本体 10 个关系捞回 49 次；
-//! schema.org 629 个关系捞回 59 次。捞回的 9 个说法里 6 个正确、3 个方向可疑
-//!（`addresses→address`、`funds→funding`、`sponsors→sponsor`），各 1 次，
-//! **全部来自光削一个 `s` 那条路**——英语里 `sponsors` 既是动词第三人称也是名词复数，
-//! 靠后缀分不出来。没为这三条再加规则：样本太小，加了就是过拟合。
-//! 它们的反事实也不是「正确」，而是 `related_to`——原词仍在 proposed_predicate 里。
+//! **What was measured** (the same 895 misses, two vocabularies): a seed ontology of 10
+//! relations recovered 49 of them; schema.org's 629 relations recovered 59. Of the 9 recovered
+//! wordings 6 are correct and 3 have a dubious direction (`addresses→address`,
+//! `funds→funding`, `sponsors→sponsor`), one use each, and **all of them come from the path
+//! that shaves off a single `s`** -- in English `sponsors` is both a third-person verb and a
+//! plural noun, and a suffix cannot tell them apart. No further rule was added for those three:
+//! the sample is too small, and adding one would just be overfitting. Their counterfactual is
+//! not "correct" either, it is `related_to` -- the original word is still in
+//! proposed_predicate.
 //!
-//! 不做同义判断（`partners_with` 与 `collaborates_with`）：那是检索与模型的活。
-//! 摆在这里会把「写法对齐」悄悄变成「意思大概差不多」，而后者错了没人看得见。
+//! No synonym judgement (`partners_with` against `collaborates_with`): that is the job of
+//! retrieval and of the model. Putting it here would quietly turn "spelling alignment" into
+//! "means roughly the same thing", and when the latter is wrong nobody can see it.
 
 use std::collections::HashMap;
 use utopia_core::models::RelationType;
 use uuid::Uuid;
 
-/// 切词：非字母数字处切，驼峰的大小写交界处也切。
+/// Word splitting: split at every non-alphanumeric character, and at camelCase boundaries too.
 ///
-/// 驼峰那一半不是可选的：OWL 导入的 key 就是 `acquiredFrom`，不切的话它跟手写的
-/// `acquired_from` 折不到一起，而「导入的本体能不能被用上」正是这条路要保的。
+/// The camelCase half is not optional: an OWL-imported key looks exactly like `acquiredFrom`, and
+/// without the split it will not fold together with a hand-written `acquired_from` -- and
+/// "whether an imported ontology can actually be used" is precisely what this path protects.
 fn words(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -67,30 +81,36 @@ fn words(s: &str) -> Vec<String> {
     out
 }
 
-/// 写法对齐形：切完的词直接拼起来，分隔符不留。与
-/// `api::ontology_routes::normalize_name` 同规则。
+/// The spelling-aligned form: concatenate the split words directly, keeping no separators. Same
+/// rule as `api::ontology_routes::normalize_name`.
 fn joined(words: &[String]) -> String {
     words.concat()
 }
 
-/// 屈折归一：削掉时态与单复数，**不碰派生后缀**。
+/// Inflection folding: shave off tense and plurals, **do not touch derivational suffixes**.
 ///
-/// 这里一度用的是 Snowball（`rust-stemmers`），实测反了：词表 10 个词时捞回 49 次，
-/// 换成 schema.org 的 629 个词只剩 18 次。因为 Snowball 连派生后缀一起削，
-/// `producer` 与 `produces` 都成了 `produc`，撞车规则于是拒绝匹配——**词表越大越不敢动**。
-/// 而 `producer`（一个人）和 `produces`（一个动作）本来就该是两个关系，
-/// 折到一起是词干器的错，不是撞车规则的错。
+/// This was Snowball (`rust-stemmers`) at one point, and the measurement came out backwards: with
+/// a vocabulary of 10 words it recovered 49, and swapping in schema.org's 629 words left only 18.
+/// Because Snowball shaves derivational suffixes along with the rest, `producer` and `produces`
+/// both became `produc`, so the collision rule refused to match -- **the bigger the vocabulary,
+/// the less it dared touch**. And `producer` (a person) and `produces` (an action) ought to be
+/// two relations in the first place; folding them together is the stemmer's fault, not the
+/// collision rule's.
 ///
-/// 所以只做屈折：`-ies→y`、`-ing`、`-ed`、`-s`（`-ss` 除外），削完再去掉结尾的 `e`。
-/// 最后那一步是为了让 `-s` 和 `-ed` 两条路汇合——`produces→produce→produc`、
-/// `produced→produc`，否则同一个动词的两种时态永远对不上。
+/// So inflection only: `-ies→y`, `-ing`, `-ed`, `-s` (except `-ss`), and once shaved, drop a
+/// trailing `e`. That last step is there to make the `-s` and `-ed` paths meet --
+/// `produces→produce→produc`, `produced→produc` -- otherwise the two tenses of one verb would
+/// never line up.
 ///
-/// 长度守卫看的是**削完之后**的结果，不是中间结果。按中间结果卡会让两条路
-/// 走岔：`uses` 削 `-s` 剩三个字母过关、再掉个 `e` 变两个，而 `used` 削 `-ed`
-/// 当场就是两个、被拦下——同一个动词的两种时态于是永远对不上。
-/// 剩不到两个字母就整个不削（`is` 不该变成 `i`，`led` 不该变成 `l`）。
+/// The length guard looks at the result **after** shaving, not at the intermediate result.
+/// Gating on the intermediate result makes the two paths diverge: `uses` shaves `-s`, passes
+/// with three letters left, then drops an `e` and becomes two, while `used` shaves `-ed`, is two
+/// letters on the spot and gets blocked -- so the two tenses of one verb would never line up.
+/// If fewer than two letters would be left, nothing is shaved at all (`is` must not become `i`,
+/// `led` must not become `l`).
 ///
-/// 中文没有屈折后缀，走这里是恒等变换，所以不必按 `ontology_lang` 分叉。
+/// Chinese has no inflectional suffixes, so coming through here is the identity transform, which
+/// is why there is no need to fork on `ontology_lang`.
 fn inflect_base(w: &str) -> String {
     let n = w.len();
     let mut s = if w.ends_with("ies") && n > 3 {
@@ -104,8 +124,8 @@ fn inflect_base(w: &str) -> String {
     } else {
         w.to_string()
     };
-    // 结尾的 e 一律去掉：`produces→produce` 与 `produced→produc` 靠这一步汇合，
-    // 顺带让 `note` 与 `notes` 落到一起
+    // A trailing e always goes: `produces→produce` and `produced→produc` meet through this step,
+    // and it incidentally lands `note` and `notes` together
     if s.ends_with('e') {
         s.pop();
     }
@@ -115,15 +135,19 @@ fn inflect_base(w: &str) -> String {
     s
 }
 
-/// 领头的轻动词：`has_funding` 与 `funding` 是同一个关系，前缀是命名习惯不是意思。
+/// Leading light verbs: `has_funding` and `funding` are the same relation, and the prefix is a
+/// naming habit, not a meaning.
 ///
-/// 实测（ai-timeline-ends × schema.org）：空谓词事实的原文说法里
-/// `has_funding` ×4 落空，而本体里就有 `funding`；`product` ×2 落空，而本体里有
-/// `has_product`——**差的只是这一个前缀**。
+/// Measured (ai-timeline-ends × schema.org): among the original wordings of facts with an empty
+/// predicate, `has_funding` came up empty ×4 while the ontology holds `funding`, and `product`
+/// came up empty ×2 while the ontology holds `has_product` -- **the only difference is that one
+/// prefix**.
 ///
-/// 只在还剩词的时候剥：`has` 单独一个词是它自己，不能剥成空。
-/// 过度归并不会造成错配——`insert` 遇到一个键落到两个关系上就作废（撞车即作废），
-/// 所以最坏情况是退回"匹配不上"，而不是匹配到错的那个。
+/// Strip only while a word is left: `has` on its own is a word in its own right and must not be
+/// stripped to nothing.
+/// Over-merging cannot produce a wrong match -- `insert` voids a key the moment it lands on two
+/// relations (a collision voids it), so the worst case falls back to "no match" rather than
+/// matching the wrong one.
 const LEADING_AUX: &[&str] = &[
     "has", "have", "had", "is", "are", "was", "were", "be", "been",
 ];
@@ -136,32 +160,39 @@ fn stems(words: &[String]) -> Vec<String> {
     words.iter().map(|w| inflect_base(w)).collect()
 }
 
-/// 一个说法的**归并键**：同一个关系的不同时态落到同一个键上。
+/// The **merge key** of a wording: different tenses of one relation land on the same key.
 ///
-/// 给本体采纳那条路用的。抽取时说法要跟**已有**关系比对（上面那套三段匹配），
-/// 采纳时要做的是另一件事——把彼此之间是同一个意思的说法先并起来再算票数。
+/// This is for the ontology-adoption path. During extraction a wording is compared against the
+/// relations that **already exist** (the three-stage match above); adoption has a different job
+/// to do -- first merge the wordings that mean the same thing as each other, then count the
+/// votes.
 ///
-/// 不并就要吃亏，而且吃得见：ai-timeline 跑完后还压在兜底谓词上的说法里，
-/// `sued` 与 `sues` 是两条（各 11 和 5）、`integrated_with` 与 `integrates_with`
-/// 是两条（各 5）、`announced`/`announces`、`supported`/`supports`、
-/// `developed`/`develops` 都是。各自算票，各自够不着「出现在 ≥2 篇」的门槛；
-/// 并起来之后够格的候选从 70 组涨到 85 组、281 条涨到 355 条。
+/// Not merging costs us, and the cost is visible: among the wordings still stuck on the fallback
+/// predicate after an ai-timeline run, `sued` and `sues` are two entries (11 and 5),
+/// `integrated_with` and `integrates_with` are two (5 each), and so are `announced`/`announces`,
+/// `supported`/`supports` and `developed`/`develops`. Each counts its own votes and each falls
+/// short of the "appears in ≥2 documents" threshold; once merged, the candidates that qualify go
+/// from 70 groups to 85 and from 281 entries to 355.
 ///
-/// **介词不并**：`integrated_with` 与 `integrated_into` 保持两组。`works_at` 与
-/// `works_in` 确实可能是两回事，这里宁可漏。
+/// **Prepositions are not merged**: `integrated_with` and `integrated_into` stay two groups.
+/// `works_at` and `works_in` really may be two different things, and here we would rather miss.
 ///
-/// **`_by` 也不并**（待做）：`founded_by` 与 `founded` 是同一条边的两个方向。
+/// **`_by` is not merged either** (to do): `founded_by` and `founded` are two directions of one
+/// edge.
 ///
-/// 当初不并的理由是「采纳路径从旧行原样复制主语，对调不了」——**那个理由已经
-/// 不成立**（#109 让 `adopt` 显式绑定主语并支持交换）。现在缺口只剩一处：
-/// 两边都还不在本体里时（`founded_by` 42 条、`founded` 4 条，都够票），
-/// 采纳前的 `PredicateIndex` 查询谁也匹配不上，于是各建一个、方向相反。
-/// 补法是把 `_by` 折进同一组并把整组标成需对调，不再有阻碍。
+/// The original reason for not merging was "the adoption path copies the subject from the old row
+/// as is and cannot swap it" -- **that reason no longer holds** (#109 made `adopt` bind the
+/// subject explicitly and support swapping). Only one gap is left: while neither side is in the
+/// ontology yet (`founded_by` 42 entries, `founded` 4, both with enough votes), the
+/// `PredicateIndex` lookup before adoption matches neither of them, so each gets created, facing
+/// opposite ways. The fix is to fold `_by` into the same group and mark the whole group as
+/// needing a swap; nothing stands in the way any more.
 pub fn merge_key(form: &str) -> Vec<String> {
     stems(&words(form))
 }
 
-/// 撞车即作废：同一个形式落到两个不同的关系上，选谁都是猜。
+/// A collision voids the entry: when one form lands on two different relations, picking either
+/// is a guess.
 fn insert<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Option<Uuid>>, key: K, id: Uuid) {
     map.entry(key)
         .and_modify(|slot| {
@@ -179,9 +210,10 @@ pub struct PredicateIndex {
 }
 
 impl PredicateIndex {
-    /// **只收 `kind == "relation"`。** 属性走字面值通道，模糊匹配跨过去，
-    /// `founding_date` 就会变成一条指向实体「2015」的边——那正是本体采纳那条路
-    /// 已经专门挡掉的东西，这里不能从后门放回来。
+    /// **Only takes `kind == "relation"`.** Attributes go through the literal-value channel; let
+    /// a fuzzy match cross over and `founding_date` turns into an edge pointing at an entity
+    /// "2015" -- exactly the thing the ontology-adoption path already goes out of its way to
+    /// block, and it must not be let back in through the back door here.
     pub fn build(rtypes: &[RelationType]) -> Self {
         let mut exact = HashMap::new();
         let mut by_joined = HashMap::new();
@@ -212,7 +244,8 @@ impl PredicateIndex {
         *self.by_stems.get(&stems(w))?
     }
 
-    /// 返回 `(关系 id, 主宾是否要对调)`。`None` = 本体里确实没有，该降级。
+    /// Returns `(relation id, whether subject and object must be swapped)`. `None` = genuinely
+    /// not in the ontology, downgrade it.
     pub fn lookup(&self, proposed: &str) -> Option<(Uuid, bool)> {
         if let Some(id) = self.exact.get(proposed) {
             return Some((*id, false));
@@ -221,8 +254,9 @@ impl PredicateIndex {
         if let Some(id) = self.widened(&w) {
             return Some((id, false));
         }
-        // 被动形：`produced_by` 去掉 by 之后才对得上 `produces`，且主宾要反过来。
-        // 要求至少两个词——光一个 `by` 削完是空的。
+        // Passive form: `produced_by` only lines up with `produces` once the by is dropped, and
+        // subject and object have to be turned around. At least two words are required -- a
+        // lone `by` shaves down to nothing.
         if w.len() >= 2 && w[w.len() - 1] == "by" {
             if let Some(id) = self.widened(&w[..w.len() - 1]) {
                 return Some((id, true));
@@ -236,51 +270,60 @@ impl PredicateIndex {
 mod tests {
     use super::*;
 
-    /// `has_funding` 与 `funding` 是同一个关系，前缀是命名习惯不是意思。
+    /// `has_funding` and `funding` are the same relation; the prefix is a naming habit, not a
+    /// meaning.
     ///
-    /// 实测里这两组各自落空：本体有 `funding`、模型写 `has_funding`（×4）；
-    /// 本体有 `has_product`、模型写 `product`（×2）。差的只是这一个前缀。
+    /// In the measurements both of these pairs came up empty: the ontology has `funding` and the
+    /// model wrote `has_funding` (×4); the ontology has `has_product` and the model wrote
+    /// `product` (×2). The only difference is that one prefix.
     #[test]
     fn a_leading_auxiliary_does_not_make_a_different_relation() {
         let rels = vec![rel("funding"), rel("has_product")];
         let idx = PredicateIndex::build(&rels);
         assert!(
             idx.lookup("has_funding").is_some(),
-            "has_funding 该落到 funding 上"
+            "has_funding should land on funding"
         );
         assert!(
             idx.lookup("product").is_some(),
-            "product 该落到 has_product 上"
+            "product should land on has_product"
         );
-        // 两个方向都要通
+        // Both directions have to work
         assert!(idx.lookup("funding").is_some());
         assert!(idx.lookup("has_product").is_some());
     }
 
-    /// **只在还剩词的时候剥。** `has` 单独一个词是它自己，剥成空就什么都匹配了。
+    /// **Strip only while a word is left.** `has` on its own is a word in its own right, and
+    /// stripping it to nothing would make everything match.
     #[test]
     fn a_bare_auxiliary_is_still_a_word() {
         let rels = vec![rel("has")];
         let idx = PredicateIndex::build(&rels);
-        assert!(idx.lookup("has").is_some(), "has 自己该匹配得上");
-        assert!(idx.lookup("owns").is_none(), "剥成空会让不相干的词也匹配上");
+        assert!(idx.lookup("has").is_some(), "has should match itself");
+        assert!(
+            idx.lookup("owns").is_none(),
+            "stripping to nothing lets unrelated words match too"
+        );
     }
 
-    /// 撞车仍然作废：本体同时有 `funding` 与 `has_funding` 时，选谁都是猜。
-    /// 过度归并的最坏结果是「匹配不上」，不是「匹配到错的那个」。
+    /// A collision still voids: when the ontology holds both `funding` and `has_funding`, picking
+    /// either is a guess.
+    /// The worst outcome of over-merging is "no match", not "matched the wrong one".
     #[test]
     fn folding_the_prefix_never_produces_a_wrong_match() {
         let rels = vec![rel("funding"), rel("has_funding")];
         let idx = PredicateIndex::build(&rels);
-        // 精确 key 仍然直达
+        // The exact key still goes straight through
         assert!(idx.lookup("funding").is_some());
         assert!(idx.lookup("has_funding").is_some());
-        // 撞车在**词干**那一层：`funding` 与 `has_funding` 剥掉前缀后都是 ["funding"]。
-        // 要测它就得给一个走不到写法对齐、只能落到词干的形式——
-        // `has_fundings` 拼起来是 hasfundings，本体里没有，于是往下走到词干，撞车作废
+        // The collision is at the **stem** layer: with the prefix stripped, `funding` and
+        // `has_funding` are both ["funding"]. To test it we need a form that cannot reach
+        // spelling alignment and can only land on the stem -- `has_fundings` concatenates to
+        // hasfundings, which is not in the ontology, so it falls through to the stem and the
+        // collision voids it
         assert!(
             idx.lookup("has_fundings").is_none(),
-            "词干层撞车了却还是选了一个"
+            "the stem layer collided and yet one of them was still picked"
         );
     }
 
@@ -316,7 +359,7 @@ mod tests {
         assert_eq!(words("acquiredFrom"), ["acquired", "from"]);
         assert_eq!(words("acquired_from"), ["acquired", "from"]);
         assert_eq!(words("Acquired From"), ["acquired", "from"]);
-        // 全大写不是驼峰边界，别把 IRI 切成 i/r/i
+        // All caps is not a camelCase boundary; do not split IRI into i/r/i
         assert_eq!(words("IRI"), ["iri"]);
         assert_eq!(words("gpt4Model"), ["gpt4", "model"]);
     }
@@ -340,12 +383,13 @@ mod tests {
     fn tense_folds_without_swapping() {
         let types = [rel("produces")];
         let idx = PredicateIndex::build(&types);
-        // 模型写过去式，说的还是同一条边，方向也没变
+        // The model wrote the past tense; it is still the same edge, and the direction has not
+        // changed either
         assert_eq!(idx.lookup("produced"), Some((types[0].id, false)));
     }
 
-    /// 这条是这个模块存在的理由：`ChatGPT produced_by OpenAI` 与
-    /// `OpenAI produces ChatGPT` 是同一条边，只差主宾方向。
+    /// This one is the reason the module exists: `ChatGPT produced_by OpenAI` and
+    /// `OpenAI produces ChatGPT` are the same edge, differing only in subject/object direction.
     #[test]
     fn passive_form_matches_and_asks_for_a_swap() {
         let types = [rel("produces")];
@@ -361,10 +405,11 @@ mod tests {
         assert_eq!(idx.lookup("invested_in"), Some((types[0].id, false)));
     }
 
-    /// **派生不是屈折。** 这条是换掉 Snowball 的理由：schema.org 里 `producer`
-    /// 与 `produces` 并存，词干器把两个都折成 `produc`，于是撞车规则把
-    /// `produced` 也一并拒了——词表越大捞得越少（实测 49 次掉到 18 次）。
-    /// 只削屈折后缀就不会有这个撞车：`producer` 保持原样。
+    /// **Derivation is not inflection.** This one is the reason Snowball was replaced: in
+    /// schema.org `producer` and `produces` coexist, the stemmer folds both into `produc`, and
+    /// the collision rule then rejects `produced` along with them -- the bigger the vocabulary,
+    /// the less it recovers (measured, 49 recoveries dropped to 18). Shaving inflectional
+    /// suffixes only avoids that collision: `producer` stays as it is.
     #[test]
     fn derivational_forms_stay_separate_from_inflected_ones() {
         let types = [rel("produces"), rel("producer"), rel("production_company")];
@@ -372,36 +417,38 @@ mod tests {
         assert_eq!(idx.lookup("produced"), Some((types[0].id, false)));
         assert_eq!(idx.lookup("produced_by"), Some((types[0].id, true)));
         assert_eq!(idx.lookup("producer"), Some((types[1].id, false)));
-        // 派生词之间也别互相串
+        // Derived words must not bleed into one another either
         assert_eq!(idx.lookup("producers"), Some((types[1].id, false)));
     }
 
-    /// 单复数与时态两条路要汇合到同一串，否则同一个动词的两种写法永远对不上。
+    /// The plural path and the tense path have to meet at the same string, or two spellings of
+    /// one verb will never line up.
     #[test]
     fn plural_and_past_forms_meet_at_the_same_base() {
         assert_eq!(inflect_base("produces"), inflect_base("produced"));
         assert_eq!(inflect_base("uses"), inflect_base("used"));
         assert_eq!(inflect_base("notes"), inflect_base("note"));
         assert_eq!(inflect_base("studies"), inflect_base("study"));
-        // 短词不削：is 不该变成 i
+        // Short words are not shaved: is must not become i
         assert_eq!(inflect_base("is"), "is");
-        // -ss 不是复数
+        // -ss is not a plural
         assert_eq!(inflect_base("address"), inflect_base("addresses"));
     }
 
-    /// 撞车宁可不匹配：本体里同时有 `produces` 和 `produced` 时，
-    /// `producing` 折到两者共同的词干上，选谁都是猜。
+    /// On a collision, rather no match: when the ontology holds both `produces` and `produced`,
+    /// `producing` folds onto the stem the two share, and picking either is a guess.
     #[test]
     fn ambiguous_stem_declines_rather_than_guesses() {
         let types = [rel("produces"), rel("produced")];
         let idx = PredicateIndex::build(&types);
         assert_eq!(idx.lookup("producing"), None);
-        // 但精确 key 不受影响，它本来就唯一
+        // But the exact key is unaffected; it is unique to begin with
         assert_eq!(idx.lookup("produces"), Some((types[0].id, false)));
         assert_eq!(idx.lookup("produced"), Some((types[1].id, false)));
     }
 
-    /// 属性不能从这条路被匹配上：宾语是字面值，配不出一条边。
+    /// Attributes must not be matchable through this path: the object is a literal value, which
+    /// cannot make an edge.
     #[test]
     fn attributes_are_not_reachable() {
         let types = [attr("founding_date")];
@@ -410,14 +457,14 @@ mod tests {
         assert_eq!(idx.lookup("foundingDate"), None);
     }
 
-    /// 本体里真没有的，照旧降级——这里不做同义判断。
+    /// What genuinely is not in the ontology downgrades as before -- no synonym judgement here.
     #[test]
     fn genuinely_missing_vocabulary_still_declines() {
         let types = [rel("produces"), rel("works_at")];
         let idx = PredicateIndex::build(&types);
         assert_eq!(idx.lookup("partners_with"), None);
         assert_eq!(idx.lookup("acquired"), None);
-        // 介词不同就是不同的关系，别替模型改口
+        // A different preposition is a different relation; do not reword on the model's behalf
         assert_eq!(idx.lookup("works_in"), None);
     }
 
@@ -429,7 +476,8 @@ mod tests {
         assert_eq!(idx.lookup("_by_"), None);
     }
 
-    /// 中文 key 走词干器是恒等变换，不该被削也不该错配。
+    /// A Chinese key through the stemmer is the identity transform: nothing should be shaved and
+    /// nothing should be mismatched.
     #[test]
     fn chinese_keys_pass_through() {
         let types = [rel("隶属于"), rel("生产")];
