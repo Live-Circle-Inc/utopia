@@ -858,6 +858,11 @@ export const zh: Strings = {
     modelsIntro:
       "OpenAI 兼容协议——DeepSeek、Qwen、GLM、Ollama、vLLM 都可用。完全内网友好。",
     chatModel: "对话模型",
+    extractModel: "抽取模型（可选）",
+    extractHint:
+      "留空即跟着对话模型走。抽取是同一份提示词在每篇文档的每个分块上重复跑，量最大而判断最简单——账单主要来自这里，换便宜快的通常不掉质量。",
+    extractKeyPlaceholder: "接口地址与对话相同时沿用对话的密钥",
+    extractInheriting: "当前跟着对话模型走——接口地址与模型都填上才会分开。",
     embedModel: "向量模型（可选，启用语义检索）",
     baseUrl: "接口地址",
     model: "模型",
@@ -869,6 +874,7 @@ export const zh: Strings = {
     test: "测试连接",
     testing: "测试中…",
     chatLabel: "对话",
+    extractLabel: "抽取",
     embedLabel: "向量",
     ok: (reply: string) => `已连接（${reply}）`,
     okDim: (dim: number) => `已连接（维度 ${dim}）`,

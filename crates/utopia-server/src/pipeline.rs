@@ -75,9 +75,11 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
 
     utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
 
-    // Two-phase: once the index is ready, queue graph extraction if a chat model is
-    // configured (it does not block being searchable and askable)
-    if settings.as_ref().is_some_and(|s| s.chat_ready()) {
+    // Two-stage: once the index is ready, enqueue graph extraction if an
+    // extraction model is configured (without blocking search and chat). The test
+    // is `extract_ready`, not `chat_ready`: extraction has its own model slot, and
+    // a deployment that configured only that should still extract
+    if settings.as_ref().is_some_and(|s| s.extract_ready()) {
         utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
         utopia_store::jobs::enqueue(
             &state.pool,
@@ -137,7 +139,7 @@ pub async fn memory_ingest(
     let did = document_id.to_string();
     tokio::task::spawn_blocking(move || search.reindex_document(&kb, &did, &pairs)).await??;
 
-    if settings.as_ref().is_some_and(|s| s.chat_ready()) {
+    if settings.as_ref().is_some_and(|s| s.extract_ready()) {
         utopia_store::documents::set_graph_status(&state.pool, document_id, "queued").await?;
         utopia_store::jobs::enqueue(
             &state.pool,

@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     // business tables and can only append to the ledger. The migration pool is released the moment
     // it is done, so that high-privilege connection does not sit around at runtime.
     let migration_url = cfg.migration_url().to_string();
-    let separate_migration_role = cfg.migration_url.is_some();
+    let separate_migration_role = cfg.migration_url_override().is_some();
     {
         let mig_pool = utopia_store::db::connect(&migration_url, Some(2)).await?;
         utopia_store::db::migrate(&mig_pool).await?;

@@ -381,6 +381,9 @@ impl LlmClient {
                             done = true;
                             break 'outer;
                         }
+                        // TEMP DEBUG(remove): log every frame verbatim, to see
+                        // whether tool-call deltas are sent more than once
+                        tracing::debug!(%data, "llm sse frame");
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
                         };

@@ -70,6 +70,50 @@ impl AppConfig {
 impl AppConfig {
     /// The migration connection string: the runtime one when nothing separate is configured.
     pub fn migration_url(&self) -> &str {
-        self.migration_url.as_deref().unwrap_or(&self.database_url)
+        self.migration_url_override().unwrap_or(&self.database_url)
+    }
+
+    /// An explicitly configured separate migration identity, or `None`.
+    ///
+    /// An empty string counts as unset: writing `${UTOPIA_MIGRATION_URL:-}` in compose leaves
+    /// the variable present but empty, and reading it literally yields `Some("")` -- the
+    /// migration pool then tries to connect with it and the very first step of startup dies on
+    /// "error with configuration: relative URL without a base", a sentence that names no
+    /// connection string at all, so it cannot be traced back to the code that caused it.
+    /// Handled the same way as `jwt_secret` at the server entry point.
+    pub fn migration_url_override(&self) -> Option<&str> {
+        self.migration_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty `UTOPIA_MIGRATION_URL` falls back to the runtime connection string
+    #[test]
+    fn an_empty_migration_url_falls_back() {
+        for blank in ["", "   "] {
+            let cfg = AppConfig {
+                migration_url: Some(blank.into()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.migration_url(), cfg.database_url);
+            assert!(cfg.migration_url_override().is_none());
+        }
+    }
+
+    /// If one is given, that is the one used
+    #[test]
+    fn a_configured_migration_url_wins() {
+        let cfg = AppConfig {
+            migration_url: Some("postgres://owner:pw@db:5432/utopia".into()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.migration_url(), "postgres://owner:pw@db:5432/utopia");
+        assert!(cfg.migration_url_override().is_some());
     }
 }

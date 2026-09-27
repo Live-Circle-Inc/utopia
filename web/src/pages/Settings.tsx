@@ -733,9 +733,22 @@ function DataSourcesAdmin() {
   );
 }
 
+/** A preset replaces the **whole set**, it does not merge -- leaving `extract`
+ *  blank hands extraction back to chat regardless of what was in those fields
+ *  beforehand. Replacing only part would leave the previous provider's extraction
+ *  address paired with this provider's chat model, with both sections looking
+ *  filled in */
 const PRESETS: Record<
   string,
-  { chat: string; embed: string; chatModel: string; embedModel: string }
+  {
+    chat: string;
+    embed: string;
+    chatModel: string;
+    embedModel: string;
+    /** Blank = extraction follows chat */
+    extract?: string;
+    extractModel?: string;
+  }
 > = {
   DeepSeek: {
     chat: "https://api.deepseek.com/v1",
@@ -767,6 +780,27 @@ const PRESETS: Record<
     embed: "https://api.openai.com/v1",
     embedModel: "text-embedding-3-small",
   },
+  // **The address must include the /openai segment.** Google's OpenAI
+  // compatibility layer lives under /v1beta/openai; using plain /v1beta hits the
+  // native Gemini API, which has no /chat/completions -- and the error that comes
+  // back often carries no message at all (see err_detail's fallback)
+  Gemini: {
+    chat: "https://generativelanguage.googleapis.com/v1beta/openai",
+    chatModel: "gemini-3.8-flash",
+    embed: "",
+    embedModel: "",
+  },
+  // Strong model stays on chat, extraction moves to the local machine:
+  // extraction is one prompt multiplied by the chunk count, so all the volume is
+  // there -- and the point is that none of it spends remote quota
+  "Gemini + local extract": {
+    chat: "https://generativelanguage.googleapis.com/v1beta/openai",
+    chatModel: "gemini-3.8-flash",
+    extract: "http://localhost:11434/v1",
+    extractModel: "qwen3:30b-a3b",
+    embed: "http://localhost:11434/v1",
+    embedModel: "bge-m3",
+  },
 };
 
 export function Settings() {
@@ -786,6 +820,9 @@ export function Settings() {
     chat_base_url: "",
     chat_api_key: "",
     chat_model: "",
+    extract_base_url: "",
+    extract_api_key: "",
+    extract_model: "",
     embed_base_url: "",
     embed_api_key: "",
     embed_model: "",
@@ -797,11 +834,21 @@ export function Settings() {
         ...f,
         chat_base_url: settings.data.chat_base_url ?? "",
         chat_model: settings.data.chat_model ?? "",
+        extract_base_url: settings.data.extract_base_url ?? "",
+        extract_model: settings.data.extract_model ?? "",
         embed_base_url: settings.data.embed_base_url ?? "",
         embed_model: settings.data.embed_model ?? "",
       }));
     }
   }, [settings.data]);
+
+  /** Whether extraction is currently following chat. **Same test as the
+   *  backend's**: address and model must both be present to count as configured
+   *  (`LlmSettings::extract_overridden`). Filling in only one field is the most
+   *  misread state -- it looks configured while the whole block falls back, and
+   *  the UI used to say nothing about it */
+  const extractInherits =
+    !form.extract_base_url.trim() || !form.extract_model.trim();
 
   const save = useMutation({
     mutationFn: () => api.saveSettings(workspace!.id, form),
@@ -873,6 +920,8 @@ export function Settings() {
                       ...form,
                       chat_base_url: p.chat,
                       chat_model: p.chatModel,
+                      extract_base_url: p.extract ?? "",
+                      extract_model: p.extractModel ?? "",
                       embed_base_url: p.embed,
                       embed_model: p.embedModel,
                     })
@@ -922,6 +971,55 @@ export function Settings() {
                     placeholder="sk-…"
                     value={form.chat_api_key}
                     onChange={set("chat_api_key")}
+                  />
+                </div>
+              </div>
+
+              <h3 className="text-sm font-bold text-neutral-200 pt-2">
+                {S.settings.extractModel}
+              </h3>
+              <p className="text-xs text-neutral-500 -mt-2">
+                {S.settings.extractHint}
+              </p>
+              {extractInherits && (
+                <p className="text-xs text-[var(--u-accent)] -mt-2">
+                  {S.settings.extractInheriting}
+                </p>
+              )}
+              <div>
+                <label className={label}>{S.settings.baseUrl}</label>
+                <input
+                  className={input}
+                  placeholder={form.chat_base_url || "https://api.deepseek.com/v1"}
+                  value={form.extract_base_url}
+                  onChange={set("extract_base_url")}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className={label}>{S.settings.model}</label>
+                  <input
+                    className={input}
+                    placeholder={form.chat_model || "deepseek-chat"}
+                    value={form.extract_model}
+                    onChange={set("extract_model")}
+                  />
+                </div>
+                <div>
+                  <label className={label}>
+                    {S.settings.apiKey}{" "}
+                    {settings.data?.has_extract_key && (
+                      <span className="text-[var(--u-accent)]">
+                        {S.settings.keyConfigured}
+                      </span>
+                    )}
+                  </label>
+                  <input
+                    className={input}
+                    type="password"
+                    placeholder={S.settings.extractKeyPlaceholder}
+                    value={form.extract_api_key}
+                    onChange={set("extract_api_key")}
                   />
                 </div>
               </div>
@@ -1007,6 +1105,20 @@ export function Settings() {
                       ? S.settings.ok(test.data.chat.reply ?? "OK")
                       : test.data.chat.error}
                   </p>
+                  {test.data.extract && (
+                    <p
+                      className={
+                        test.data.extract.ok
+                          ? "text-[var(--u-accent)]"
+                          : "text-rose-400"
+                      }
+                    >
+                      {S.settings.extractLabel}:{" "}
+                      {test.data.extract.ok
+                        ? S.settings.ok(test.data.extract.reply ?? "OK")
+                        : test.data.extract.error}
+                    </p>
+                  )}
                   <p
                     className={
                       test.data.embed.ok

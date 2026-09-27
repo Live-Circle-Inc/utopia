@@ -59,7 +59,7 @@ async fn chat_retrying_rate_limits(
     for attempt in 1..=RATE_LIMIT_TRIES {
         // The permit wraps only the call itself and is handed back on leaving this block
         let outcome = {
-            let _permit = llm_util::acquire_chat(state, settings).await;
+            let _permit = llm_util::acquire_extract(state, settings).await;
             client.chat(messages).await
         };
         let err = match outcome {
@@ -319,8 +319,12 @@ async fn run(state: &AppState, document_id: Uuid, proposed_by: Option<Uuid>) -> 
     let settings = utopia_store::settings::get(&state.pool, kb.workspace_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
-    let client = llm_util::chat_client(&settings)
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
+    // **Extraction uses its own model slot**, falling back to chat's when unset
+    // (`effective_extract`). The volume is here: one prompt re-run per chunk, tens
+    // to thousands of times per document, and the judgement required is far
+    // simpler than chat's -- this is the worst place to spend a strong model
+    let client = llm_util::extract_client(&settings)
+        .ok_or_else(|| anyhow::anyhow!("Extraction model not configured; cannot extract"))?;
 
     // Ownership token: a re-extraction bumps the epoch, and this job uses it to notice it has
     // been taken over (see the chunk loop)
