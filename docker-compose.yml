@@ -27,17 +27,30 @@ services:
       timeout: 3s
       retries: 10
 
-  # 完整部署：docker compose --profile app up -d
-  # 本地开发只起 db，应用用 cargo run 跑
+  # Full deployment: docker compose --profile app up -d
+  # For local development only db is started, and the application is run with cargo run
   #
-  # 这里只写 image 不写 build：两者并存时，本地没有镜像的 up 会去"构建"而不是
-  # "拉取"，预构建镜像就白发了。要从源码起，叠加 docker-compose.build.yml。
+  # **This fork builds its own image and runs that image. It never pulls one.**
+  #
+  # Upstream wrote image without build here on purpose: with both present, an up on a machine
+  # with no local image builds instead of pulling, and the image they published goes unused.
+  # That reasoning is theirs -- they publish releases to ghcr. We do not consume those, so the
+  # trade runs the other way: build is what we want, and a registry fetch is the thing to
+  # prevent. pull_policy makes that explicit rather than leaving it to whether an image
+  # happens to be lying around locally.
   app:
-    # 钉在已发布的具体版本。**这个默认值就是 README 承诺的那条命令**，
-    # 写一个不存在的标签，clone 下来第一步就是 manifest unknown。
-    # 所以撤掉一个版本时必须连它一起改——0.1.0 撤了，现在指向 rc。
-    # 转正之后改回 0.1.0（或改成 latest 让它自动跟随）。
-    image: ${UTOPIA_IMAGE:-bryan_utopia:latest}
+    # Local build tag, never an upstream release. The old default was
+    # ghcr.io/deeplethe/utopia:0.1.0-rc3, which tied us to whichever tag upstream had or had
+    # not withdrawn that week -- and a withdrawn tag makes the first command after a clone
+    # fail with manifest unknown. UTOPIA_IMAGE still overrides, for pinning a build by tag.
+    image: ${UTOPIA_IMAGE:-brycircle-utopia:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    # build, not missing: always build from this tree rather than reaching for a registry.
+    # With only `build:` above, compose would still pull if a matching tag existed locally or
+    # remotely, which is exactly the fallback we are removing.
+    pull_policy: build
     profiles: ["app"]
     environment:
       # 默认以 owner 身份运行。要启用受限角色（业务表随便读写、台账只增不改），

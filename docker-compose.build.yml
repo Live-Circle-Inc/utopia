@@ -1,8 +1,13 @@
-# 从源码构建，叠加在 docker-compose.yml 之上——改了代码，或者想跑未发布的版本时用：
+# **Redundant in this fork, kept only so the command below still works.**
+#
+# docker-compose.yml now carries build: and pull_policy: build itself, so a plain
+# `docker compose --profile app up -d` already builds from this tree -- this overlay adds
+# nothing on top of it. It survives because the READMEs document the longer form:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml --profile app up -d --build
 #
-# 普通部署不需要这个文件，直接 docker compose --profile app up -d 拉预构建镜像。
+# Upstream needed the split because it publishes release images to ghcr and did not want an up
+# to build one by accident. We do not consume those images, so there is nothing to protect.
 services:
   app:
     build:
