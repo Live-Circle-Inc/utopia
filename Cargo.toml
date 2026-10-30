@@ -72,7 +72,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 chardetng = "1"
 encoding_rs = "0.8"
 quick-xml = "0.42"
-zip = { version = "6", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 csv = "1"
 
 # Ontology import: the small, focused parsers split out of Oxigraph -- they parse, they do not
