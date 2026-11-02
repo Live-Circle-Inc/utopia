@@ -33,7 +33,7 @@ pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
         zip::ZipArchive::new(Cursor::new(bytes.to_vec())).context("Failed to unzip pptx")?;
     let mut slides: Vec<(u32, String)> = Vec::new();
     for i in 0..archive.len() {
-        let name = archive.by_index(i)?.name().to_string();
+        let name = archive.by_index(i)?.name()?.to_string();
         if let Some(num) = name
             .strip_prefix("ppt/slides/slide")
             .and_then(|s| s.strip_suffix(".xml"))
