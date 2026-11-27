@@ -18,4 +18,4 @@ sha2.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-url = "2.5.8"
+url = "2.5.9"
